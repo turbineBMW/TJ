@@ -58,6 +58,9 @@ pub struct MenuContext {
     pub project_name: String,
     pub project_account: String,
     pub project_mode: PermissionMode,
+    /// The project folder for display (`~/Projects/TJ`), and its git branch.
+    pub project_dir: String,
+    pub branch: Option<String>,
 }
 
 /// The widest the conversation and composer get, so lines stay readable in a wide window.
@@ -342,6 +345,11 @@ impl ThreadView {
             self.plain.iter().rev().filter_map(|line| line.strip_prefix("User: ")).take(n).map(str::to_owned).collect();
         requests.reverse();
         requests
+    }
+
+    /// A thread that hasn't started yet shows the intro instead of an empty conversation.
+    pub fn is_fresh(&self) -> bool {
+        self.rows.is_empty()
     }
 
     #[cfg(test)]
@@ -991,6 +999,12 @@ impl ThreadView {
 
 impl Render for ThreadView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_view(cx)
+    }
+}
+
+impl ThreadView {
+    fn render_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (bg, border, muted) = (theme.background, theme.border, theme.muted_foreground);
         let this = cx.entity();
@@ -1083,26 +1097,117 @@ impl Render for ThreadView {
                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
         };
 
-        v_flex().size_full().bg(bg).child(div().flex_1().min_h_0().child(transcript)).child(
-            h_flex().w_full().justify_center().border_t_1().border_color(border).child(
-                v_flex()
-                    .w_full()
-                    .max_w(px(MAX_CONVERSATION_WIDTH))
-                    .gap_1()
-                    .px_3()
-                    .pt_3()
-                    .pb_2()
-                    .child(Textarea::new(&self.prompt))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .text_color(muted)
-                            .child(account_menu)
-                            .child(mode_menu)
-                            .child(div().flex_1())
-                            .child(send),
-                    ),
-            ),
+        if self.is_fresh() {
+            return self.render_intro(account_menu, mode_menu, cx).into_any_element();
+        }
+
+        v_flex()
+            .size_full()
+            .bg(bg)
+            .child(div().flex_1().min_h_0().child(transcript))
+            .child(
+                h_flex().w_full().justify_center().border_t_1().border_color(border).child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(MAX_CONVERSATION_WIDTH))
+                        .gap_1()
+                        .px_3()
+                        .pt_3()
+                        .pb_2()
+                        .child(Textarea::new(&self.prompt))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .text_color(muted)
+                                .child(account_menu)
+                                .child(mode_menu)
+                                .child(div().flex_1())
+                                .child(send),
+                        ),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// Before the first message: a heading, a large prompt card, and where the session will run.
+    /// Like T3 Code's new-session screen.
+    fn render_intro(
+        &self,
+        account_menu: impl IntoElement,
+        mode_menu: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let (bg, border, muted, fg, card) =
+            (theme.background, theme.border, theme.muted_foreground, theme.foreground, theme.secondary);
+        let (accent, accent_fg) = (theme.primary, theme.primary_foreground);
+        let project = if self.menus.project_name.is_empty() {
+            "this project".to_string()
+        } else {
+            self.menus.project_name.clone()
+        };
+        let can_send = self.agent.is_some() || self.backend.is_some();
+        let send = div()
+            .id("intro-send")
+            .flex_none()
+            .size_8()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(if can_send { accent } else { muted })
+            .text_color(accent_fg)
+            .cursor_pointer()
+            .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::ArrowUp).small())
+            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)));
+        let footnote = |icon: gpui_kit::assets::IconName, text: String| {
+            h_flex()
+                .gap_1()
+                .text_xs()
+                .text_color(muted)
+                .child(gpui_kit::component::Icon::new(icon).xsmall())
+                .child(text)
+        };
+
+        // A little above centre, like T3 Code's start screen.
+        v_flex().size_full().bg(bg).items_center().justify_center().px_6().pb(px(140.)).child(
+            v_flex()
+                .w_full()
+                .max_w(px(MAX_CONVERSATION_WIDTH - 80.0))
+                .gap_2()
+                .child(
+                    div()
+                        .w_full()
+                        .pb_4()
+                        .flex()
+                        .justify_center()
+                        .text_3xl()
+                        .text_color(fg)
+                        .child(format!("What should we build in {project}?")),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .p_3()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(border)
+                        .bg(card)
+                        .child(div().min_h(px(64.)).child(Textarea::new(&self.prompt).appearance(false)))
+                        .child(h_flex().gap_1().child(account_menu).child(mode_menu).child(div().flex_1()).child(send)),
+                )
+                .child(
+                    h_flex()
+                        .px_2()
+                        .gap_4()
+                        .child(footnote(gpui_kit::assets::IconName::Folder, self.menus.project_dir.clone()))
+                        .child(div().flex_1())
+                        .when_some(self.menus.branch.clone(), |el, branch| {
+                            el.child(footnote(gpui_kit::assets::IconName::GitBranch, branch))
+                        })
+                        .child(footnote(gpui_kit::assets::IconName::Shield, self.mode.label().to_string())),
+                ),
         )
     }
 }

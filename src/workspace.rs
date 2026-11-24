@@ -242,6 +242,8 @@ impl Workspace {
                 project_name: project.name.clone(),
                 project_account: self.accounts.resolve(None, project.account.as_deref()).id.clone(),
                 project_mode: project.mode.unwrap_or_default(),
+                project_dir: display_path(&project.path, &self.home),
+                branch: git_branch(&project.path),
             };
             thread.update(cx, |t, cx| {
                 t.menus = menus;
@@ -1055,6 +1057,36 @@ fn drag_area() -> impl IntoElement {
     })
 }
 
+/// `/home/me/Projects/TJ` -> `~/Projects/TJ`.
+fn display_path(path: &std::path::Path, home: &std::path::Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// The checked-out branch, read from `.git/HEAD` (a worktree's `.git` file points at its own
+/// HEAD). A detached HEAD shows its short commit; outside git, `None`.
+fn git_branch(project: &std::path::Path) -> Option<String> {
+    let dot_git = project.join(".git");
+    let head_file = if dot_git.is_file() {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let dir = pointer.trim().strip_prefix("gitdir:")?.trim();
+        let dir = std::path::Path::new(dir);
+        let dir = if dir.is_absolute() { dir.to_path_buf() } else { project.join(dir) };
+        dir.join("HEAD")
+    } else {
+        dot_git.join("HEAD")
+    };
+    let head = std::fs::read_to_string(head_file).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: refs/heads/") {
+        Some(branch) => Some(branch.to_string()),
+        None => (head.len() >= 7).then(|| head[..7].to_string()),
+    }
+}
+
 /// "SeaBreeze" -> "SB", "my project" -> "MP", "tj" -> "TJ".
 fn initials(name: &str) -> String {
     let words: Vec<&str> = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
@@ -1092,8 +1124,10 @@ impl Render for Workspace {
         let metrics = self.metrics(cx);
         let theme = cx.theme();
         let (bg, fg, border, danger) = (theme.background, theme.foreground, theme.border, theme.danger);
-        // The overview pane only appears when it has something to show.
-        let right_pane = overview_panel.is_some() || changes_list.is_some();
+        // The overview pane only appears when it has something to show, and stays out of the
+        // way while the active thread is still on its intro.
+        let fresh = self.active_thread().is_some_and(|t| t.read(cx).is_fresh());
+        let right_pane = !fresh && (overview_panel.is_some() || changes_list.is_some());
 
         // The window itself is transparent: only the content area paints an opaque background,
         // so the sidebar can be see-through.
@@ -1218,6 +1252,14 @@ mod tests {
         }
         assert_eq!(changes.read_with(cx, |c, _| c.changes.files[0].path.clone()), "notes.md");
 
+        // While the thread is on its intro, the overview pane (and its file list) stays hidden.
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from("change-0")).is_none());
+        });
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        thread.update(cx, |t, cx| t.handle(crate::agent::AgentEvent::TextDelta("Started.".into()), cx));
+
         cx.update(|window, cx| {
             window.render_frame(cx);
             window.click(SharedString::from("change-0"), cx);
@@ -1301,6 +1343,30 @@ mod tests {
             window.click(SharedString::from("header-split-right"), cx);
         });
         assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2, 1]);
+    }
+
+    #[test]
+    fn branch_and_display_path() {
+        let root = std::env::temp_dir().join(format!("tj-branch-{}", new_id()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/feat/intro\n").unwrap();
+        assert_eq!(super::git_branch(&root).as_deref(), Some("feat/intro"));
+        std::fs::write(root.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(super::git_branch(&root).as_deref(), Some("0123456"), "detached shows the short commit");
+
+        let worktree = root.join("wt");
+        std::fs::create_dir_all(root.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(root.join(".git/worktrees/wt/HEAD"), "ref: refs/heads/side\n").unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", root.join(".git/worktrees/wt").display()))
+            .unwrap();
+        assert_eq!(super::git_branch(&worktree).as_deref(), Some("side"));
+        assert_eq!(super::git_branch(&std::env::temp_dir().join("tj-no-git-here")), None);
+
+        let home = std::path::Path::new("/home/me");
+        assert_eq!(super::display_path(std::path::Path::new("/home/me/Projects/TJ"), home), "~/Projects/TJ");
+        assert_eq!(super::display_path(home, home), "~");
+        assert_eq!(super::display_path(std::path::Path::new("/srv/x"), home), "/srv/x");
     }
 
     #[test]
