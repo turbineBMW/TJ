@@ -3,6 +3,7 @@
 //! Closing a pane's last tab folds its split back up. Shortcuts match Vmux's.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use alacritty_terminal::tty::Shell;
 use gpui_kit::base::{h_flex, v_flex};
@@ -18,6 +19,23 @@ use crate::thread::{Status, ThreadView};
 
 pub const CONTEXT: &str = "Panes";
 const MIN_RATIO: f32 = 0.15;
+/// How wide a divider between panes is to grab (it draws a 1px line in the middle).
+const DIVIDER: f32 = 5.0;
+
+/// A divider being dragged: the path (first = false, second = true) from the root to its split.
+#[derive(Clone, Debug, PartialEq)]
+struct DividerDrag {
+    path: Rc<[bool]>,
+}
+
+/// Nothing follows the pointer while a divider is dragged; the panes move instead.
+struct NoDragImage;
+
+impl Render for NoDragImage {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
 const RESIZE_STEP: f32 = 0.05;
 
 gpui_kit::actions!(
@@ -227,6 +245,24 @@ impl Node {
                 (Some(only), None) | (None, Some(only)) => Some(only),
                 (None, None) => None,
             },
+        }
+    }
+
+    /// Set the ratio of the split at `path`, kept within the limits. False if there's none.
+    fn set_ratio(&mut self, path: &[bool], value: f32) -> bool {
+        match (self, path.split_first()) {
+            (Node::Split { ratio, .. }, None) => {
+                *ratio = value.clamp(MIN_RATIO, 1.0 - MIN_RATIO);
+                true
+            }
+            (Node::Split { first, second, .. }, Some((&go_second, rest))) => {
+                if go_second {
+                    second.set_ratio(rest, value)
+                } else {
+                    first.set_ratio(rest, value)
+                }
+            }
+            (Node::Pane(_), _) => false,
         }
     }
 
@@ -684,24 +720,89 @@ impl Panes {
 
     // ---------- rendering ----------
 
-    fn render_node(&self, node: &Node, cx: &mut Context<Self>) -> AnyElement {
+    /// Drag a divider: the split takes the pointer's position within it as its ratio.
+    fn drag_divider(&mut self, path: &[bool], ratio: f32, cx: &mut Context<Self>) {
+        if self.root.as_mut().is_some_and(|root| root.set_ratio(path, ratio)) {
+            cx.notify();
+        }
+    }
+
+    fn render_node(&self, node: &Node, path: Vec<bool>, cx: &mut Context<Self>) -> AnyElement {
         match node {
             Node::Pane(pane) => self.render_pane(pane, cx),
             Node::Split { direction, ratio, first, second } => {
-                let border = cx.theme().border;
-                let (a, b) = (self.render_node(first, cx), self.render_node(second, cx));
-                match direction {
-                    SplitDirection::Right => h_flex()
-                        .size_full()
-                        .child(div().h_full().w(relative(*ratio)).min_w_0().child(a))
-                        .child(div().h_full().flex_1().min_w_0().border_l_1().border_color(border).child(b))
-                        .into_any_element(),
-                    SplitDirection::Down => v_flex()
-                        .size_full()
-                        .child(div().w_full().h(relative(*ratio)).min_h_0().child(a))
-                        .child(div().w_full().flex_1().min_h_0().border_t_1().border_color(border).child(b))
-                        .into_any_element(),
-                }
+                let (border, accent) = (cx.theme().border, cx.theme().primary);
+                let child_path = |second: bool| path.iter().copied().chain([second]).collect::<Vec<_>>();
+                let (a, b) =
+                    (self.render_node(first, child_path(false), cx), self.render_node(second, child_path(true), cx));
+                let across = *direction == SplitDirection::Right;
+                let path: Rc<[bool]> = path.into();
+                let key = path.iter().map(|b| if *b { '1' } else { '0' }).collect::<String>();
+                // A strip to grab between the two sides, with a 1px line down its middle.
+                let divider = div()
+                    .id(SharedString::from(format!("divider-{key}")))
+                    .debug_selector(|| format!("divider-{key}"))
+                    .group("divider")
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .map(|el| {
+                        if across {
+                            el.w(px(DIVIDER)).h_full().cursor_col_resize()
+                        } else {
+                            el.h(px(DIVIDER)).w_full().cursor_row_resize()
+                        }
+                    })
+                    .child(
+                        div()
+                            .bg(border)
+                            .group_hover("divider", |el| el.bg(accent))
+                            .map(|el| if across { el.w(px(1.)).h_full() } else { el.h(px(1.)).w_full() }),
+                    )
+                    .on_drag(DividerDrag { path: path.clone() }, |_, _, _, cx| cx.new(|_| NoDragImage))
+                    // A double click puts the divider back in the middle.
+                    .on_click(cx.listener({
+                        let path = path.clone();
+                        move |this, event: &ClickEvent, window, cx| {
+                            if event.click_count() >= 2 {
+                                this.drag_divider(&path, 0.5, cx);
+                                this.changed(window, cx);
+                            }
+                        }
+                    }));
+                let container = if across { h_flex() } else { v_flex() };
+                container
+                    .size_full()
+                    .on_drag_move(cx.listener({
+                        let path = path.clone();
+                        move |this, event: &DragMoveEvent<DividerDrag>, _, cx| {
+                            if event.drag(cx).path != path {
+                                return;
+                            }
+                            let (bounds, at) = (event.bounds, event.event.position);
+                            let ratio = if across {
+                                (at.x - bounds.left()) / bounds.size.width
+                            } else {
+                                (at.y - bounds.top()) / bounds.size.height
+                            };
+                            this.drag_divider(&path, ratio, cx);
+                        }
+                    }))
+                    // Saved once, when the divider is let go.
+                    .on_drop(cx.listener(|this, _: &DividerDrag, window, cx| this.changed(window, cx)))
+                    .map(|el| {
+                        if across {
+                            el.child(div().h_full().w(relative(*ratio)).min_w_0().child(a))
+                                .child(divider)
+                                .child(div().h_full().flex_1().min_w_0().child(b))
+                        } else {
+                            el.child(div().w_full().h(relative(*ratio)).min_h_0().child(a))
+                                .child(divider)
+                                .child(div().w_full().flex_1().min_h_0().child(b))
+                        }
+                    })
+                    .into_any_element()
             }
         }
     }
@@ -826,7 +927,7 @@ impl Render for Panes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let body = match &self.root {
-            Some(root) => self.render_node(root, cx),
+            Some(root) => self.render_node(root, Vec::new(), cx),
             None => v_flex()
                 .size_full()
                 .items_center()
@@ -888,6 +989,16 @@ mod tests {
 
     /// Panes for a temp project with one known thread ("t1"), running `/bin/sh` terminals.
     fn open(cx: &mut TestAppContext, layout: Option<PaneLayout>, start_thread: bool) -> Setup {
+        open_with(cx, layout, start_thread, Shell::new("/bin/sh".into(), vec![]))
+    }
+
+    /// Terminals that print nothing (`sleep`), for tests that let the scheduler run: a shell's
+    /// prompt would wake the view from the PTY's thread, which the test scheduler rejects.
+    fn open_quiet(cx: &mut TestAppContext) -> Setup {
+        open_with(cx, None, false, Shell::new("sleep".into(), vec!["60".into()]))
+    }
+
+    fn open_with(cx: &mut TestAppContext, layout: Option<PaneLayout>, start_thread: bool, shell: Shell) -> Setup {
         let dir = std::env::temp_dir().join(format!("tj-panes-{}", crate::store::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         cx.update(|cx| {
@@ -911,8 +1022,7 @@ mod tests {
                 let threads = HashMap::from([("t1".to_string(), thread.clone())]);
                 let start = Start { thread: start_thread.then(|| ("t1".to_string(), thread.clone())), terminal: true };
                 let panes = cx.new(|cx| {
-                    let shell = Some(Shell::new("/bin/sh".into(), vec![]));
-                    Panes::new(project, layout.as_ref(), &threads, review, start, shell, window, cx)
+                    Panes::new(project, layout.as_ref(), &threads, review, start, Some(shell.clone()), window, cx)
                 });
                 cx.subscribe(&panes, move |_, event: &PaneEvent, _| {
                     log.borrow_mut().push(match event {
@@ -983,6 +1093,67 @@ mod tests {
         let cwd = s.dir.canonicalize().unwrap();
         assert!(matches!(*first, PaneLayout::Pane { ref tabs, .. } if tabs == &vec![TabState::Terminal { cwd }]));
         assert!(matches!(*second, PaneLayout::Split { direction: SplitDirection::Down, .. }));
+    }
+
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+
+    fn root_ratio(panes: &Entity<Panes>, cx: &mut VisualTestContext) -> f32 {
+        match panes.read_with(cx, |p, cx| p.snapshot(cx)) {
+            Some(PaneLayout::Split { ratio, .. }) => ratio,
+            other => panic!("expected a split: {other:?}"),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn dragging_a_divider_resizes_the_split_and_saves_on_release(cx: &mut TestAppContext) {
+        let s = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(s.window, cx);
+        s.panes.update_in(cx, |p, window, cx| p.split(SplitDirection::Right, window, cx));
+        cx.run_until_parked();
+        let divider = cx.debug_bounds("divider-").expect("the split has a divider");
+        assert!((divider.center().x - px(600.)).abs() < px(4.), "it starts in the middle: {divider:?}");
+
+        let (start, y) = (divider.center(), divider.center().y);
+        let none = Modifiers::none();
+        s.events.borrow_mut().clear();
+        cx.simulate_mouse_down(start, MouseButton::Left, none);
+        cx.simulate_mouse_move(point(start.x - px(20.), y), MouseButton::Left, none);
+        cx.simulate_mouse_move(point(px(300.), y), MouseButton::Left, none);
+        let dragged = root_ratio(&s.panes, cx);
+        assert!((dragged - 0.25).abs() < 0.01, "ratio follows the pointer: {dragged}");
+        assert!(!s.events.borrow().iter().any(|e| e == "layout"), "not saved mid-drag");
+
+        cx.simulate_mouse_move(point(px(20.), y), MouseButton::Left, none);
+        cx.simulate_mouse_up(point(px(20.), y), MouseButton::Left, none);
+        assert_eq!(root_ratio(&s.panes, cx), super::MIN_RATIO, "it stops at the limit");
+        assert!(s.events.borrow().iter().any(|e| e == "layout"), "saved when let go");
+    }
+
+    #[gpui_kit::test]
+    fn double_clicking_a_divider_centres_it(cx: &mut TestAppContext) {
+        let s = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(s.window, cx);
+        s.panes.update_in(cx, |p, window, cx| {
+            p.split(SplitDirection::Down, window, cx);
+            p.resize(0.2, window, cx);
+        });
+        assert!((root_ratio(&s.panes, cx) - 0.5).abs() > 0.1);
+        cx.run_until_parked();
+        let divider = cx.debug_bounds("divider-").expect("divider").center();
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: divider,
+            modifiers: Modifiers::none(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position: divider,
+            modifiers: Modifiers::none(),
+            click_count: 2,
+        });
+        assert_eq!(root_ratio(&s.panes, cx), 0.5);
     }
 
     #[gpui_kit::test]
