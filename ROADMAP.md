@@ -4,7 +4,9 @@
 
 **Done (milestone 3a):** the Changes list and the diff review with a summary of each file.
 
-**Next:** the pi-style task panel, then the transparent-sidebar setting and following the Omarchy theme, then terminal splits and tabs.
+**Done (milestone 3b):** the pi-style overview (Goal, Now, Next, Tasks) with context, usage and cost.
+
+**Next:** the transparent-sidebar setting and following the Omarchy theme, then terminal splits and tabs.
 
 These are steering decisions, not a schedule. Build toward them, but don't let them block the agent core.
 

@@ -335,6 +335,143 @@ impl Workspace {
         }
     }
 
+    /// Goal, Now, Next and tasks for the active thread, with its usage underneath (like pi's sidebar).
+    fn overview_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.active_thread()?;
+        let t = thread.read(cx);
+        let theme = cx.theme();
+        let (muted, border, accent, fg) = (theme.muted_foreground, theme.border, theme.primary, theme.foreground);
+        let ov = &t.overview;
+        let label =
+            |text: &'static str| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(text);
+        let field = |name: &'static str, value: &Option<String>, color: Hsla| {
+            value.clone().map(|value| {
+                v_flex().gap_0p5().child(label(name)).child(div().text_sm().text_color(color).child(value))
+            })
+        };
+
+        let mut stats = Vec::new();
+        if let (Some(tokens), Some(window)) = (t.context_tokens, t.context_window) {
+            let percent = tokens as f64 / window.max(1) as f64 * 100.0;
+            stats.push(format!("ctx {} / {} · {percent:.0}%", compact(tokens), compact(window)));
+        }
+        for window in &t.usage {
+            let name = match window.id.as_str() {
+                "five_hour" => "5h",
+                "seven_day" => "7d",
+                other => other,
+            };
+            stats.push(format!("{name} {:.0}%", window.utilization * 100.0));
+        }
+        if t.cost_usd > 0.0 {
+            // On a subscription this is Claude's estimate, not a charge.
+            let approx = if t.usage.is_empty() { "" } else { "≈" };
+            stats.push(if t.cost_usd < 1.0 {
+                format!("{approx}${:.3}", t.cost_usd)
+            } else {
+                format!("{approx}${:.2}", t.cost_usd)
+            });
+        }
+        if let Some(model) = &t.model {
+            stats.push(thread::short_model(model));
+        }
+
+        let body = if ov.is_empty() {
+            div()
+                .text_sm()
+                .text_color(muted)
+                .child(if t.overview_busy {
+                    "Writing the overview…"
+                } else {
+                    "The overview appears after the first reply."
+                })
+                .into_any_element()
+        } else {
+            let tasks = ov.tasks.iter().map(|task| {
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .text_sm()
+                    .child(div().text_color(if task.done { muted } else { accent }).child(if task.done {
+                        "✓"
+                    } else {
+                        "○"
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .when(task.done, |el| el.text_color(muted).line_through())
+                            .child(task.text.clone()),
+                    )
+            });
+            v_flex()
+                .gap_2()
+                .children(field("GOAL", &ov.goal, fg))
+                .children(field("NOW", &ov.now, accent))
+                .children(field("NEXT", &ov.next, fg))
+                .when(!ov.tasks.is_empty(), |el| {
+                    el.child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(h_flex().gap_1().child(label("TASKS")).child(
+                                div().text_xs().text_color(muted).child(format!(
+                                    "{}/{}",
+                                    ov.done_count(),
+                                    ov.tasks.len()
+                                )),
+                            ))
+                            .children(tasks),
+                    )
+                })
+                .into_any_element()
+        };
+
+        Some(
+            v_flex()
+                .id("overview")
+                .flex_none()
+                .max_h(relative(0.5))
+                .overflow_y_scroll()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(muted)
+                                .child("OVERVIEW"),
+                        )
+                        .when(t.overview_busy && !ov.is_empty(), |el| {
+                            el.child(div().text_xs().text_color(muted).child("updating…"))
+                        })
+                        .child(
+                            Button::new("refresh-overview")
+                                .xsmall()
+                                .ghost()
+                                .label("↻")
+                                .tooltip("Update the overview now")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(thread) = this.active_thread() {
+                                        thread.update(cx, |t, cx| t.update_overview(cx));
+                                    }
+                                })),
+                        ),
+                )
+                .child(body)
+                .when(!stats.is_empty(), |el| {
+                    el.child(div().pt_1().text_xs().text_color(muted).child(stats.join("  ·  ")))
+                })
+                .into_any_element(),
+        )
+    }
+
     fn changes_list(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let changes = self.project_changes(cx)?;
         let touched = self
@@ -625,28 +762,13 @@ impl Workspace {
 
     fn content_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, border, warning) = (theme.muted_foreground, theme.border, theme.warning);
+        let (border, warning) = (theme.border, theme.warning);
         let Some(thread) = self.active_thread() else {
             return h_flex().h(px(HEADER_HEIGHT)).flex_none().border_b_1().border_color(border).child(drag_area());
         };
         let t = thread.read(cx);
         let (mode, account_id, account_name) = (t.mode, t.account_id.clone(), t.account_name.clone());
         let title = t.title.clone().unwrap_or_else(|| "New thread".into());
-        let mut stats = Vec::new();
-        if let Some(model) = &t.model {
-            stats.push(thread::short_model(model));
-        }
-        for window in &t.usage {
-            let label = match window.id.as_str() {
-                "five_hour" => "5h",
-                "seven_day" => "7d",
-                other => other,
-            };
-            stats.push(format!("{label} {:.0}%", window.utilization * 100.0));
-        }
-        if t.cost_usd > 0.0 {
-            stats.push(if t.cost_usd < 1.0 { format!("${:.3}", t.cost_usd) } else { format!("${:.2}", t.cost_usd) });
-        }
         let status = match t.status {
             Status::Idle => "",
             Status::Running => "Working…",
@@ -728,7 +850,6 @@ impl Workspace {
             })
             .child(drag_area())
             .child(div().text_sm().text_color(warning).child(status))
-            .child(div().text_sm().text_color(muted).child(stats.join(" · ")))
             .child(
                 Button::new("toggle-terminal")
                     .xsmall()
@@ -762,6 +883,15 @@ fn drag_area() -> impl IntoElement {
     })
 }
 
+/// 12_345 -> "12k", 1_000_000 -> "1M".
+fn compact(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{}k", n / 1_000),
+        _ => format!("{}M", (n as f64 / 1_000_000.0 * 10.0).round() / 10.0),
+    }
+}
+
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
@@ -773,6 +903,7 @@ impl Render for Workspace {
         } else {
             None
         };
+        let overview_panel = self.overview_panel(cx);
         let changes_list = self.changes_list(cx);
         let main =
             if self.reviewing { Some(self.review(cx)) } else { self.active_thread().map(|t| t.into_any_element()) };
@@ -781,7 +912,7 @@ impl Render for Workspace {
             (theme.background, theme.foreground, theme.border, theme.muted_foreground, theme.danger);
         let terminal_title =
             terminal.as_ref().and_then(|t| t.read(cx).title().map(str::to_owned)).unwrap_or_else(|| "Terminal".into());
-        let right_column = terminal.is_some() || changes_list.is_some();
+        let right_column = terminal.is_some() || changes_list.is_some() || overview_panel.is_some();
 
         h_flex().size_full().bg(bg).text_color(fg).child(self.sidebar(cx)).child(
             v_flex()
@@ -801,6 +932,7 @@ impl Render for Workspace {
                                 .h_full()
                                 .border_l_1()
                                 .border_color(border)
+                                .children(overview_panel)
                                 .children(changes_list)
                                 .when_some(terminal, |el, term| {
                                     el.child(div().px_3().py_1().text_xs().text_color(muted).child(terminal_title))

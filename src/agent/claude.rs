@@ -278,16 +278,28 @@ impl Parser {
                     _ => Vec::new(),
                 }
             }
-            Some("assistant") if !from_subagent => blocks(m)
-                .filter(|b| b["type"] == "tool_use")
-                .filter_map(|b| {
-                    Some(AgentEvent::ToolStarted {
-                        id: str_at(b, "id")?,
-                        name: str_at(b, "name")?,
-                        input: b.get("input").cloned().unwrap_or(Value::Null),
+            Some("assistant") if !from_subagent => {
+                let mut events: Vec<AgentEvent> = blocks(m)
+                    .filter(|b| b["type"] == "tool_use")
+                    .filter_map(|b| {
+                        Some(AgentEvent::ToolStarted {
+                            id: str_at(b, "id")?,
+                            name: str_at(b, "name")?,
+                            input: b.get("input").cloned().unwrap_or(Value::Null),
+                        })
                     })
-                })
-                .collect(),
+                    .collect();
+                let usage = &m["message"]["usage"];
+                if usage.is_object() {
+                    let tokens =
+                        ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"]
+                            .iter()
+                            .filter_map(|k| usage.get(*k).and_then(Value::as_u64))
+                            .sum::<u64>();
+                    events.push(AgentEvent::Context { tokens: Some(tokens), window: None });
+                }
+                events
+            }
             Some("user") if !from_subagent => blocks(m)
                 .filter(|b| b["type"] == "tool_result")
                 .filter_map(|b| {
@@ -318,12 +330,20 @@ impl Parser {
             }
             Some("result") => {
                 let is_error = m.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-                vec![AgentEvent::TurnFinished {
+                let window = m["modelUsage"]
+                    .as_object()
+                    .and_then(|models| models.values().filter_map(|u| u.get("contextWindow")?.as_u64()).max());
+                let mut events = Vec::new();
+                if window.is_some() {
+                    events.push(AgentEvent::Context { tokens: None, window });
+                }
+                events.push(AgentEvent::TurnFinished {
                     cost_usd: m.get("total_cost_usd").and_then(Value::as_f64),
                     duration_ms: m.get("duration_ms").and_then(Value::as_u64),
                     is_error,
                     error: is_error.then(|| str_at(m, "result").unwrap_or_else(|| "The turn failed.".into())),
-                }]
+                });
+                events
             }
             Some("control_request") => {
                 let request = &m["request"];
@@ -424,6 +444,49 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
+/// One structured answer from a cheap, tool-less `claude -p` call: no tools, no MCP servers,
+/// nothing saved. `schema` constrains the JSON that comes back. Blocking.
+pub fn oneshot(
+    cwd: &std::path::Path,
+    config_dir: Option<&std::path::Path>,
+    model: &str,
+    system_prompt: &str,
+    schema: &Value,
+    input: &str,
+) -> anyhow::Result<Value> {
+    let mut command = Command::new("claude");
+    command
+        .args(["-p", "--model", model, "--output-format", "json", "--tools", "", "--no-session-persistence"])
+        .args(["--strict-mcp-config", "--system-prompt", system_prompt])
+        .args(["--json-schema", &schema.to_string()])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = config_dir {
+        command.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    let mut child = command.spawn().context("could not start claude")?;
+    child.stdin.take().context("claude stdin")?.write_all(input.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() && output.stdout.is_empty() {
+        anyhow::bail!("claude failed: {}", String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or(""));
+    }
+    parse_oneshot(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The structured answer in `claude -p --output-format json` output.
+pub fn parse_oneshot(output: &str) -> anyhow::Result<Value> {
+    let value: Value = serde_json::from_str(output.trim()).context("claude's output was not JSON")?;
+    if value.get("is_error").and_then(Value::as_bool) == Some(true) {
+        anyhow::bail!("{}", value.get("result").and_then(Value::as_str).unwrap_or("the call failed"));
+    }
+    match value.get("structured_output") {
+        Some(v) if !v.is_null() => Ok(v.clone()),
+        _ => Ok(serde_json::from_str(value.get("result").and_then(Value::as_str).unwrap_or("{}"))?),
+    }
+}
+
 /// Whether `version` is newer than [`TESTED_VERSION`], comparing dotted numbers.
 pub fn is_newer_than_tested(version: &str) -> bool {
     let parse = |v: &str| v.split('.').map(|p| p.trim().parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
@@ -507,6 +570,21 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::TurnFinished { cost_usd: Some(c), is_error: false, .. } if *c > 0.0))
         );
+    }
+
+    #[test]
+    fn context_size_and_window_are_reported() {
+        let events = replay("2.1.331-approve.jsonl");
+        let tokens = events.iter().rev().find_map(|e| match e {
+            AgentEvent::Context { tokens: Some(t), .. } => Some(*t),
+            _ => None,
+        });
+        let window = events.iter().find_map(|e| match e {
+            AgentEvent::Context { window: Some(w), .. } => Some(*w),
+            _ => None,
+        });
+        assert!(tokens.is_some_and(|t| t > 1_000), "{tokens:?}");
+        assert_eq!(window, Some(1_000_000));
     }
 
     #[test]

@@ -21,7 +21,11 @@ use crate::agent::{
     AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, ScriptedAgent, ScriptedCall, UsageWindow,
     claude::{self, ClaudeSession, SessionOptions},
 };
+use crate::overview::{self, Overview};
 use crate::store::{Record, TranscriptWriter};
+
+/// How often a long turn's overview is refreshed while it runs.
+const OVERVIEW_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The most transcript text handed to a new session when a thread switches accounts.
 const HANDOFF_MAX_CHARS: usize = 30_000;
@@ -112,6 +116,16 @@ pub struct ThreadView {
     handoff: Option<String>,
     /// Files the agent wrote or edited in this thread (paths as the tools gave them).
     pub touched: HashSet<String>,
+    /// Goal, Now, Next and tasks, kept by a cheap model.
+    pub overview: Overview,
+    /// How much of `plain` the overview has read.
+    overview_mark: usize,
+    pub overview_busy: bool,
+    overview_again: bool,
+    _overview_tick: Option<Task<()>>,
+    /// Tokens in the latest request, and the model's context window.
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<u64>,
     scroller: Entity<MessageScrollerState>,
     prompt: Entity<TextareaState>,
     backend: Option<Backend>,
@@ -169,6 +183,13 @@ impl ThreadView {
             replaying: false,
             handoff: None,
             touched: HashSet::new(),
+            overview: Overview::default(),
+            overview_mark: 0,
+            overview_busy: false,
+            overview_again: false,
+            _overview_tick: None,
+            context_tokens: None,
+            context_window: None,
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             prompt,
             backend: Some(backend),
@@ -206,6 +227,10 @@ impl ThreadView {
                 }
                 Record::AccountSwitch { from, to } => {
                     self.notice(NoticeKind::Info, format!("Switched from {from} to {to}."), cx)
+                }
+                Record::Overview { overview, mark } => {
+                    self.overview = overview;
+                    self.overview_mark = mark.min(self.plain.len());
                 }
             }
         }
@@ -327,6 +352,81 @@ impl ThreadView {
         }
         self.handoff = None;
         self.status = Status::Running;
+        self.start_overview_ticker(cx);
+        cx.emit(ThreadChanged);
+        cx.notify();
+    }
+
+    /// While a turn runs, refresh the overview every [`OVERVIEW_EVERY`].
+    fn start_overview_ticker(&mut self, cx: &mut Context<Self>) {
+        if self._overview_tick.is_some() || !self.writes_overview() {
+            return;
+        }
+        self._overview_tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(OVERVIEW_EVERY).await;
+                let alive = this.update(cx, |t: &mut ThreadView, cx| {
+                    if t.status != Status::Idle {
+                        t.update_overview(cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Overviews come from Claude, so only Claude-backed threads write them.
+    fn writes_overview(&self) -> bool {
+        matches!(self.backend, Some(Backend::Claude(_)))
+    }
+
+    /// Ask the overview writer to read what's new. At most one update runs at a time.
+    pub fn update_overview(&mut self, cx: &mut Context<Self>) {
+        if self.replaying || !self.writes_overview() || self.plain.len() <= self.overview_mark {
+            return;
+        }
+        if self.overview_busy {
+            self.overview_again = true;
+            return;
+        }
+        let Some(Backend::Claude(options)) = &self.backend else { return };
+        let (cwd, config_dir) = (options.cwd.clone(), options.config_dir.clone());
+        let mark = self.plain.len();
+        let delta = self.plain[self.overview_mark..].join("\n\n");
+        let current = self.overview.clone();
+        self.overview_busy = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { overview::write(&cwd, config_dir.as_deref(), &current, &delta) })
+                .await;
+            let _ = this.update(cx, |t: &mut ThreadView, cx| {
+                t.overview_busy = false;
+                match result {
+                    Ok(overview) => t.apply_overview(overview, mark, cx),
+                    // Not worth a notice: the next turn tries again with a larger delta.
+                    Err(err) => eprintln!("tj: overview update failed: {err:#}"),
+                }
+                if std::mem::take(&mut t.overview_again) {
+                    t.update_overview(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Take a new overview covering `plain[..mark]`, and save it.
+    pub fn apply_overview(&mut self, overview: Overview, mark: usize, cx: &mut Context<Self>) {
+        if let Some(title) = &overview.title {
+            self.title = Some(title.clone());
+        }
+        self.overview = overview.clone();
+        self.overview_mark = mark;
+        self.write(Record::Overview { overview, mark });
         cx.emit(ThreadChanged);
         cx.notify();
     }
@@ -504,7 +604,21 @@ impl ThreadView {
                     self.touched.insert(path.to_string());
                 }
                 let summary = tool_summary(&name, &input);
-                self.plain.push(format!("(Claude used {name}: {})", truncate(&summary, 300)));
+                let line = match (name.as_str(), input.get("todos").and_then(Value::as_array)) {
+                    // Claude's own task list is the best evidence for the overview's tasks.
+                    ("TodoWrite", Some(todos)) => {
+                        let items: Vec<String> = todos
+                            .iter()
+                            .filter_map(|t| {
+                                let done = t.get("status").and_then(Value::as_str) == Some("completed");
+                                Some(format!("[{}] {}", if done { "x" } else { " " }, t.get("content")?.as_str()?))
+                            })
+                            .collect();
+                        format!("(Claude updated its task list: {})", items.join("; "))
+                    }
+                    _ => format!("(Claude used {name}: {})", truncate(&summary, 300)),
+                };
+                self.plain.push(line);
                 self.plain_current = None;
                 self.push_row(
                     Row::Tool(ToolRow {
@@ -522,6 +636,10 @@ impl ThreadView {
                 if let Some(ix) = self.rows.iter().rposition(|r| matches!(r, Row::Tool(t) if t.id == id)) {
                     if let Row::Tool(tool) = &mut self.rows[ix] {
                         tool.status = if is_error { ToolStatus::Failed } else { ToolStatus::Done };
+                        if is_error {
+                            self.plain.push(format!("({} failed: {})", tool.name, truncate(&output, 240)));
+                            self.plain_current = None;
+                        }
                         tool.output = Some(output);
                     }
                     self.remeasure(ix, cx);
@@ -542,6 +660,10 @@ impl ThreadView {
                     self.remeasure(ix, cx);
                 }
             }
+            AgentEvent::Context { tokens, window } => {
+                self.context_tokens = tokens.or(self.context_tokens);
+                self.context_window = window.or(self.context_window);
+            }
             AgentEvent::Usage(windows) => {
                 for window in windows {
                     match self.usage.iter_mut().find(|w| w.id == window.id) {
@@ -553,6 +675,7 @@ impl ThreadView {
             AgentEvent::TurnFinished { cost_usd, duration_ms, is_error, error } => {
                 self.current_text = None;
                 self.status = Status::Idle;
+                self.update_overview(cx);
                 if let Some(cost) = cost_usd {
                     self.cost_usd += cost;
                 }
@@ -1145,6 +1268,51 @@ mod tests {
         assert_eq!(requests, vec!["two", "three", "four"]);
         let relative = crate::changes::touched_relative(std::path::Path::new("/p"), &touched);
         assert!(relative.contains("src/a.rs") && relative.contains("b.md"));
+    }
+
+    #[gpui_kit::test]
+    fn an_applied_overview_sets_the_title_and_survives_a_reopen(cx: &mut TestAppContext) {
+        let path = std::env::temp_dir().join(format!("tj-overview-{}.jsonl", crate::store::new_id()));
+        let setup = super::ThreadSetup { transcript: Some(path.clone()), ..Default::default() };
+        let (window, _thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let first = cx.update(|window, cx| {
+            cx.new(|cx| ThreadView::open(setup.clone(), Backend::Scripted(Vec::new()), window, cx))
+        });
+        let overview = crate::overview::Overview {
+            title: Some("Dark mode toggle".into()),
+            goal: Some("Ship a dark mode setting".into()),
+            tasks: vec![crate::overview::Task { text: "Add toggle".into(), done: true }],
+            ..Default::default()
+        };
+        first.update(cx, |t, cx| {
+            t.attach_scripted(ScriptedAgent::start(Vec::new()).0);
+            t.send("Add a dark mode toggle", cx);
+            let mark = t.plain.len();
+            t.apply_overview(overview.clone(), mark, cx);
+        });
+        assert_eq!(first.read_with(cx, |t, _| t.title.clone()), Some("Dark mode toggle".into()));
+
+        let second =
+            cx.update(|window, cx| cx.new(|cx| ThreadView::open(setup, Backend::Scripted(Vec::new()), window, cx)));
+        assert_eq!(second.read_with(cx, |t, _| t.overview.clone()), overview);
+        assert_eq!(second.read_with(cx, |t, _| t.overview_mark), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[gpui_kit::test]
+    fn claudes_task_list_reaches_the_overview_text(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, cx| {
+            let todos = serde_json::json!({ "todos": [
+                { "content": "Write parser", "status": "completed" },
+                { "content": "Add tests", "status": "in_progress" }
+            ]});
+            t.handle(AgentEvent::ToolStarted { id: "1".into(), name: "TodoWrite".into(), input: todos }, cx);
+        });
+        let plain = thread.read_with(cx, |t, _| t.plain.clone());
+        assert_eq!(plain, vec!["(Claude updated its task list: [x] Write parser; [ ] Add tests)"]);
     }
 
     #[gpui_kit::test]

@@ -196,21 +196,18 @@ fn summary_schema() -> Value {
 }
 
 /// Read `claude -p --output-format json` output into path -> summary.
+#[cfg(test)]
 pub fn parse_summaries(output: &str) -> anyhow::Result<HashMap<String, String>> {
-    let value: Value = serde_json::from_str(output.trim()).context("summary output was not JSON")?;
-    if value.get("is_error").and_then(Value::as_bool) == Some(true) {
-        bail!("{}", value.get("result").and_then(Value::as_str).unwrap_or("the summary call failed"));
-    }
-    let structured = match value.get("structured_output") {
-        Some(v) if !v.is_null() => v.clone(),
-        _ => serde_json::from_str(value.get("result").and_then(Value::as_str).unwrap_or("{}"))?,
-    };
-    Ok(structured["files"]
+    Ok(summaries_from(&crate::agent::claude::parse_oneshot(output)?))
+}
+
+fn summaries_from(structured: &Value) -> HashMap<String, String> {
+    structured["files"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|f| Some((f.get("path")?.as_str()?.to_string(), f.get("summary")?.as_str()?.trim().to_string())))
-        .collect())
+        .collect()
 }
 
 /// Ask Claude (Haiku, no tools, nothing saved) for a summary of each file. Blocking.
@@ -220,26 +217,15 @@ pub fn summarize(
     requests: &[String],
     files: &[&FileChange],
 ) -> anyhow::Result<HashMap<String, String>> {
-    use std::io::Write as _;
-    let mut command = Command::new("claude");
-    command
-        .args(["-p", "--model", "haiku", "--output-format", "json", "--tools", "", "--no-session-persistence"])
-        .args(["--strict-mcp-config", "--system-prompt", SUMMARY_SYSTEM_PROMPT])
-        .args(["--json-schema", &summary_schema().to_string()])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(dir) = config_dir {
-        command.env("CLAUDE_CONFIG_DIR", dir);
-    }
-    let mut child = command.spawn().context("could not start claude")?;
-    child.stdin.take().context("claude stdin")?.write_all(summary_prompt(requests, files).as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() && output.stdout.is_empty() {
-        bail!("claude failed: {}", String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or(""));
-    }
-    parse_summaries(&String::from_utf8_lossy(&output.stdout))
+    let structured = crate::agent::claude::oneshot(
+        cwd,
+        config_dir,
+        "haiku",
+        SUMMARY_SYSTEM_PROMPT,
+        &summary_schema(),
+        &summary_prompt(requests, files),
+    )?;
+    Ok(summaries_from(&structured))
 }
 
 fn truncate(text: &str, max: usize) -> String {

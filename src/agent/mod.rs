@@ -135,6 +135,11 @@ pub enum AgentEvent {
         id: String,
     },
     Usage(Vec<UsageWindow>),
+    /// How full the context is: tokens in the latest request, and the model's window.
+    Context {
+        tokens: Option<u64>,
+        window: Option<u64>,
+    },
     TurnFinished {
         cost_usd: Option<f64>,
         duration_ms: Option<u64>,
