@@ -202,6 +202,9 @@ pub struct ModelChoice {
     pub value: String,
     pub name: String,
     pub description: String,
+    /// The model id the value runs (`claude-opus-5-5`), when `claude` says.
+    #[serde(default)]
+    pub resolved: Option<String>,
     /// Effort levels the model accepts (`low` ... `max`); empty when it has none.
     pub efforts: Vec<String>,
 }
@@ -221,6 +224,7 @@ impl ModelChoice {
             value: value.into(),
             name: name.into(),
             description: description.into(),
+            resolved: None,
             efforts: effort.clone(),
         })
         .collect()

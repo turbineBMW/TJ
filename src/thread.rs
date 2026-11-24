@@ -69,6 +69,9 @@ pub struct MenuContext {
     pub branch: Option<String>,
 }
 
+/// The model menu's width; descriptions wrap inside it.
+const MODEL_MENU_WIDTH: f32 = 400.0;
+
 /// The widest the conversation and composer get, so lines stay readable in a wide window.
 const MAX_CONVERSATION_WIDTH: f32 = 860.0;
 
@@ -505,20 +508,18 @@ impl ThreadView {
         self.menus.models.iter().find(|m| m.value == value)
     }
 
-    /// "Opus 5.5 · High": the picked model's name, else the model the session runs, else the
-    /// default's; then the effort, when one is set.
+    /// "Opus 5.5 · High": the model a session runs, else the one the picked entry resolves
+    /// to (also for "default"), else the entry's name; then the effort, when one is set.
+    /// Descriptions are never used: accounts word them differently (some add pricing).
     pub fn model_label(&self) -> String {
-        let name = match (&self.model_choice, self.model_info()) {
-            (Some(_), Some(info)) => info.name.clone(),
-            (Some(value), None) => value.clone(),
-            (None, _) => match &self.model {
-                Some(running) => short_model(running),
-                None => self
-                    .model_info()
-                    .and_then(|m| m.description.split(" · ").next().filter(|d| !d.is_empty()).map(str::to_owned))
-                    .unwrap_or_else(|| "Default model".into()),
-            },
-        };
+        let info = self.model_info();
+        let resolved = info.and_then(|m| m.resolved.as_deref()).map(short_model);
+        let name = match &self.model_choice {
+            // A session reports the model that really answered; after a switch it catches up.
+            None => self.model.as_deref().map(short_model).or(resolved),
+            Some(value) => resolved.or_else(|| info.map(|m| m.name.clone())).or_else(|| Some(value.clone())),
+        }
+        .unwrap_or_else(|| "Default model".into());
         match &self.effort {
             Some(effort) => format!("{name} · {}", capitalize(effort)),
             None => name,
@@ -1634,16 +1635,24 @@ impl ThreadView {
                 let (choice, effort) = (self.model_choice.clone(), self.effort.clone());
                 let efforts = self.model_info().map(|m| m.efforts.clone()).unwrap_or_default();
                 move |menu, _window, _cx| {
-                    let mut menu = menu.label("Model");
+                    // Two lines per model: its name, then its description (long on some accounts,
+                    // with pricing), wrapping inside a fixed-width menu.
+                    let mut menu = menu.min_w(px(MODEL_MENU_WIDTH)).max_w(px(MODEL_MENU_WIDTH)).label("Model");
                     for model in &menus.models {
                         let (thread, value) = (thread.clone(), model.value.clone());
                         let picked = choice.as_deref().unwrap_or("default") == model.value;
-                        let label = if model.description.is_empty() {
-                            model.name.clone()
-                        } else {
-                            format!("{} — {}", model.name, model.description)
-                        };
-                        menu = menu.item(PopupMenuItem::new(label).checked(picked).on_click(move |_, _, cx| {
+                        let (name, description) = (model.name.clone(), model.description.clone());
+                        let item = PopupMenuItem::element(move |_, cx| {
+                            let muted = cx.theme().muted_foreground;
+                            v_flex()
+                                .w(px(MODEL_MENU_WIDTH - 56.0))
+                                .py_0p5()
+                                .child(div().text_sm().child(name.clone()))
+                                .when(!description.is_empty(), |el| {
+                                    el.child(div().text_xs().text_color(muted).child(description.clone()))
+                                })
+                        });
+                        menu = menu.item(item.checked(picked).on_click(move |_, _, cx| {
                             let value = (value != "default").then(|| value.clone());
                             thread.update(cx, |t, cx| t.set_model_choice(value, cx))
                         }));
@@ -2296,15 +2305,21 @@ mod tests {
             value: value.into(),
             name: name.into(),
             description: String::new(),
+            resolved: None,
             efforts: efforts.iter().map(|e| e.to_string()).collect(),
         };
         thread.update(cx, |t, cx| {
             t.menus.models = vec![
+                // Worded like the Work account's list: the label must not come from this text.
                 ModelChoice {
-                    description: "Opus 5.5 · Best for everyday tasks".into(),
-                    ..model("default", "Default", &["low", "high"])
+                    description: "Use the default model (currently Opus 5.5) · $4/$20 per Mtok".into(),
+                    resolved: Some("claude-opus-5-5".into()),
+                    ..model("default", "Default (recommended)", &["low", "high"])
                 },
-                model("sonnet", "Sonnet 5.5", &["low", "high"]),
+                ModelChoice {
+                    resolved: Some("claude-sonnet-5-5".into()),
+                    ..model("sonnet", "Sonnet", &["low", "high"])
+                },
                 model("claude-haiku-4-5", "Haiku 4.5", &[]),
             ];
             assert_eq!(t.model_label(), "Opus 5.5", "the default's model name, before a session says otherwise");

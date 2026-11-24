@@ -253,6 +253,7 @@ pub fn parse_models(models: &Value) -> Vec<super::ModelChoice> {
                 value: m.get("value")?.as_str()?.to_string(),
                 name: m.get("displayName").and_then(Value::as_str).unwrap_or_default().to_string(),
                 description: m.get("description").and_then(Value::as_str).unwrap_or_default().to_string(),
+                resolved: m.get("resolvedModel").and_then(Value::as_str).map(str::to_owned),
                 efforts: m["supportedEffortLevels"]
                     .as_array()
                     .into_iter()
@@ -900,6 +901,7 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].value, "default");
         assert_eq!(models[0].efforts, vec!["low", "high"]);
+        assert_eq!(models[0].resolved.as_deref(), Some("claude-opus-5-5"));
         assert!(models[1].efforts.is_empty(), "a model without effort levels offers none");
     }
 
