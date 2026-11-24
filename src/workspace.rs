@@ -6,7 +6,7 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
@@ -76,6 +76,8 @@ pub struct Workspace {
     no_summaries: bool,
     /// The sidebar-opacity slider in the settings popover.
     opacity_slider: Entity<SliderState>,
+    /// The cursor-animation slider (milliseconds; 0 is off).
+    glide_slider: Entity<SliderState>,
     /// The thread whose title is being edited in the sidebar, and the editor.
     renaming: Option<(String, Entity<InputState>)>,
     /// Projects whose archived threads are listed.
@@ -100,6 +102,18 @@ impl Workspace {
         let opacity = cx.try_global::<Settings>().map(|s| s.sidebar_opacity).unwrap_or(0.8);
         let opacity_slider =
             cx.new(|_| SliderState::new().min(Settings::MIN_OPACITY).max(1.0).step(0.05).default_value(opacity));
+        let glide =
+            cx.try_global::<Settings>().map(|s| s.cursor_glide_ms).unwrap_or(Settings::default().cursor_glide_ms);
+        let glide_slider = cx.new(|_| {
+            SliderState::new().min(0.).max(Settings::MAX_GLIDE_MS as f32).step(10.).default_value(glide as f32)
+        });
+        let glide_events = cx.subscribe(&glide_slider, |this, _, event: &SliderEvent, cx| {
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
+            if let SliderValue::Single(ms) = value {
+                let ms = ms.round().max(0.) as u32;
+                this.update_settings(cx, |s| s.cursor_glide_ms = ms);
+            }
+        });
         let slider_events = cx.subscribe(&opacity_slider, |this, _, event: &SliderEvent, cx| {
             let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
             if let SliderValue::Single(opacity) = value {
@@ -128,7 +142,8 @@ impl Workspace {
             show_archived: Default::default(),
             no_summaries: launch.no_summaries,
             opacity_slider,
-            _subscriptions: vec![slider_events],
+            glide_slider,
+            _subscriptions: vec![slider_events, glide_events],
         };
 
         // Open the requested folder, or the current one when there are no projects yet.
@@ -634,6 +649,7 @@ impl Workspace {
     fn settings_popover(&self, cx: &mut Context<Self>) -> AnyElement {
         let this = cx.entity();
         let slider = self.opacity_slider.clone();
+        let glide_slider = self.glide_slider.clone();
         let theme_name = crate::omarchy::theme_name(&self.home);
         Popover::new("settings")
             .anchor(Anchor::TopLeft)
@@ -641,7 +657,11 @@ impl Workspace {
             .content(move |_, _window, cx| {
                 let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
                 let muted = cx.theme().muted_foreground;
-                let (this_follow, this_transparent) = (this.clone(), this.clone());
+                let (this_follow, this_transparent, this_trail) = (this.clone(), this.clone(), this.clone());
+                let glide = match settings.cursor_glide_ms {
+                    0 => "Off".to_string(),
+                    ms => format!("{ms} ms"),
+                };
                 let row = |label: &'static str, hint: Option<String>, control: AnyElement| {
                     h_flex()
                         .gap_3()
@@ -690,6 +710,30 @@ impl Workspace {
                             ))
                             .child(Slider::new(&slider).disabled(!settings.transparent_sidebar)),
                     )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .text_sm()
+                                    .child("Cursor animation")
+                                    .child(div().text_color(muted).child(glide)),
+                            )
+                            .child(Slider::new(&glide_slider)),
+                    )
+                    .child(row(
+                        "Cursor trail",
+                        Some("The cursor stretches as it moves".into()),
+                        Switch::new("cursor-trail")
+                            .checked(settings.cursor_trail)
+                            .disabled(settings.cursor_glide_ms == 0)
+                            .on_change(move |checked, _, cx| {
+                                let checked = *checked;
+                                this_trail.update(cx, |w, cx| w.update_settings(cx, |s| s.cursor_trail = checked))
+                            })
+                            .into_any_element(),
+                    ))
             })
             .into_any_element()
     }
@@ -1156,7 +1200,8 @@ impl Workspace {
                                 this.finish_rename(false, cx);
                                 cx.stop_propagation();
                             }))
-                            .child(Input::new(&input).xsmall()),
+                            .child(Input::new(&input).xsmall())
+                            .child(crate::caret::overlay(&input)),
                     ),
                     None => el.child(label),
                 })
@@ -1567,6 +1612,26 @@ mod tests {
         workspace.update_in(cx, |w, window, cx| w.new_thread(&project_id, window, cx));
         let second = workspace.read_with(cx, |w, _| w.active.clone().unwrap());
         (project_id, first, second)
+    }
+
+    #[gpui_kit::test]
+    fn cursor_settings_are_offered_and_saved(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("settings-button", cx);
+            window.render_frame(cx);
+        });
+        workspace.update(cx, |w, cx| {
+            w.update_settings(cx, |s| {
+                s.cursor_glide_ms = 0;
+                s.cursor_trail = false;
+            })
+        });
+        let saved = crate::settings::Settings::load(&paths);
+        assert_eq!((saved.cursor_glide_ms, saved.cursor_trail), (0, false));
+        cx.update(|window, cx| window.render_frame(cx));
     }
 
     #[gpui_kit::test]

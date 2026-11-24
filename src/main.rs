@@ -1,6 +1,7 @@
 //! TJ: a native GUI for coding agents.
 
 mod agent;
+mod caret;
 mod changes;
 mod composer;
 mod demo;

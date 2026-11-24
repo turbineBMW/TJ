@@ -576,6 +576,8 @@ pub fn apply(cx: &mut gpui_kit::App, follow: bool, font_family: Option<&str>) {
     if let Some(font) = font_family {
         Theme::global_mut(cx).font_family = font.to_string().into();
     }
+    // TJ draws the text fields' caret itself, so it can glide (see `caret`).
+    crate::caret::hide_native_caret(cx);
     cx.refresh_windows();
 }
 

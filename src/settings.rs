@@ -17,11 +17,21 @@ pub struct Settings {
     pub transparent_sidebar: bool,
     /// 0.3 to 1.0; used while `transparent_sidebar` is on.
     pub sidebar_opacity: f32,
+    /// How long the cursor takes to glide to a new place, in milliseconds (0: it jumps).
+    pub cursor_glide_ms: u32,
+    /// The cursor stretches along its path as it moves, and snaps back.
+    pub cursor_trail: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { follow_omarchy_theme: true, transparent_sidebar: false, sidebar_opacity: 0.8 }
+        Self {
+            follow_omarchy_theme: true,
+            transparent_sidebar: false,
+            sidebar_opacity: 0.8,
+            cursor_glide_ms: 90,
+            cursor_trail: true,
+        }
     }
 }
 
@@ -29,11 +39,17 @@ impl gpui_kit::Global for Settings {}
 
 impl Settings {
     pub const MIN_OPACITY: f32 = 0.3;
+    /// The slowest cursor animation the settings offer.
+    pub const MAX_GLIDE_MS: u32 = 300;
 
     pub fn load(paths: &Paths) -> Self {
         fs::read_to_string(paths.config_dir.join("settings.toml"))
             .ok()
-            .and_then(|text| toml::from_str(&text).ok())
+            .and_then(|text| toml::from_str::<Self>(&text).ok())
+            .map(|mut s| {
+                s.cursor_glide_ms = s.cursor_glide_ms.min(Self::MAX_GLIDE_MS);
+                s
+            })
             .unwrap_or_default()
     }
 
@@ -58,7 +74,13 @@ mod tests {
     fn defaults_save_and_load() {
         let paths = Paths::in_dir(&std::env::temp_dir().join(format!("tj-settings-{}", new_id())));
         assert_eq!(Settings::load(&paths), Settings::default());
-        let settings = Settings { transparent_sidebar: true, sidebar_opacity: 0.6, ..Default::default() };
+        let settings = Settings {
+            transparent_sidebar: true,
+            sidebar_opacity: 0.6,
+            cursor_glide_ms: 150,
+            cursor_trail: false,
+            ..Default::default()
+        };
         settings.save(&paths).unwrap();
         assert_eq!(Settings::load(&paths), settings);
         assert_eq!(settings.sidebar_alpha(), 0.6);
