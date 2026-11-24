@@ -36,6 +36,8 @@ pub struct SessionOptions {
     /// The account's config directory (`CLAUDE_CONFIG_DIR`); Claude's default when `None`.
     pub config_dir: Option<PathBuf>,
     pub model: Option<String>,
+    /// `--effort` (low ... max); the model's default when `None`.
+    pub effort: Option<String>,
     pub permission_mode: PermissionMode,
     /// Continue an earlier conversation.
     pub resume: Option<String>,
@@ -59,6 +61,9 @@ impl SessionOptions {
         args.extend(["--permission-mode".into(), self.permission_mode.claude_name().into()]);
         if let Some(model) = &self.model {
             args.extend(["--model".into(), model.clone()]);
+        }
+        if let Some(effort) = &self.effort {
+            args.extend(["--effort".into(), effort.clone()]);
         }
         if let Some(session) = &self.resume {
             args.extend(["--resume".into(), session.clone()]);
@@ -184,6 +189,79 @@ impl AgentSession for ClaudeSession {
     fn set_permission_mode(&self, mode: PermissionMode) -> anyhow::Result<()> {
         self.control("set_permission_mode", json!({ "mode": mode.claude_name() }))
     }
+
+    fn set_model(&self, model: Option<&str>) -> anyhow::Result<()> {
+        self.control("set_model", json!({ "model": model }))
+    }
+
+    /// Effort is a flag-tier setting; `null` returns to the model's default effort.
+    fn set_effort(&self, effort: Option<&str>) -> anyhow::Result<()> {
+        self.control("apply_flag_settings", json!({ "settings": { "effortLevel": effort } }))
+    }
+}
+
+/// The models `claude` offers this account, read from the `initialize` reply of a session
+/// that is stopped straight after (no prompt is sent, so it costs nothing). Blocking.
+pub fn list_models(config_dir: Option<&std::path::Path>) -> anyhow::Result<Vec<super::ModelChoice>> {
+    let mut command = Command::new("claude");
+    command
+        .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(dir) = config_dir {
+        command.env("CLAUDE_CONFIG_DIR", dir);
+    }
+    let mut child = command.spawn().context("could not start claude")?;
+    let mut stdin = child.stdin.take().context("claude stdin")?;
+    let stdout = child.stdout.take().context("claude stdout")?;
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "type": "control_request", "request_id": "tj-models", "request": { "subtype": "initialize" } })
+    )?;
+    stdin.flush()?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(message) = serde_json::from_str::<Value>(&line)
+                && message["response"]["request_id"] == "tj-models"
+            {
+                let _ = tx.send(message);
+                return;
+            }
+        }
+    });
+    let reply = rx.recv_timeout(std::time::Duration::from_secs(20));
+    let _ = child.kill();
+    let _ = child.wait();
+    let reply = reply.context("claude did not answer in time")?;
+    let models = parse_models(&reply["response"]["response"]["models"]);
+    anyhow::ensure!(!models.is_empty(), "claude listed no models");
+    Ok(models)
+}
+
+pub fn parse_models(models: &Value) -> Vec<super::ModelChoice> {
+    models
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            Some(super::ModelChoice {
+                value: m.get("value")?.as_str()?.to_string(),
+                name: m.get("displayName").and_then(Value::as_str).unwrap_or_default().to_string(),
+                description: m.get("description").and_then(Value::as_str).unwrap_or_default().to_string(),
+                efforts: m["supportedEffortLevels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.as_str().map(str::to_owned))
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 impl Drop for ClaudeSession {
@@ -354,6 +432,9 @@ impl Parser {
                         })
                     })
                     .collect();
+                if let Some(model) = str_at(&m["message"], "model") {
+                    events.push(AgentEvent::ModelInUse(model));
+                }
                 let usage = &m["message"]["usage"];
                 if usage.is_object() {
                     let tokens =
@@ -809,6 +890,35 @@ mod tests {
     }
 
     #[test]
+    fn models_are_read_from_the_initialize_reply() {
+        let models = parse_models(&json!([
+            { "value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default (recommended)",
+              "description": "Opus 5.5 · Best for everyday, complex tasks", "supportedEffortLevels": ["low", "high"] },
+            { "value": "claude-haiku-4-5-20251001", "displayName": "Haiku 4.5", "description": "Fastest" },
+            { "displayName": "no value: skipped" }
+        ]));
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].value, "default");
+        assert_eq!(models[0].efforts, vec!["low", "high"]);
+        assert!(models[1].efforts.is_empty(), "a model without effort levels offers none");
+    }
+
+    #[test]
+    fn effort_becomes_a_flag() {
+        let options = SessionOptions { model: Some("opus".into()), effort: Some("high".into()), ..Default::default() };
+        let args = options.args().join(" ");
+        assert!(args.contains("--model opus") && args.contains("--effort high"), "{args}");
+    }
+
+    /// `cargo test -- --ignored live_` (no tokens: the session is stopped after its handshake)
+    #[test]
+    #[ignore]
+    fn live_models_are_listed() {
+        let models = list_models(None).unwrap();
+        assert!(models.iter().any(|m| m.value == "haiku"), "{models:?}");
+    }
+
+    #[test]
     fn version_check() {
         assert!(!is_newer_than_tested(TESTED_VERSION));
         assert!(!is_newer_than_tested("2.1.300"));
@@ -876,6 +986,33 @@ mod tests {
         }
         assert!(asked, "expected a question");
         assert!(text.to_lowercase().contains("pear"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Switching model and effort mid-session: the next reply comes from the new model, and
+    /// neither control request is refused.
+    #[test]
+    #[ignore]
+    fn live_model_and_effort_switch() {
+        let dir = std::env::temp_dir().join(format!("tj-live-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = SessionOptions { cwd: dir.clone(), model: Some("haiku".into()), ..Default::default() };
+        let (session, events) = ClaudeSession::spawn(&options).unwrap();
+        session.set_model(Some("sonnet")).unwrap();
+        session.set_effort(Some("low")).unwrap();
+        session.send_prompt("Reply with just the word ok.").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut models = Vec::new();
+        while std::time::Instant::now() < deadline {
+            match smol::block_on(events.recv()).expect("events") {
+                AgentEvent::ModelInUse(model) => models.push(model),
+                AgentEvent::Error(err) => panic!("a control request was refused: {err}"),
+                AgentEvent::TurnFinished { .. } => break,
+                AgentEvent::Exited { stderr, .. } => panic!("claude exited: {stderr}"),
+                _ => {}
+            }
+        }
+        assert!(models.iter().any(|m| m.contains("sonnet")), "{models:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

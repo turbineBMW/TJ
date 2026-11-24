@@ -188,6 +188,11 @@ pub struct ThreadMeta {
     pub account: Option<String>,
     #[serde(default, with = "mode_name")]
     pub mode: Option<PermissionMode>,
+    /// The thread's own model and effort, overriding the project's.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -200,6 +205,11 @@ pub struct Project {
     pub account: Option<String>,
     #[serde(default, with = "mode_name")]
     pub mode: Option<PermissionMode>,
+    /// The model and effort new threads start with; Claude Code's defaults when absent.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub threads: Vec<ThreadMeta>,
     /// The project's panes and their tabs (conversations, terminals, the review).
@@ -306,6 +316,8 @@ impl State {
             path,
             account: None,
             mode: None,
+            model: None,
+            effort: None,
             threads: Vec::new(),
             layout: None,
         });
@@ -342,6 +354,8 @@ impl State {
                 session_account: None,
                 account: None,
                 mode: None,
+                model: None,
+                effort: None,
             },
         );
         Some(id)
