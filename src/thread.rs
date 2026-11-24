@@ -11,6 +11,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    menu::{DropdownMenu as _, PopupMenuItem},
     message_scroller::{MessageScroller, MessageScrollerState},
     text::{TextView, TextViewState},
 };
@@ -34,6 +35,33 @@ const HANDOFF_MAX_CHARS: usize = 30_000;
 pub struct ThreadChanged;
 
 impl EventEmitter<ThreadChanged> for ThreadView {}
+
+/// Something the composer's menus ask the workspace to do.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ThreadAction {
+    SwitchAccount(String),
+    /// Make the thread's account the default for new threads in its project.
+    MakeAccountDefault,
+    /// Make the thread's mode the default for new threads in its project.
+    MakeModeDefault,
+    /// Start `claude auth login` for the thread's account in a terminal.
+    LogIn,
+}
+
+impl EventEmitter<ThreadAction> for ThreadView {}
+
+/// What the composer's menus offer, provided by the workspace.
+#[derive(Clone, Default)]
+pub struct MenuContext {
+    /// (id, name) of every account.
+    pub accounts: Vec<(String, String)>,
+    pub project_name: String,
+    pub project_account: String,
+    pub project_mode: PermissionMode,
+}
+
+/// The widest the conversation and composer get, so lines stay readable in a wide window.
+const MAX_CONVERSATION_WIDTH: f32 = 860.0;
 
 /// Who the thread is and where it keeps its transcript.
 #[derive(Clone, Default)]
@@ -126,6 +154,8 @@ pub struct ThreadView {
     /// Tokens in the latest request, and the model's context window.
     pub context_tokens: Option<u64>,
     pub context_window: Option<u64>,
+    /// What the account and mode menus offer.
+    pub menus: MenuContext,
     scroller: Entity<MessageScrollerState>,
     prompt: Entity<TextareaState>,
     backend: Option<Backend>,
@@ -190,6 +220,7 @@ impl ThreadView {
             _overview_tick: None,
             context_tokens: None,
             context_window: None,
+            menus: MenuContext::default(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             prompt,
             backend: Some(backend),
@@ -961,36 +992,117 @@ impl ThreadView {
 impl Render for ThreadView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (bg, border) = (theme.background, theme.border);
+        let (bg, border, muted) = (theme.background, theme.border, theme.muted_foreground);
         let this = cx.entity();
         let running = self.status != Status::Idle;
 
         let transcript = MessageScroller::new("transcript", self.scroller.clone(), move |ix, window, cx| {
             this.update(cx, |thread, cx| {
-                if ix < thread.rows.len() { thread.render_row(ix, window, cx) } else { div().into_any_element() }
+                let row =
+                    if ix < thread.rows.len() { thread.render_row(ix, window, cx) } else { div().into_any_element() };
+                // Rows stay centred and no wider than a comfortable reading width.
+                h_flex().w_full().justify_center().child(div().w_full().max_w(px(MAX_CONVERSATION_WIDTH)).child(row))
             })
         })
         .scrollbar(true)
         .jump_button(true)
         .with_bottom_fade(bg);
 
+        let menus = self.menus.clone();
+        let (account_id, account_name, mode) = (self.account_id.clone(), self.account_name.clone(), self.mode);
+        let thread = cx.entity();
+
+        let account_menu = Button::new("account-menu")
+            .ghost()
+            .xsmall()
+            .label(format!("Claude · {account_name}"))
+            .icon(gpui_kit::assets::IconName::ChevronDown)
+            .dropdown_menu({
+                let (menus, thread, account_id, account_name) =
+                    (menus.clone(), thread.clone(), account_id.clone(), account_name.clone());
+                move |menu, _window, _cx| {
+                    let mut menu = menu.label("Account");
+                    for (id, name) in &menus.accounts {
+                        let (thread, id) = (thread.clone(), id.clone());
+                        menu = menu.item(PopupMenuItem::new(name.clone()).checked(id == account_id).on_click(
+                            move |_, _, cx| thread.update(cx, |_, cx| cx.emit(ThreadAction::SwitchAccount(id.clone()))),
+                        ));
+                    }
+                    let (t1, t2) = (thread.clone(), thread.clone());
+                    menu.separator()
+                        .item(
+                            PopupMenuItem::new(format!("Use {account_name} for new threads in {}", menus.project_name))
+                                .checked(account_id == menus.project_account)
+                                .on_click(move |_, _, cx| {
+                                    t1.update(cx, |_, cx| cx.emit(ThreadAction::MakeAccountDefault))
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(format!("Log in to {account_name}…"))
+                                .on_click(move |_, _, cx| t2.update(cx, |_, cx| cx.emit(ThreadAction::LogIn))),
+                        )
+                }
+            });
+
+        let mode_menu = Button::new("mode-menu")
+            .ghost()
+            .xsmall()
+            .label(mode.label())
+            .icon(gpui_kit::assets::IconName::ChevronDown)
+            .dropdown_menu({
+                let (menus, thread) = (menus.clone(), thread.clone());
+                move |menu, _window, _cx| {
+                    let mut menu = menu.label("Permission mode");
+                    for m in PermissionMode::ALL {
+                        let thread = thread.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(m.label())
+                                .checked(m == mode)
+                                .on_click(move |_, _, cx| thread.update(cx, |t, cx| t.set_mode(m, cx))),
+                        );
+                    }
+                    let thread = thread.clone();
+                    menu.separator().item(
+                        PopupMenuItem::new(format!("Make {} the default for {}", mode.label(), menus.project_name))
+                            .checked(mode == menus.project_mode)
+                            .on_click(move |_, _, cx| {
+                                thread.update(cx, |_, cx| cx.emit(ThreadAction::MakeModeDefault))
+                            }),
+                    )
+                }
+            });
+
+        let send = if running {
+            Button::new("stop").small().label("Stop").on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
+        } else {
+            Button::new("send")
+                .primary()
+                .small()
+                .label("Send")
+                .disabled(self.agent.is_none() && self.backend.is_none())
+                .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+        };
+
         v_flex().size_full().bg(bg).child(div().flex_1().min_h_0().child(transcript)).child(
-            h_flex()
-                .items_end()
-                .gap_2()
-                .p_3()
-                .border_t_1()
-                .border_color(border)
-                .child(div().flex_1().child(Textarea::new(&self.prompt)))
-                .child(if running {
-                    Button::new("stop").label("Stop").on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
-                } else {
-                    Button::new("send")
-                        .primary()
-                        .label("Send")
-                        .disabled(self.agent.is_none() && self.backend.is_none())
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
-                }),
+            h_flex().w_full().justify_center().border_t_1().border_color(border).child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(MAX_CONVERSATION_WIDTH))
+                    .gap_1()
+                    .px_3()
+                    .pt_3()
+                    .pb_2()
+                    .child(Textarea::new(&self.prompt))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .text_color(muted)
+                            .child(account_menu)
+                            .child(mode_menu)
+                            .child(div().flex_1())
+                            .child(send),
+                    ),
+            ),
         )
     }
 }

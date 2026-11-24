@@ -118,7 +118,8 @@ fn desktop_ui_font() -> Option<String> {
 
 fn main() {
     let args = Args::parse();
-    gpui_kit::application().run(move |cx| {
+    // The icon SVGs (the full Lucide set) must be registered, or icons render blank.
+    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
         keymap::init(cx);
         // gpui keeps running after its last window closes; TJ has only one, so quit with it.

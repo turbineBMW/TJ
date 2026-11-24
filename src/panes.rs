@@ -6,10 +6,7 @@ use std::path::PathBuf;
 
 use alacritty_terminal::tty::Shell;
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
-};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, button::Button};
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use std::collections::HashMap;
@@ -752,9 +749,6 @@ impl Panes {
                         })),
                 )
         });
-        let button = |id: &str, label: &'static str, tip: &'static str| {
-            Button::new(SharedString::from(format!("{id}-{pane_id}"))).ghost().xsmall().label(label).tooltip(tip)
-        };
         let content: Option<AnyElement> = pane.tabs.get(pane.active).map(|tab| match tab {
             Tab::Thread { view, .. } => view.clone().into_any_element(),
             Tab::Terminal(term) => term.clone().into_any_element(),
@@ -777,34 +771,18 @@ impl Panes {
                     }
                 }),
             )
-            .child(
-                h_flex()
-                    .h(px(30.))
-                    .flex_none()
-                    .px_1()
-                    .gap_0p5()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(h_flex().flex_1().min_w_0().h_full().overflow_hidden().children(tabs))
-                    .child(button("new-tab", "+", "New terminal tab (Ctrl+Shift+T)").on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            this.focused = pane_id;
-                            this.new_terminal(window, cx)
-                        },
-                    )))
-                    .child(button("split-right", "◫", "Split right (Ctrl+Shift+E)").on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            this.focused = pane_id;
-                            this.split(SplitDirection::Right, window, cx)
-                        },
-                    )))
-                    .child(button("split-down", "⬓", "Split down (Ctrl+Shift+O)").on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            this.focused = pane_id;
-                            this.split(SplitDirection::Down, window, cx)
-                        },
-                    ))),
-            )
+            // The tab strip only shows when there's more than one tab to switch between.
+            .when(pane.tabs.len() > 1, |el| {
+                el.child(
+                    h_flex()
+                        .h(px(30.))
+                        .flex_none()
+                        .px_1()
+                        .border_b_1()
+                        .border_color(border)
+                        .child(h_flex().flex_1().min_w_0().h_full().overflow_hidden().children(tabs)),
+                )
+            })
             .child(div().flex_1().min_h_0().children(content))
             .into_any_element()
     }
