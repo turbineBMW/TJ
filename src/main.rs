@@ -1,6 +1,7 @@
 //! TJ: a native GUI for coding agents.
 
 mod agent;
+mod changes;
 mod demo;
 mod keymap;
 mod sample;
@@ -31,6 +32,8 @@ struct Args {
     type_text: Option<String>,
     /// Open this project folder (added if new).
     project: Option<PathBuf>,
+    /// Open the review of the project's changes.
+    review: bool,
 }
 
 impl Args {
@@ -44,6 +47,7 @@ impl Args {
             model: value("--model"),
             type_text: value("--type"),
             project: value("--project").map(PathBuf::from),
+            review: args.iter().any(|a| a == "--review"),
         }
     }
 
@@ -66,6 +70,8 @@ impl Args {
             type_text: self.type_text,
             paths,
             hide_terminal: false,
+            no_summaries: false,
+            review: self.review,
         }
     }
 }

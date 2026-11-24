@@ -1,6 +1,7 @@
 //! A conversation with an agent: the transcript, approval cards, and the prompt box.
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -109,6 +110,8 @@ pub struct ThreadView {
     replaying: bool,
     /// Context to prepend to the next prompt after an account switch.
     handoff: Option<String>,
+    /// Files the agent wrote or edited in this thread (paths as the tools gave them).
+    pub touched: HashSet<String>,
     scroller: Entity<MessageScrollerState>,
     prompt: Entity<TextareaState>,
     backend: Option<Backend>,
@@ -165,6 +168,7 @@ impl ThreadView {
             pending_text: String::new(),
             replaying: false,
             handoff: None,
+            touched: HashSet::new(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             prompt,
             backend: Some(backend),
@@ -274,6 +278,14 @@ impl ThreadView {
         format!(
             "[Context from TJ: this conversation began in another Claude session (account: {from}) and continues here (account: {to}). Here is the conversation so far.]\n\n{transcript}\n\n[End of the earlier conversation. My new message follows.]"
         )
+    }
+
+    /// The user's last `n` messages in this thread, oldest first (context for change summaries).
+    pub fn recent_requests(&self, n: usize) -> Vec<String> {
+        let mut requests: Vec<String> =
+            self.plain.iter().rev().filter_map(|line| line.strip_prefix("User: ")).take(n).map(str::to_owned).collect();
+        requests.reverse();
+        requests
     }
 
     #[cfg(test)]
@@ -427,8 +439,10 @@ impl ThreadView {
         }
         let status_before = self.status;
         let session_before = self.session_id.clone();
+        // A finished tool may have changed files; the workspace refreshes the project's changes.
+        let tool_finished = matches!(event, AgentEvent::ToolFinished { .. });
         self.handle_event(event, cx);
-        if !self.replaying && (self.status != status_before || self.session_id != session_before) {
+        if !self.replaying && (tool_finished || self.status != status_before || self.session_id != session_before) {
             cx.emit(ThreadChanged);
         }
     }
@@ -484,6 +498,11 @@ impl ThreadView {
             }
             AgentEvent::ToolStarted { id, name, input } => {
                 self.current_text = None;
+                if matches!(name.as_str(), "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
+                    && let Some(path) = input.get("file_path").or(input.get("notebook_path")).and_then(Value::as_str)
+                {
+                    self.touched.insert(path.to_string());
+                }
                 let summary = tool_summary(&name, &input);
                 self.plain.push(format!("(Claude used {name}: {})", truncate(&summary, 300)));
                 self.plain_current = None;
@@ -1102,6 +1121,30 @@ mod tests {
         assert_eq!(b.2, Some("Approved"));
         assert_eq!(second.read_with(cx, |t, _| t.status), Status::Idle);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[gpui_kit::test]
+    fn edited_files_and_recent_requests_are_tracked(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, cx| {
+            for prompt in ["one", "two", "three", "four"] {
+                t.send(prompt, cx);
+            }
+            for (id, name, input) in [
+                ("1", "Edit", serde_json::json!({ "file_path": "/p/src/a.rs" })),
+                ("2", "Write", serde_json::json!({ "file_path": "/p/b.md" })),
+                ("3", "Read", serde_json::json!({ "file_path": "/p/c.rs" })),
+                ("4", "Bash", serde_json::json!({ "command": "touch d" })),
+            ] {
+                t.handle(AgentEvent::ToolStarted { id: id.into(), name: name.into(), input }, cx);
+            }
+        });
+        let (touched, requests) = thread.read_with(cx, |t, _| (t.touched.clone(), t.recent_requests(3)));
+        assert_eq!(touched, ["/p/src/a.rs", "/p/b.md"].map(String::from).into_iter().collect());
+        assert_eq!(requests, vec!["two", "three", "four"]);
+        let relative = crate::changes::touched_relative(std::path::Path::new("/p"), &touched);
+        assert!(relative.contains("src/a.rs") && relative.contains("b.md"));
     }
 
     #[gpui_kit::test]
