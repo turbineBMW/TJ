@@ -1887,7 +1887,9 @@ impl ThreadView {
                         )
                         .children(options)
                         .when(pending, |el| {
-                            el.when_some(card.other[qi].as_ref(), |el, o| el.child(Input::new(o).small()))
+                            el.when_some(card.other[qi].as_ref(), |el, o| {
+                                el.child(Input::new(o).small()).child(crate::caret::overlay(o))
+                            })
                         })
                 });
                 pad(div())
@@ -1950,36 +1952,40 @@ impl ThreadView {
                             )
                             .map(|el| match outcome {
                                 Some(outcome) => el.child(div().text_sm().text_color(muted).child(outcome.clone())),
-                                None => el.when_some(feedback.as_ref(), |el, f| el.child(Input::new(f).small())).child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            Button::new(SharedString::from(format!("plan-accept-{ix}")))
-                                                .primary()
-                                                .small()
-                                                .label("Start, accepting edits")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.decide(ix, Decision::StartPlan { accept_edits: true }, cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new(SharedString::from(format!("plan-ask-{ix}")))
-                                                .small()
-                                                .label("Start, asking first")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.decide(ix, Decision::StartPlan { accept_edits: false }, cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new(SharedString::from(format!("plan-keep-{ix}")))
-                                                .ghost()
-                                                .small()
-                                                .label("Keep planning")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.decide(ix, Decision::Decline { feedback: None }, cx)
-                                                })),
-                                        ),
-                                ),
+                                None => el
+                                    .when_some(feedback.as_ref(), |el, f| {
+                                        el.child(Input::new(f).small()).child(crate::caret::overlay(f))
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                Button::new(SharedString::from(format!("plan-accept-{ix}")))
+                                                    .primary()
+                                                    .small()
+                                                    .label("Start, accepting edits")
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.decide(ix, Decision::StartPlan { accept_edits: true }, cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!("plan-ask-{ix}")))
+                                                    .small()
+                                                    .label("Start, asking first")
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.decide(ix, Decision::StartPlan { accept_edits: false }, cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!("plan-keep-{ix}")))
+                                                    .ghost()
+                                                    .small()
+                                                    .label("Keep planning")
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.decide(ix, Decision::Decline { feedback: None }, cx)
+                                                    })),
+                                            ),
+                                    ),
                             }),
                     )
                     .into_any_element()
@@ -2020,8 +2026,11 @@ impl ThreadView {
                             })
                             .map(|el| match &row.outcome {
                                 Some(outcome) => el.child(div().text_sm().text_color(muted).child(outcome.clone())),
-                                None => {
-                                    el.when_some(row.feedback.as_ref(), |el, f| el.child(Input::new(f).small())).child(
+                                None => el
+                                    .when_some(row.feedback.as_ref(), |el, f| {
+                                        el.child(Input::new(f).small()).child(crate::caret::overlay(f))
+                                    })
+                                    .child(
                                         h_flex()
                                             .gap_2()
                                             .child(
@@ -2060,8 +2069,7 @@ impl ThreadView {
                                                         this.decide(ix, Decision::Cancel, cx)
                                                     })),
                                             ),
-                                    )
-                                }
+                                    ),
                             }),
                     )
                     .into_any_element()
@@ -2269,6 +2277,7 @@ impl ThreadView {
                         .pb_2()
                         .children(self.render_attachments(cx))
                         .child(self.prompt_box(true, cx))
+                        .child(crate::caret::overlay(&self.prompt))
                         .child(
                             h_flex()
                                 .gap_1()
@@ -2354,6 +2363,7 @@ impl ThreadView {
                         .bg(card)
                         .children(self.render_attachments(cx))
                         .child(div().min_h(px(64.)).child(self.prompt_box(false, cx)))
+                        .child(crate::caret::overlay(&self.prompt))
                         .child(
                             h_flex()
                                 .gap_1()

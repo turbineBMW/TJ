@@ -12,7 +12,7 @@ use alacritty_terminal::{
     sync::FairMutex,
     term::{Config, Term, TermMode, cell::Flags, color::Colors},
     tty,
-    vte::ansi::{Color, CursorShape, NamedColor, Rgb},
+    vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Rgb},
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{prelude::FluentBuilder as _, *};
@@ -84,6 +84,7 @@ pub struct TerminalView {
     reported_button: Option<u8>,
     /// The last cell reported to the app, so motion within one cell isn't repeated.
     last_reported: Option<(usize, usize)>,
+    caret: crate::caret::Caret,
     /// Everything written to the shell, so tests can check what it received.
     #[cfg(test)]
     sent: std::cell::RefCell<Vec<u8>>,
@@ -106,7 +107,12 @@ impl TerminalView {
         let (tx, rx) = smol::channel::unbounded();
         let listener = Listener(tx);
 
-        let term = Arc::new(FairMutex::new(Term::new(Config::default(), &size, listener.clone())));
+        // Blinking unless an app asks for a steady cursor (DECSCUSR); `CSI 0 q` returns here.
+        let config = Config {
+            default_cursor_style: CursorStyle { shape: CursorShape::Block, blinking: true },
+            ..Config::default()
+        };
+        let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
 
         let mut env = HashMap::new();
         env.insert("TERM".into(), "xterm-256color".into());
@@ -147,6 +153,7 @@ impl TerminalView {
                 selecting: false,
                 reported_button: None,
                 last_reported: None,
+                caret: Default::default(),
                 #[cfg(test)]
                 sent: Default::default(),
                 #[cfg(test)]
@@ -251,6 +258,7 @@ impl TerminalView {
             term.scroll_display(Scroll::Bottom);
             term.selection = None;
             drop(term);
+            self.caret.blink_from = std::time::Instant::now();
             self.write(bytes);
             cx.stop_propagation();
         }
@@ -496,6 +504,79 @@ impl Palette<'_> {
 }
 
 impl TerminalView {
+    // ---------- cursor ----------
+
+    /// The cursor, painted over the grid by [`crate::caret`]: it glides (and trails) between
+    /// cells and fades as it blinks. A block shows the character under it in the background
+    /// colour once it has arrived; an unfocused terminal shows a hollow block.
+    #[allow(clippy::too_many_arguments)]
+    fn render_cursor(
+        &mut self,
+        cursor: alacritty_terminal::term::RenderableCursor,
+        blinking: bool,
+        under: Option<(char, bool)>,
+        offset: i32,
+        focused: bool,
+        fg: Hsla,
+        bg: Hsla,
+        font: &Font,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let row = cursor.point.line.0 + offset;
+        if cursor.shape == CursorShape::Hidden || row < 0 || row as usize >= self.size.rows {
+            return Vec::new();
+        }
+        let (c, wide) = under.unwrap_or((' ', false));
+        let cell = self.cell;
+        let width = if wide { cell.width * 2.0 } else { cell.width };
+        let (x, y) = (cell.width * cursor.point.column.0 as f32, cell.height * row as f32);
+        if !focused || cursor.shape == CursorShape::HollowBlock {
+            let hollow =
+                div().absolute().left(x).top(y).w(width).h(cell.height).border_1().border_color(fg.opacity(0.8));
+            return vec![hollow.into_any_element()];
+        }
+        // Grid-relative, so a pane resize doesn't send the cursor gliding.
+        let target = match cursor.shape {
+            CursorShape::Beam => Bounds::new(point(x, y), size(px(2.), cell.height)),
+            CursorShape::Underline => Bounds::new(point(x, y + cell.height - px(2.)), size(width, px(2.))),
+            _ => Bounds::new(point(x, y), size(width, cell.height)),
+        };
+        let now = std::time::Instant::now();
+        self.caret.aim(target, crate::caret::Motion::from_settings(cx), now);
+        let Some((corners, moving)) = self.caret.corners_at(now) else { return Vec::new() };
+        let alpha = self.caret.alpha(blinking, moving, now, window, cx);
+        if alpha <= 0.0 {
+            return Vec::new();
+        }
+        let ink = fg.opacity(alpha);
+        let quad = canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| crate::caret::paint(corners.map(|p| p + bounds.origin), ink, window),
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        let mut out = vec![quad.into_any_element()];
+        let block = !matches!(cursor.shape, CursorShape::Beam | CursorShape::Underline);
+        if block && !moving && c != ' ' && c != '\0' {
+            out.push(
+                div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .font(font.clone())
+                    .text_size(px(FONT_SIZE))
+                    .line_height(cell.height)
+                    .text_color(bg.opacity(alpha))
+                    .child(c.to_string())
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
     // ---------- mouse ----------
 
     /// The grid cell under a window position, clamped to the grid, and which half of it.
@@ -532,6 +613,7 @@ impl TerminalView {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
+        self.caret.blink_from = std::time::Instant::now();
         let button = match event.button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
@@ -650,6 +732,8 @@ impl Render for TerminalView {
         let offset = content.display_offset as i32;
         let cursor = content.cursor;
         let selection = content.selection;
+        let cursor_style = term.cursor_style();
+        let mut cursor_cell: Option<(char, bool)> = None;
         let selection_bg = cx.theme().selection;
 
         let rows = self.size.rows;
@@ -679,12 +763,8 @@ impl Render for TerminalView {
             if selection.is_some_and(|s| s.contains(indexed.point)) {
                 cell_bg = Some(selection_bg);
             }
-            let is_cursor = focused
-                && cursor.shape != CursorShape::Hidden
-                && indexed.point == Point::new(Line(cursor.point.line.0), Column(cursor.point.column.0));
-            if is_cursor {
-                cell_bg = Some(fg);
-                cell_fg = bg;
+            if indexed.point == cursor.point {
+                cursor_cell = Some((cell.c, cell.flags.contains(Flags::WIDE_CHAR)));
             }
 
             let start = text.len();
@@ -734,6 +814,18 @@ impl Render for TerminalView {
         }
         drop(term);
 
+        let cursor_overlay = self.render_cursor(
+            cursor,
+            cursor_style.blinking,
+            cursor_cell,
+            offset,
+            focused,
+            fg,
+            bg,
+            &base_font,
+            window,
+            cx,
+        );
         let cell = self.cell;
         let this = cx.entity();
         let painted = this.clone();
@@ -796,6 +888,7 @@ impl Render for TerminalView {
                     .children(lines.into_iter().map(|(text, runs)| {
                         div().h(cell.height).whitespace_nowrap().child(StyledText::new(text).with_runs(runs))
                     }))
+                    .children(cursor_overlay)
                     .child(measure),
             )
             .when(self.exited, |el| {
@@ -890,6 +983,26 @@ mod tests {
         assert_eq!(mouse_report(0, 300, 0, true, TermMode::empty()), None, "past column 223");
         let utf8 = mouse_report(0, 300, 0, true, TermMode::UTF8_MOUSE).unwrap();
         assert_eq!(String::from_utf8(utf8[3..].to_vec()).unwrap().chars().nth(1), Some(char::from_u32(333).unwrap()));
+    }
+
+    #[gpui_kit::test]
+    fn apps_can_ask_for_a_steady_cursor(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, b"");
+        let blinking = |term: &Entity<TerminalView>, cx: &mut gpui_kit::VisualTestContext| {
+            term.read_with(cx, |t, _| t.term.lock().cursor_style().blinking)
+        };
+        assert!(blinking(&term, &mut cx), "blinking by default");
+        let feed = |bytes: &[u8], cx: &mut gpui_kit::VisualTestContext| {
+            term.update(cx, |t, _| {
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(&mut *t.term.lock(), bytes);
+            })
+        };
+        feed(b"\x1b[2 q", &mut cx); // steady block, as vi-mode prompts send
+        assert!(!blinking(&term, &mut cx));
+        feed(b"\x1b[0 q", &mut cx); // back to the default
+        assert!(blinking(&term, &mut cx));
+        cx.update(|window, cx| window.render_frame(cx));
     }
 
     /// A terminal running `sleep` (so no prompt arrives) showing `screen`, rendered once.

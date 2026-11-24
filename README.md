@@ -17,6 +17,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **Changes and review.** Under the overview, the project's uncommitted changes (git's working tree against HEAD, new files included) with A/M/D/R, paths and line counts; a dot marks files the current thread edited. Click a file, or **Review**, to open the review tab: every diff stacked (unified or side by side), scrolled to that file. Under each file's header is a short summary of what changed and why, written by Haiku on the thread's account with your recent requests as context; summaries are cached until the file changes again. The list refreshes as the agent works.
 - **Omarchy theme, live.** TJ takes its colours from the active Omarchy theme (`~/.local/state/omarchy/current/theme/colors.toml`, resolved with the same cascade as Bubo and Rustle, so legacy themes work too) and follows theme switches within two seconds. Light themes get a readable "ink" for text, as in Bubo. The terminal follows the theme's `alacritty.toml`, like your other terminals, so a light theme that pins its terminals dark stays dark there.
 - **Transparent sidebar**, as an app setting like the rest of the app family: ⚙ in the sidebar header has **Transparent sidebar** (off by default) and an **Opacity** slider (0.8 by default), plus **Follow Omarchy theme**. Settings are saved in `~/.config/tj/settings.toml`.
+- **Smooth cursor**, in the terminal and in every text field (the prompt box, answers, renaming): it glides to each new place and blinks with a soft fade, solid while you type. With **Cursor trail** on it stretches along its path and snaps back, like Neovide. ⚙ has a **Cursor animation** slider (Off to 300 ms, 90 ms by default) and the **Cursor trail** switch (on by default).
 - **Panes and tabs**, like Vmux. The main area is the project's panes, split right or down, and every pane has its own tabs. A tab is a **conversation**, a **terminal** or the **review**, so you can put a thread beside a shell, or two threads side by side. Picking a thread in the sidebar focuses its tab, or opens it in the focused pane. A new project starts with just its conversation; the tab strip appears once a pane has a second tab. Closing a tab goes back to the one used before; closing a pane's last tab folds its split; a shell that exits closes its tab. The layout, each terminal's directory and which threads are open are saved per project. Vmux's shortcuts work anywhere in the main area:
 
   | Keys | Action |
@@ -89,7 +90,7 @@ Test hooks:
   config_dir = "~/.claude-work"
   ```
 
-- `~/.config/tj/settings.toml`: follow the Omarchy theme, transparent sidebar, opacity.
+- `~/.config/tj/settings.toml`: follow the Omarchy theme, transparent sidebar, opacity, cursor animation (`cursor_glide_ms`) and trail (`cursor_trail`).
 - `~/.local/share/tj/state.json`: projects, threads, defaults, and what was open.
 - `~/.local/share/tj/threads/<id>.jsonl`: each thread's transcript.
 
@@ -125,4 +126,4 @@ cargo test -- --ignored live_       # runs the real claude once (needs a login; 
 - **A hidden window doesn't repaint** until something asks for a frame. The model keeps updating, so nothing is lost.
 - **gpui-kit's root paints the theme background over the whole window**, which would hide a see-through sidebar. `main` clears the root's own background right after opening the window (the root's style is applied after its plugins'), and the content area paints its own.
 - gpui-kit 0.11 pins `gpui-pre` 0.3.14, a snapshot of Zed's gpui published by the gpui-kit author, not Zed's `gpui` 0.2.x on crates.io.
-- The terminal handles colours, bold, underline, inverse, Nerd Font glyphs, resize, scrollback, the alt screen and bracketed paste. It also does mouse selection and copy, and mouse reporting. Not done yet: a blinking cursor, and images.
+- The terminal handles colours, bold, underline, inverse, Nerd Font glyphs, resize, scrollback, the alt screen and bracketed paste. It also does mouse selection and copy, and mouse reporting. Its cursor is the smooth one above; apps that ask for a steady cursor or a beam or underline get one, and an unfocused terminal shows a hollow block. Not done yet: images.
