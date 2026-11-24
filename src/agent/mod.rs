@@ -11,10 +11,11 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// How much the agent may do without asking. Mirrors Claude Code's permission modes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Eq)]
 pub enum PermissionMode {
     /// Ask before anything risky.
     #[default]
@@ -59,7 +60,7 @@ impl PermissionMode {
 }
 
 /// The agent wants to use a tool and is waiting for the user.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
     /// Correlates the answer; chosen by the agent.
     pub id: String,
@@ -77,7 +78,7 @@ pub struct PermissionRequest {
 }
 
 /// The user's answer to a [`PermissionRequest`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Decision {
     Approve,
     /// Approve, and stop asking for calls like this until the session ends.
@@ -91,7 +92,7 @@ pub enum Decision {
 }
 
 /// A usage window on a subscription, such as the 5-hour or 7-day limit.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsageWindow {
     /// The agent's name for the window, e.g. `five_hour` or `seven_day`.
     pub id: String,
@@ -102,7 +103,7 @@ pub struct UsageWindow {
 }
 
 /// What happened in the session, in order.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent {
     /// The process is up and has said who it is.
     Started {

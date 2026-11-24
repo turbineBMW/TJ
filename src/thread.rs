@@ -20,6 +20,26 @@ use crate::agent::{
     AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, ScriptedAgent, ScriptedCall, UsageWindow,
     claude::{self, ClaudeSession, SessionOptions},
 };
+use crate::store::{Record, TranscriptWriter};
+
+/// The most transcript text handed to a new session when a thread switches accounts.
+const HANDOFF_MAX_CHARS: usize = 30_000;
+
+/// Tells the workspace something it saves or shows has changed (title, session, status, ...).
+pub struct ThreadChanged;
+
+impl EventEmitter<ThreadChanged> for ThreadView {}
+
+/// Who the thread is and where it keeps its transcript.
+#[derive(Clone, Default)]
+pub struct ThreadSetup {
+    pub title: Option<String>,
+    pub session_id: Option<String>,
+    pub account_id: String,
+    pub account_name: String,
+    /// Where to append the transcript; nothing is saved when `None` (demos, tests).
+    pub transcript: Option<PathBuf>,
+}
 
 /// How the thread starts its agent when the first prompt is sent.
 pub enum Backend {
@@ -37,6 +57,7 @@ pub enum Status {
 
 #[derive(Clone, Copy, PartialEq)]
 enum NoticeKind {
+    Info,
     Warning,
     Error,
 }
@@ -75,7 +96,19 @@ enum Row {
 }
 
 pub struct ThreadView {
+    pub title: Option<String>,
+    pub account_id: String,
+    pub account_name: String,
     rows: Vec<Row>,
+    /// The conversation as plain text ("User: ..." / "Claude: ..."), for account handoffs.
+    plain: Vec<String>,
+    plain_current: Option<usize>,
+    log: Option<TranscriptWriter>,
+    /// Streamed text not yet written to the transcript; saved as one delta per block.
+    pending_text: String,
+    replaying: bool,
+    /// Context to prepend to the next prompt after an account switch.
+    handoff: Option<String>,
     scroller: Entity<MessageScrollerState>,
     prompt: Entity<TextareaState>,
     backend: Option<Backend>,
@@ -94,7 +127,13 @@ pub struct ThreadView {
 }
 
 impl ThreadView {
+    #[cfg(test)]
     pub fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::open(ThreadSetup::default(), backend, window, cx)
+    }
+
+    /// A thread with an identity, replaying its saved transcript if there is one.
+    pub fn open(setup: ThreadSetup, backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mode = match &backend {
             Backend::Claude(options) => options.permission_mode,
             Backend::Scripted(_) => PermissionMode::default(),
@@ -113,8 +152,19 @@ impl ThreadView {
         })
         .detach();
 
-        Self {
+        let records = setup.transcript.as_deref().map(crate::store::read_transcript).unwrap_or_default();
+        let log = setup.transcript.as_deref().and_then(|path| TranscriptWriter::open(path).ok());
+        let mut this = Self {
+            title: setup.title,
+            account_id: setup.account_id,
+            account_name: setup.account_name,
             rows: Vec::new(),
+            plain: Vec::new(),
+            plain_current: None,
+            log: None,
+            pending_text: String::new(),
+            replaying: false,
+            handoff: None,
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             prompt,
             backend: Some(backend),
@@ -128,7 +178,107 @@ impl ThreadView {
             cost_usd: 0.0,
             usage: Vec::new(),
             scripted_log: None,
+        };
+        this.replay(records, cx);
+        // The saved session id wins over one seen in the transcript (an account switch clears it).
+        this.session_id = setup.session_id;
+        this.log = log;
+        this
+    }
+
+    /// Rebuild the transcript from saved records, without writing them again.
+    fn replay(&mut self, records: Vec<Record>, cx: &mut Context<Self>) {
+        self.replaying = true;
+        for record in records {
+            match record {
+                Record::Prompt { text } => self.push_prompt_row(&text, cx),
+                Record::Event { event } => self.handle(event, cx),
+                Record::Decision { request_id, outcome } => {
+                    if let Some(Row::Approval(row)) =
+                        self.rows.iter_mut().find(|r| matches!(r, Row::Approval(a) if a.request.id == request_id))
+                    {
+                        row.outcome = Some(outcome_label(&outcome));
+                    }
+                }
+                Record::AccountSwitch { from, to } => {
+                    self.notice(NoticeKind::Info, format!("Switched from {from} to {to}."), cx)
+                }
+            }
         }
+        // Whatever was waiting belonged to a process that is gone.
+        for row in &mut self.rows {
+            if let Row::Approval(row) = row
+                && row.outcome.is_none()
+            {
+                row.outcome = Some("No longer needed");
+            }
+        }
+        self.current_text = None;
+        self.plain_current = None;
+        self.status = Status::Idle;
+        self.replaying = false;
+    }
+
+    fn write(&mut self, record: Record) {
+        if self.replaying {
+            return;
+        }
+        if let Some(log) = &mut self.log {
+            if !self.pending_text.is_empty() {
+                let text = std::mem::take(&mut self.pending_text);
+                let _ = log.append(&Record::Event { event: AgentEvent::TextDelta(text) });
+            }
+            let _ = log.append(&record);
+        }
+    }
+
+    /// Move the thread to another account. The next message starts a new Claude session there,
+    /// given this conversation's transcript as context, since a session can't change accounts.
+    pub fn set_account(&mut self, id: &str, name: &str, config_dir: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.account_id == id {
+            return;
+        }
+        let from = std::mem::replace(&mut self.account_name, name.to_string());
+        self.account_id = id.to_string();
+        if let Some(Backend::Claude(options)) = &mut self.backend {
+            options.config_dir = config_dir;
+        }
+        if !self.plain.is_empty() {
+            self.handoff = Some(self.handoff_text(&from, name));
+            self.agent = None;
+            self._pump = None;
+            self.session_id = None;
+            self.status = Status::Idle;
+            self.write(Record::AccountSwitch { from: from.clone(), to: name.to_string() });
+            self.notice(
+                NoticeKind::Info,
+                format!(
+                    "Switched from {from} to {name}. Your next message starts a new Claude session on {name}, with this conversation so far as context."
+                ),
+                cx,
+            );
+        }
+        cx.emit(ThreadChanged);
+        cx.notify();
+    }
+
+    fn handoff_text(&self, from: &str, to: &str) -> String {
+        let mut transcript = self.plain.join("\n\n");
+        if transcript.len() > HANDOFF_MAX_CHARS {
+            let mut start = transcript.len() - HANDOFF_MAX_CHARS;
+            while !transcript.is_char_boundary(start) {
+                start += 1;
+            }
+            transcript = format!("[earlier messages omitted]\n\n{}", &transcript[start..]);
+        }
+        format!(
+            "[Context from TJ: this conversation began in another Claude session (account: {from}) and continues here (account: {to}). Here is the conversation so far.]\n\n{transcript}\n\n[End of the earlier conversation. My new message follows.]"
+        )
+    }
+
+    #[cfg(test)]
+    pub fn has_pending_handoff(&self) -> bool {
+        self.handoff.is_some()
     }
 
     pub fn prompt_focus(&self, cx: &App) -> FocusHandle {
@@ -149,14 +299,31 @@ impl ThreadView {
 
     /// Send `text` as the next user message.
     pub fn send(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.push_text_row(true, text, cx);
-        self.current_text = None;
-        if let Err(err) = self.ensure_agent(cx).and_then(|agent| agent.send_prompt(text)) {
+        self.push_prompt_row(text, cx);
+        self.write(Record::Prompt { text: text.to_string() });
+        if self.title.is_none() {
+            self.title = Some(title_from(text));
+        }
+        let message = match &self.handoff {
+            Some(context) => format!("{context}\n\n{text}"),
+            None => text.to_string(),
+        };
+        if let Err(err) = self.ensure_agent(cx).and_then(|agent| agent.send_prompt(&message)) {
             self.notice(NoticeKind::Error, format!("Could not send: {err:#}"), cx);
+            cx.emit(ThreadChanged);
             return;
         }
+        self.handoff = None;
         self.status = Status::Running;
+        cx.emit(ThreadChanged);
         cx.notify();
+    }
+
+    fn push_prompt_row(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.push_text_row(true, text, cx);
+        self.plain.push(format!("User: {text}"));
+        self.plain_current = None;
+        self.current_text = None;
     }
 
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
@@ -200,6 +367,8 @@ impl ThreadView {
             Decision::Cancel => "Cancelled the turn",
         });
         let request = row.request.clone();
+        let outcome = row.outcome.unwrap_or_default().to_string();
+        self.write(Record::Decision { request_id: request.id.clone(), outcome });
         if let Some(agent) = &self.agent
             && let Err(err) = agent.respond(&request, decision)
         {
@@ -208,6 +377,7 @@ impl ThreadView {
         if !self.has_pending_approval() && self.status == Status::AwaitingApproval {
             self.status = Status::Running;
         }
+        cx.emit(ThreadChanged);
         self.remeasure(ix, cx);
     }
 
@@ -249,6 +419,21 @@ impl ThreadView {
     // ---------- events ----------
 
     pub fn handle(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
+        match &event {
+            // Process lifecycle and live usage aren't part of the conversation.
+            AgentEvent::Started { .. } | AgentEvent::Exited { .. } | AgentEvent::Usage(_) => {}
+            AgentEvent::TextDelta(text) if !self.replaying => self.pending_text.push_str(text),
+            _ => self.write(Record::Event { event: event.clone() }),
+        }
+        let status_before = self.status;
+        let session_before = self.session_id.clone();
+        self.handle_event(event, cx);
+        if !self.replaying && (self.status != status_before || self.session_id != session_before) {
+            cx.emit(ThreadChanged);
+        }
+    }
+
+    fn handle_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
         match event {
             AgentEvent::Started { version, permission_mode } => {
                 if let Some(version) = version.filter(|v| claude::is_newer_than_tested(v)) {
@@ -271,6 +456,8 @@ impl ThreadView {
             }
             AgentEvent::TextStarted => {
                 self.current_text = Some(self.push_text_row(false, "", cx));
+                self.plain.push("Claude: ".into());
+                self.plain_current = Some(self.plain.len() - 1);
             }
             AgentEvent::TextDelta(text) => {
                 let ix = match self.current_text {
@@ -284,11 +471,22 @@ impl ThreadView {
                 if let Some(Row::Assistant(body)) = self.rows.get(ix) {
                     body.update(cx, |state, cx| state.push_str(&text, cx));
                 }
+                let plain = match self.plain_current {
+                    Some(plain) => plain,
+                    None => {
+                        self.plain.push("Claude: ".into());
+                        self.plain.len() - 1
+                    }
+                };
+                self.plain[plain].push_str(&text);
+                self.plain_current = Some(plain);
                 self.remeasure(ix, cx);
             }
             AgentEvent::ToolStarted { id, name, input } => {
                 self.current_text = None;
                 let summary = tool_summary(&name, &input);
+                self.plain.push(format!("(Claude used {name}: {})", truncate(&summary, 300)));
+                self.plain_current = None;
                 self.push_row(
                     Row::Tool(ToolRow {
                         id,
@@ -404,15 +602,6 @@ impl ThreadView {
         self.scroller.update(cx, |s, cx| {
             s.remeasure_items(ix..ix + 1, cx);
         });
-        cx.notify();
-    }
-
-    /// Add `pairs` finished prompt/reply pairs, to test a long history (`--demo history`).
-    pub fn add_history(&mut self, pairs: usize, prompt: &str, reply: &str, cx: &mut Context<Self>) {
-        for _ in 0..pairs {
-            self.push_text_row(true, prompt, cx);
-            self.push_text_row(false, reply, cx);
-        }
         cx.notify();
     }
 
@@ -616,6 +805,7 @@ impl ThreadView {
             }
             Row::Notice(kind, text) => {
                 let color = match kind {
+                    NoticeKind::Info => muted,
                     NoticeKind::Warning => warning,
                     NoticeKind::Error => danger,
                 };
@@ -661,6 +851,20 @@ impl Render for ThreadView {
                 }),
         )
     }
+}
+
+/// A thread title from its first prompt: the first line, shortened.
+pub fn title_from(prompt: &str) -> String {
+    let line = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or("New thread").trim();
+    truncate(line, 60)
+}
+
+/// Map a saved outcome back to the label shown on the card.
+fn outcome_label(outcome: &str) -> &'static str {
+    ["Approved", "Approved for this session", "Declined", "Cancelled the turn", "No longer needed"]
+        .into_iter()
+        .find(|label| *label == outcome)
+        .unwrap_or("Answered")
 }
 
 /// One line describing a tool call, e.g. the command for Bash or the path for Edit.
@@ -837,6 +1041,67 @@ mod tests {
         cx.update(|window, cx| window.press("enter", cx));
         assert_eq!(calls(&thread, cx), vec![ScriptedCall::Prompt("first line\nsecond line".into())]);
         assert_eq!(thread.read_with(cx, |t, cx| t.prompt.read(cx).value().to_string()), "");
+    }
+
+    #[gpui_kit::test]
+    fn switching_accounts_hands_the_conversation_to_a_new_session(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, cx| {
+            t.send("What does main.rs do?", cx);
+            t.handle(AgentEvent::SessionInfo { session_id: "s1".into(), model: None }, cx);
+            t.handle(AgentEvent::TextStarted, cx);
+            t.handle(AgentEvent::TextDelta("It opens the window.".into()), cx);
+            t.handle(AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, error: None }, cx);
+            t.set_account("work", "Work", None, cx);
+        });
+        assert_eq!(thread.read_with(cx, |t, _| t.session_id.clone()), None);
+        assert!(thread.read_with(cx, |t, _| t.has_pending_handoff()));
+
+        thread.update(cx, |t, cx| t.send("And store.rs?", cx));
+        let prompt = calls(&thread, cx)
+            .into_iter()
+            .find_map(|c| match c {
+                ScriptedCall::Prompt(p) => Some(p),
+                _ => None,
+            })
+            .expect("the new session got a prompt");
+        assert!(prompt.starts_with("[Context from TJ"), "{prompt}");
+        assert!(prompt.contains("account: Work"));
+        assert!(prompt.contains("User: What does main.rs do?"));
+        assert!(prompt.contains("Claude: It opens the window."));
+        assert!(prompt.ends_with("And store.rs?"));
+        assert!(!thread.read_with(cx, |t, _| t.has_pending_handoff()), "the handoff is sent once");
+    }
+
+    #[gpui_kit::test]
+    fn a_saved_transcript_replays_into_the_same_rows(cx: &mut TestAppContext) {
+        let path = std::env::temp_dir().join(format!("tj-replay-{}.jsonl", crate::store::new_id()));
+        let setup = super::ThreadSetup { transcript: Some(path.clone()), ..Default::default() };
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let first = cx.update(|window, cx| {
+            cx.new(|cx| ThreadView::open(setup.clone(), Backend::Scripted(Vec::new()), window, cx))
+        });
+        first.update(cx, |t, cx| {
+            t.attach_scripted(ScriptedAgent::start(Vec::new()).0);
+            t.send("Touch a file", cx);
+            for event in fixture("2.1.331-approve.jsonl") {
+                t.handle(event, cx);
+            }
+        });
+        let ix = first.read_with(cx, |t, _| t.approval_rows()[0]);
+        first.update(cx, |t, cx| t.decide(ix, Decision::Approve, cx));
+        let _ = thread;
+
+        let second =
+            cx.update(|window, cx| cx.new(|cx| ThreadView::open(setup, Backend::Scripted(Vec::new()), window, cx)));
+        let summary = |t: &ThreadView| (t.rows.len(), t.plain.clone(), t.approval_outcome(ix));
+        let (a, b) = (first.read_with(cx, |t, _| summary(t)), second.read_with(cx, |t, _| summary(t)));
+        assert_eq!(a, b);
+        assert_eq!(b.2, Some("Approved"));
+        assert_eq!(second.read_with(cx, |t, _| t.status), Status::Idle);
+        let _ = std::fs::remove_file(path);
     }
 
     #[gpui_kit::test]
