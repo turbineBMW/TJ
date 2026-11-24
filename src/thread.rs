@@ -1,7 +1,7 @@
 //! A conversation with an agent: the transcript, approval cards, and the prompt box.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -15,7 +15,7 @@ use gpui_kit::component::{
     message_scroller::{MessageScroller, MessageScrollerState},
     text::{TextView, TextViewState},
 };
-use gpui_kit::{prelude::FluentBuilder as _, *};
+use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use serde_json::Value;
 
 use crate::agent::{
@@ -116,12 +116,90 @@ struct ToolRow {
 
 struct ApprovalRow {
     request: PermissionRequest,
+    kind: ApprovalKind,
     /// `None` while waiting; otherwise what happened, shown in place of the buttons.
-    outcome: Option<&'static str>,
+    outcome: Option<String>,
     /// Created on first render, since an input needs a window.
     feedback: Option<Entity<InputState>>,
 }
 
+/// What the agent is waiting on: an ordinary tool call, a question for the user, or a plan.
+enum ApprovalKind {
+    Tool,
+    /// Boxed: a question card is much larger than the other transcript rows.
+    Question(Box<QuestionCard>),
+    Plan(Entity<TextViewState>),
+}
+
+struct Question {
+    question: String,
+    header: String,
+    /// (label, description)
+    options: Vec<(String, String)>,
+    multi: bool,
+}
+
+struct QuestionCard {
+    questions: Vec<Question>,
+    /// The options picked for each question.
+    picked: Vec<BTreeSet<usize>>,
+    /// An "Other" answer for each question, created on first render.
+    other: Vec<Option<Entity<InputState>>>,
+}
+
+impl QuestionCard {
+    fn parse(input: &Value) -> Option<Self> {
+        let questions: Vec<Question> = input
+            .get("questions")?
+            .as_array()?
+            .iter()
+            .filter_map(|q| {
+                Some(Question {
+                    question: q.get("question")?.as_str()?.to_string(),
+                    header: q.get("header").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    options: q
+                        .get("options")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|o| {
+                            Some((
+                                o.get("label")?.as_str()?.to_string(),
+                                o.get("description").and_then(Value::as_str).unwrap_or_default().to_string(),
+                            ))
+                        })
+                        .collect(),
+                    multi: q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+                })
+            })
+            .collect();
+        (!questions.is_empty()).then(|| Self {
+            picked: vec![BTreeSet::new(); questions.len()],
+            other: (0..questions.len()).map(|_| None).collect(),
+            questions,
+        })
+    }
+
+    /// Question text -> answer, when every question has one. An "Other" answer wins over picks.
+    fn answers(&self, cx: &App) -> Option<BTreeMap<String, String>> {
+        self.questions
+            .iter()
+            .enumerate()
+            .map(|(qi, q)| {
+                let other = self.other[qi].as_ref().map(|o| o.read(cx).value().trim().to_string()).unwrap_or_default();
+                let answer = if !other.is_empty() {
+                    other
+                } else {
+                    self.picked[qi].iter().map(|oi| q.options[*oi].0.clone()).collect::<Vec<_>>().join(", ")
+                };
+                (!answer.is_empty()).then(|| (q.question.clone(), answer))
+            })
+            .collect()
+    }
+}
+
+// An approval row is several times larger than the others, but a transcript holds hundreds
+// of rows at most, and boxing it would complicate every match on the cards.
+#[allow(clippy::large_enum_variant)]
 enum Row {
     User(Entity<TextViewState>),
     Assistant(Entity<TextViewState>),
@@ -256,7 +334,7 @@ impl ThreadView {
                     if let Some(Row::Approval(row)) =
                         self.rows.iter_mut().find(|r| matches!(r, Row::Approval(a) if a.request.id == request_id))
                     {
-                        row.outcome = Some(outcome_label(&outcome));
+                        row.outcome = Some(outcome);
                     }
                 }
                 Record::AccountSwitch { from, to } => {
@@ -273,7 +351,7 @@ impl ThreadView {
             if let Row::Approval(row) = row
                 && row.outcome.is_none()
             {
-                row.outcome = Some("No longer needed");
+                row.outcome = Some("No longer needed".into());
             }
         }
         self.current_text = None;
@@ -511,15 +589,40 @@ impl ThreadView {
             }
             other => other,
         };
-        row.outcome = Some(match decision {
-            Decision::Approve => "Approved",
-            Decision::ApproveForSession => "Approved for this session",
-            Decision::Decline { .. } => "Declined",
-            Decision::Cancel => "Cancelled the turn",
-        });
+        let is_question = matches!(row.kind, ApprovalKind::Question(_));
+        let is_plan = matches!(row.kind, ApprovalKind::Plan(_));
+        let outcome = match &decision {
+            Decision::Approve => "Approved".to_string(),
+            Decision::ApproveForSession => "Approved for this session".to_string(),
+            Decision::Decline { .. } if is_question => "Skipped".to_string(),
+            Decision::Decline { .. } if is_plan => "Kept planning".to_string(),
+            Decision::Decline { .. } => "Declined".to_string(),
+            Decision::Cancel => "Cancelled the turn".to_string(),
+            Decision::Answer { answers } => {
+                format!("Answered: {}", answers.values().cloned().collect::<Vec<_>>().join("; "))
+            }
+            Decision::StartPlan { accept_edits: true } => "Started, accepting edits".to_string(),
+            Decision::StartPlan { accept_edits: false } => "Started, asking first".to_string(),
+        };
+        row.outcome = Some(outcome.clone());
         let request = row.request.clone();
-        let outcome = row.outcome.unwrap_or_default().to_string();
-        self.write(Record::Decision { request_id: request.id.clone(), outcome });
+        self.write(Record::Decision { request_id: request.id.clone(), outcome: outcome.clone() });
+        if let Decision::Answer { answers } = &decision {
+            for (question, answer) in answers {
+                self.plain.push(format!("(User answered \"{question}\": {answer})"));
+            }
+        }
+        if is_plan {
+            self.plain.push(format!("(User: {outcome})"));
+        }
+        // Approving a plan leaves plan mode; show the mode the session now runs in.
+        if let Decision::StartPlan { accept_edits } = &decision {
+            let mode = if *accept_edits { PermissionMode::AcceptEdits } else { PermissionMode::Ask };
+            self.mode = mode;
+            if let Some(Backend::Claude(options)) = &mut self.backend {
+                options.permission_mode = mode;
+            }
+        }
         if let Some(agent) = &self.agent
             && let Err(err) = agent.respond(&request, decision)
         {
@@ -530,6 +633,35 @@ impl ThreadView {
         }
         cx.emit(ThreadChanged);
         self.remeasure(ix, cx);
+    }
+
+    /// Pick (or, for a multi-select, toggle) option `oi` of question `qi` on card `ix`.
+    pub fn pick(&mut self, ix: usize, qi: usize, oi: usize, cx: &mut Context<Self>) {
+        if let Some(Row::Approval(ApprovalRow { kind: ApprovalKind::Question(card), outcome: None, .. })) =
+            self.rows.get_mut(ix)
+            && let (Some(q), Some(picked)) = (card.questions.get(qi), card.picked.get_mut(qi))
+        {
+            if q.multi {
+                if !picked.remove(&oi) {
+                    picked.insert(oi);
+                }
+            } else {
+                picked.clear();
+                picked.insert(oi);
+            }
+        }
+        self.remeasure(ix, cx);
+    }
+
+    /// Send the question card's answers, if every question has one.
+    pub fn submit_answers(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let answers = match self.rows.get(ix) {
+            Some(Row::Approval(ApprovalRow { kind: ApprovalKind::Question(card), .. })) => card.answers(cx),
+            _ => None,
+        };
+        if let Some(answers) = answers {
+            self.decide(ix, Decision::Answer { answers }, cx);
+        }
     }
 
     fn ensure_agent(&mut self, cx: &mut Context<Self>) -> anyhow::Result<&dyn AgentSession> {
@@ -637,6 +769,10 @@ impl ThreadView {
             }
             AgentEvent::ToolStarted { id, name, input } => {
                 self.current_text = None;
+                // Questions and plans get their own cards; a tool row would only repeat them.
+                if matches!(name.as_str(), "AskUserQuestion" | "ExitPlanMode") {
+                    return;
+                }
                 if matches!(name.as_str(), "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
                     && let Some(path) = input.get("file_path").or(input.get("notebook_path")).and_then(Value::as_str)
                 {
@@ -686,7 +822,21 @@ impl ThreadView {
             }
             AgentEvent::PermissionRequested(request) => {
                 self.current_text = None;
-                self.push_row(Row::Approval(ApprovalRow { request, outcome: None, feedback: None }), cx);
+                let kind = match request.tool_name.as_str() {
+                    "AskUserQuestion" => QuestionCard::parse(&request.input)
+                        .map(|card| ApprovalKind::Question(Box::new(card)))
+                        .unwrap_or(ApprovalKind::Tool),
+                    "ExitPlanMode" => match request.input.get("plan").and_then(Value::as_str) {
+                        Some(plan) => {
+                            self.plain.push(format!("(Claude proposed a plan:\n{})", truncate(plan, 1500)));
+                            let plan = plan.to_string();
+                            ApprovalKind::Plan(cx.new(|cx| TextViewState::markdown(&plan, cx).selectable(true)))
+                        }
+                        None => ApprovalKind::Tool,
+                    },
+                    _ => ApprovalKind::Tool,
+                };
+                self.push_row(Row::Approval(ApprovalRow { request, kind, outcome: None, feedback: None }), cx);
                 self.status = Status::AwaitingApproval;
             }
             AgentEvent::PermissionWithdrawn { id } => {
@@ -694,7 +844,7 @@ impl ThreadView {
                     if let Row::Approval(row) = &mut self.rows[ix]
                         && row.outcome.is_none()
                     {
-                        row.outcome = Some("No longer needed");
+                        row.outcome = Some("No longer needed".into());
                     }
                     self.remeasure(ix, cx);
                 }
@@ -792,9 +942,9 @@ impl ThreadView {
     }
 
     #[cfg(test)]
-    pub fn approval_outcome(&self, ix: usize) -> Option<&'static str> {
+    pub fn approval_outcome(&self, ix: usize) -> Option<String> {
         match self.rows.get(ix) {
-            Some(Row::Approval(row)) => row.outcome,
+            Some(Row::Approval(row)) => row.outcome.clone(),
             _ => None,
         }
     }
@@ -812,12 +962,19 @@ impl ThreadView {
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if let Some(Row::Approval(row)) = self.rows.get_mut(ix)
             && row.outcome.is_none()
-            && row.feedback.is_none()
         {
-            row.feedback =
-                Some(cx.new(|cx| {
-                    InputState::new(window, cx).placeholder("Optional: tell Claude why, or what to do instead")
-                }));
+            if row.feedback.is_none() {
+                let hint = match row.kind {
+                    ApprovalKind::Plan(_) => "Optional: what should change in the plan?",
+                    _ => "Optional: tell Claude why, or what to do instead",
+                };
+                row.feedback = Some(cx.new(|cx| InputState::new(window, cx).placeholder(hint)));
+            }
+            if let ApprovalKind::Question(card) = &mut row.kind {
+                for other in card.other.iter_mut().filter(|o| o.is_none()) {
+                    *other = Some(cx.new(|cx| InputState::new(window, cx).placeholder("Or type your own answer")));
+                }
+            }
         }
         let theme = cx.theme();
         let (border, muted, secondary, accent) = (theme.border, theme.muted_foreground, theme.secondary, theme.primary);
@@ -902,6 +1059,156 @@ impl ThreadView {
                     )
                     .into_any_element()
             }
+            Row::Approval(ApprovalRow { kind: ApprovalKind::Question(card), outcome, .. }) => {
+                let pending = outcome.is_none();
+                let complete = card.answers(cx).is_some();
+                let fg = theme.foreground;
+                let questions = card.questions.iter().enumerate().map(|(qi, q)| {
+                    let options = q.options.iter().enumerate().map(|(oi, (label, description))| {
+                        let picked = card.picked[qi].contains(&oi);
+                        let mark = match (q.multi, picked) {
+                            (true, true) => "☑",
+                            (true, false) => "☐",
+                            (false, true) => "●",
+                            (false, false) => "○",
+                        };
+                        h_flex()
+                            .id(SharedString::from(format!("option-{ix}-{qi}-{oi}")))
+                            .test_support()
+                            .gap_2()
+                            .items_start()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .when(pending, |el| el.cursor_pointer().hover(|el| el.bg(secondary)))
+                            .when(picked, |el| el.bg(secondary))
+                            .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, qi, oi, cx)))
+                            .child(div().text_color(if picked { accent } else { muted }).child(mark))
+                            .child(
+                                v_flex()
+                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(label.clone()))
+                                    .when(!description.is_empty(), |el| {
+                                        el.child(div().text_xs().text_color(muted).child(description.clone()))
+                                    }),
+                            )
+                    });
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .when(!q.header.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .px_1p5()
+                                            .rounded_sm()
+                                            .bg(secondary)
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(q.header.clone()),
+                                    )
+                                })
+                                .child(div().text_sm().text_color(fg).child(q.question.clone())),
+                        )
+                        .children(options)
+                        .when(pending, |el| {
+                            el.when_some(card.other[qi].as_ref(), |el, o| el.child(Input::new(o).small()))
+                        })
+                });
+                pad(div())
+                    .child(
+                        v_flex()
+                            .gap_3()
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if pending { accent } else { border })
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Claude is asking"))
+                            .children(questions)
+                            .map(|el| match outcome {
+                                Some(outcome) => el.child(div().text_sm().text_color(muted).child(outcome.clone())),
+                                None => el.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new(SharedString::from(format!("answer-{ix}")))
+                                                .primary()
+                                                .small()
+                                                .label("Answer")
+                                                .disabled(!complete)
+                                                .on_click(
+                                                    cx.listener(move |this, _, _, cx| this.submit_answers(ix, cx)),
+                                                ),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!("skip-{ix}")))
+                                                .ghost()
+                                                .small()
+                                                .label("Skip")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.decide(ix, Decision::Decline { feedback: None }, cx)
+                                                })),
+                                        ),
+                                ),
+                            }),
+                    )
+                    .into_any_element()
+            }
+            Row::Approval(ApprovalRow { kind: ApprovalKind::Plan(plan), outcome, feedback, .. }) => {
+                let pending = outcome.is_none();
+                pad(div())
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if pending { accent } else { border })
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Claude's plan"))
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .bg(secondary)
+                                    .child(TextView::new(plan).selectable(true)),
+                            )
+                            .map(|el| match outcome {
+                                Some(outcome) => el.child(div().text_sm().text_color(muted).child(outcome.clone())),
+                                None => el.when_some(feedback.as_ref(), |el, f| el.child(Input::new(f).small())).child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new(SharedString::from(format!("plan-accept-{ix}")))
+                                                .primary()
+                                                .small()
+                                                .label("Start, accepting edits")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.decide(ix, Decision::StartPlan { accept_edits: true }, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!("plan-ask-{ix}")))
+                                                .small()
+                                                .label("Start, asking first")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.decide(ix, Decision::StartPlan { accept_edits: false }, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!("plan-keep-{ix}")))
+                                                .ghost()
+                                                .small()
+                                                .label("Keep planning")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.decide(ix, Decision::Decline { feedback: None }, cx)
+                                                })),
+                                        ),
+                                ),
+                            }),
+                    )
+                    .into_any_element()
+            }
             Row::Approval(row) => {
                 let request = &row.request;
                 let summary = tool_summary(&request.tool_name, &request.input);
@@ -936,8 +1243,8 @@ impl ThreadView {
                             .when_some(request.reason.clone(), |el, reason| {
                                 el.child(div().text_sm().text_color(warning).child(reason))
                             })
-                            .map(|el| match row.outcome {
-                                Some(outcome) => el.child(div().text_sm().text_color(muted).child(outcome)),
+                            .map(|el| match &row.outcome {
+                                Some(outcome) => el.child(div().text_sm().text_color(muted).child(outcome.clone())),
                                 None => {
                                     el.when_some(row.feedback.as_ref(), |el, f| el.child(Input::new(f).small())).child(
                                         h_flex()
@@ -1218,14 +1525,6 @@ pub fn title_from(prompt: &str) -> String {
     truncate(line, 60)
 }
 
-/// Map a saved outcome back to the label shown on the card.
-fn outcome_label(outcome: &str) -> &'static str {
-    ["Approved", "Approved for this session", "Declined", "Cancelled the turn", "No longer needed"]
-        .into_iter()
-        .find(|label| *label == outcome)
-        .unwrap_or("Answered")
-}
-
 /// One line describing a tool call, e.g. the command for Bash or the path for Edit.
 pub fn tool_summary(name: &str, input: &Value) -> String {
     let field = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -1351,7 +1650,7 @@ mod tests {
             })
             .collect();
         assert_eq!(answered, vec![Decision::Approve]);
-        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)), Some("Approved"));
+        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)).as_deref(), Some("Approved"));
         assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Running);
     }
 
@@ -1373,7 +1672,7 @@ mod tests {
             request_id,
             decision: Decision::Decline { feedback: Some("use mktemp instead".into()) },
         }));
-        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)), Some("Declined"));
+        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)).as_deref(), Some("Declined"));
     }
 
     fn request_id(thread: &Entity<ThreadView>, ix: usize, cx: &mut VisualTestContext) -> String {
@@ -1458,7 +1757,7 @@ mod tests {
         let summary = |t: &ThreadView| (t.rows.len(), t.plain.clone(), t.approval_outcome(ix));
         let (a, b) = (first.read_with(cx, |t, _| summary(t)), second.read_with(cx, |t, _| summary(t)));
         assert_eq!(a, b);
-        assert_eq!(b.2, Some("Approved"));
+        assert_eq!(b.2.as_deref(), Some("Approved"));
         assert_eq!(second.read_with(cx, |t, _| t.status), Status::Idle);
         let _ = std::fs::remove_file(path);
     }
@@ -1530,6 +1829,113 @@ mod tests {
         });
         let plain = thread.read_with(cx, |t, _| t.plain.clone());
         assert_eq!(plain, vec!["(Claude updated its task list: [x] Write parser; [ ] Add tests)"]);
+    }
+
+    fn first_card(thread: &Entity<ThreadView>, events: Vec<AgentEvent>, cx: &mut VisualTestContext) -> usize {
+        let ix = until_approval(thread, events, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        ix
+    }
+
+    fn responses(thread: &Entity<ThreadView>, cx: &mut VisualTestContext) -> Vec<Decision> {
+        calls(thread, cx)
+            .into_iter()
+            .filter_map(|c| match c {
+                ScriptedCall::Respond { decision, .. } => Some(decision),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    fn a_question_is_answered_by_picking_an_option(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let ix = first_card(&thread, fixture("2.1.331-question.jsonl"), cx);
+        cx.update(|window, cx| {
+            window.click(gpui_kit::SharedString::from(format!("option-{ix}-0-1")), cx);
+            window.render_frame(cx);
+            window.click(gpui_kit::SharedString::from(format!("answer-{ix}")), cx);
+        });
+        let expected = std::collections::BTreeMap::from([(
+            "Which colour do you prefer for a button?".to_string(),
+            "Blue".to_string(),
+        )]);
+        assert_eq!(responses(&thread, cx), vec![Decision::Answer { answers: expected }]);
+        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)).as_deref(), Some("Answered: Blue"));
+    }
+
+    #[gpui_kit::test]
+    fn multi_select_and_other_answers_are_combined_and_required(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let request = crate::agent::PermissionRequest {
+            id: "q1".into(),
+            tool_name: "AskUserQuestion".into(),
+            tool_use_id: None,
+            description: None,
+            input: serde_json::json!({ "questions": [
+                { "question": "Which checks?", "header": "Checks", "multiSelect": true,
+                  "options": [{ "label": "Tests", "description": "" }, { "label": "Lint", "description": "" }] },
+                { "question": "Which branch?", "header": "Branch", "multiSelect": false,
+                  "options": [{ "label": "main", "description": "" }, { "label": "dev", "description": "" }] }
+            ]}),
+            suggestions: Vec::new(),
+            reason: None,
+            no_standing_grant: false,
+        };
+        let ix = first_card(&thread, vec![AgentEvent::PermissionRequested(request)], cx);
+        cx.update(|window, cx| {
+            window.click(gpui_kit::SharedString::from(format!("option-{ix}-0-0")), cx);
+            window.click(gpui_kit::SharedString::from(format!("option-{ix}-0-1")), cx);
+            window.render_frame(cx);
+        });
+        // The second question isn't answered yet, so nothing can be sent.
+        thread.update(cx, |t, cx| t.submit_answers(ix, cx));
+        assert!(responses(&thread, cx).is_empty());
+
+        cx.update(|window, cx| {
+            let other = thread.read_with(cx, |t, _| match &t.rows[ix] {
+                super::Row::Approval(super::ApprovalRow { kind: super::ApprovalKind::Question(card), .. }) => {
+                    card.other[1].clone().unwrap()
+                }
+                _ => panic!("not a question card"),
+            });
+            other.update(cx, |o, cx| o.set_value("release/2.0", window, cx));
+        });
+        thread.update(cx, |t, cx| t.submit_answers(ix, cx));
+        let expected = std::collections::BTreeMap::from([
+            ("Which checks?".to_string(), "Tests, Lint".to_string()),
+            ("Which branch?".to_string(), "release/2.0".to_string()),
+        ]);
+        assert_eq!(responses(&thread, cx), vec![Decision::Answer { answers: expected }]);
+    }
+
+    #[gpui_kit::test]
+    fn approving_a_plan_starts_work_and_switches_the_mode(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, cx| t.set_mode(crate::agent::PermissionMode::Plan, cx));
+        let ix = first_card(&thread, fixture("2.1.331-plan.jsonl"), cx);
+        cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("plan-accept-{ix}")), cx));
+        assert_eq!(responses(&thread, cx), vec![Decision::StartPlan { accept_edits: true }]);
+        assert_eq!(thread.read_with(cx, |t, _| t.mode), crate::agent::PermissionMode::AcceptEdits);
+        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)).as_deref(), Some("Started, accepting edits"));
+        assert!(thread.read_with(cx, |t, _| t.plain.iter().any(|l| l.starts_with("(Claude proposed a plan:"))));
+    }
+
+    #[gpui_kit::test]
+    fn keeping_a_plan_sends_the_feedback(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let ix = first_card(&thread, fixture("2.1.331-plan.jsonl"), cx);
+        cx.update(|window, cx| {
+            let feedback = thread.read(cx).feedback_input(ix).unwrap();
+            feedback.update(cx, |f, cx| f.set_value("Also add a test", window, cx));
+            window.click(gpui_kit::SharedString::from(format!("plan-keep-{ix}")), cx);
+        });
+        assert_eq!(responses(&thread, cx), vec![Decision::Decline { feedback: Some("Also add a test".into()) }]);
+        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)).as_deref(), Some("Kept planning"));
     }
 
     #[gpui_kit::test]

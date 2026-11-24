@@ -89,6 +89,14 @@ pub enum Decision {
     },
     /// Refuse and stop the turn.
     Cancel,
+    /// Answer an AskUserQuestion: question text -> the chosen label(s) or the user's own words.
+    Answer {
+        answers: std::collections::BTreeMap<String, String>,
+    },
+    /// Approve a plan (ExitPlanMode) and start working, accepting edits or asking first.
+    StartPlan {
+        accept_edits: bool,
+    },
 }
 
 /// A usage window on a subscription, such as the 5-hour or 7-day limit.

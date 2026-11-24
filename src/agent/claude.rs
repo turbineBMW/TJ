@@ -211,6 +211,24 @@ pub fn permission_result(request: &PermissionRequest, decision: &Decision) -> Va
         Decision::Cancel => {
             json!({ "behavior": "deny", "message": "The user cancelled the turn.", "interrupt": true })
         }
+        // The answers ride in the tool's own input, which is how Claude Code's dialog returns them.
+        Decision::Answer { answers } => {
+            let mut input = request.input.clone();
+            if !input.is_object() {
+                input = json!({});
+            }
+            input["answers"] = json!(answers);
+            json!({ "behavior": "allow", "updatedInput": input })
+        }
+        Decision::StartPlan { accept_edits } => json!({
+            "behavior": "allow",
+            "updatedInput": request.input,
+            "updatedPermissions": [{
+                "type": "setMode",
+                "mode": if *accept_edits { "acceptEdits" } else { "default" },
+                "destination": "session",
+            }],
+        }),
     }
 }
 
@@ -588,6 +606,39 @@ mod tests {
     }
 
     #[test]
+    fn questions_and_plans_arrive_as_permission_requests() {
+        let question = replay("2.1.331-question.jsonl");
+        let request = question
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::PermissionRequested(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("a question");
+        assert_eq!(request.tool_name, "AskUserQuestion");
+        assert_eq!(request.input["questions"][0]["options"][1]["label"], "Blue");
+        assert!(
+            question
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolFinished { output, .. } if output.contains("have been answered")))
+        );
+
+        let plan = replay("2.1.331-plan.jsonl");
+        let request = plan
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::PermissionRequested(r) if r.tool_name == "ExitPlanMode" => Some(r.clone()),
+                _ => None,
+            })
+            .expect("a plan");
+        assert!(request.input["plan"].as_str().unwrap().starts_with("# Plan"));
+        assert!(
+            plan.iter()
+                .any(|e| matches!(e, AgentEvent::ToolFinished { output, .. } if output.contains("approved your plan")))
+        );
+    }
+
+    #[test]
     fn declined_tool_call_comes_back_as_an_error_result() {
         let events = replay("2.1.331-decline.jsonl");
         assert!(events.iter().any(|e| matches!(e, AgentEvent::PermissionRequested(_))));
@@ -652,6 +703,25 @@ mod tests {
     }
 
     #[test]
+    fn answers_and_plans_become_the_answers_claude_expects() {
+        let mut r = request();
+        r.tool_name = "AskUserQuestion".into();
+        r.input = json!({ "questions": [{ "question": "Which colour?", "header": "Colour", "options": [], "multiSelect": false }] });
+        let answers = std::collections::BTreeMap::from([("Which colour?".to_string(), "Red".to_string())]);
+        let answered = permission_result(&r, &Decision::Answer { answers });
+        assert_eq!(answered["behavior"], "allow");
+        assert_eq!(answered["updatedInput"]["answers"]["Which colour?"], "Red");
+        assert_eq!(answered["updatedInput"]["questions"][0]["header"], "Colour", "the questions stay in the input");
+
+        r.tool_name = "ExitPlanMode".into();
+        r.input = json!({ "plan": "# Plan" });
+        let start = permission_result(&r, &Decision::StartPlan { accept_edits: true });
+        assert_eq!(start["updatedPermissions"][0]["mode"], "acceptEdits");
+        let ask = permission_result(&r, &Decision::StartPlan { accept_edits: false });
+        assert_eq!(ask["updatedPermissions"][0]["mode"], "default");
+    }
+
+    #[test]
     fn approve_for_session_without_suggestions_allows_the_tool() {
         let mut r = request();
         r.suggestions.clear();
@@ -696,6 +766,38 @@ mod tests {
             }
         }
         (session, text)
+    }
+
+    /// A real AskUserQuestion, answered through TJ's own answer format.
+    #[test]
+    #[ignore]
+    fn live_question_is_answered() {
+        let dir = std::env::temp_dir().join(format!("tj-live-question-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = SessionOptions { cwd: dir.clone(), model: Some("haiku".into()), ..Default::default() };
+        let (session, events) = ClaudeSession::spawn(&options).unwrap();
+        session
+            .send_prompt("Use the AskUserQuestion tool to ask me which fruit I prefer, with the options Apple and Pear. Then reply with only the fruit I chose.")
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let (mut asked, mut text) = (false, String::new());
+        while std::time::Instant::now() < deadline {
+            match smol::block_on(events.recv()).expect("events") {
+                AgentEvent::PermissionRequested(request) if request.tool_name == "AskUserQuestion" => {
+                    asked = true;
+                    let question = request.input["questions"][0]["question"].as_str().unwrap().to_string();
+                    let answers = std::collections::BTreeMap::from([(question, "Pear".to_string())]);
+                    session.respond(&request, Decision::Answer { answers }).unwrap();
+                }
+                AgentEvent::TextDelta(t) => text.push_str(&t),
+                AgentEvent::TurnFinished { .. } => break,
+                AgentEvent::Exited { stderr, .. } => panic!("claude exited: {stderr}"),
+                _ => {}
+            }
+        }
+        assert!(asked, "expected a question");
+        assert!(text.to_lowercase().contains("pear"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--resume` continues the same conversation in a new process.
