@@ -2,6 +2,7 @@
 
 mod agent;
 mod agent_icon;
+mod agent_slot;
 mod caret;
 mod changes;
 mod composer;

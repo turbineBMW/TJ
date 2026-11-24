@@ -269,7 +269,9 @@ pub enum SplitDirection {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TabState {
-    /// A conversation, by thread id.
+    /// The project's agent tab; it shows whichever thread is picked in the sidebar.
+    Agent,
+    /// A conversation tab from before there was one agent tab per project; read as the agent tab.
     Thread { id: String },
     /// A shell, by its working directory.
     Terminal { cwd: PathBuf },
@@ -292,26 +294,6 @@ pub enum PaneLayout {
         first: Box<PaneLayout>,
         second: Box<PaneLayout>,
     },
-}
-
-impl PaneLayout {
-    /// Thread ids anywhere in the layout.
-    pub fn thread_ids(&self) -> Vec<String> {
-        match self {
-            PaneLayout::Pane { tabs, .. } => tabs
-                .iter()
-                .filter_map(|t| match t {
-                    TabState::Thread { id } => Some(id.clone()),
-                    _ => None,
-                })
-                .collect(),
-            PaneLayout::Split { first, second, .. } => {
-                let mut ids = first.thread_ids();
-                ids.extend(second.thread_ids());
-                ids
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

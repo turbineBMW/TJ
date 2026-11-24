@@ -1,6 +1,8 @@
 //! A project's main area, laid out like Vmux: panes split right or down, each with its own
-//! tabs. A tab is a conversation, a terminal, or the review of the project's changes.
-//! Closing a pane's last tab folds its split back up. Shortcuts match Vmux's.
+//! tabs. A tab is the project's agent, a terminal, or the review of the project's changes.
+//! There is one agent tab per project: picking a thread in the sidebar changes what it shows,
+//! and leaves every other tab where it is. Closing a pane's last tab folds its split back up.
+//! Shortcuts match Vmux's.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -10,8 +12,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, button::Button};
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
-use std::collections::HashMap;
-
+use crate::agent_slot::AgentSlot;
 use crate::changes::ReviewView;
 use crate::store::{PaneLayout, SplitDirection, TabState};
 use crate::terminal::{TerminalExited, TerminalView};
@@ -82,7 +83,8 @@ pub fn bindings() -> Vec<KeyBinding> {
 /// What a tab shows.
 #[derive(Clone)]
 pub enum Tab {
-    Thread { id: String, view: Entity<ThreadView> },
+    /// The project's agent: whichever thread is picked, with its status column.
+    Agent(Entity<AgentSlot>),
     Terminal(Entity<TerminalView>),
     Review(Entity<ReviewView>),
 }
@@ -90,7 +92,7 @@ pub enum Tab {
 impl Tab {
     fn entity_id(&self) -> EntityId {
         match self {
-            Tab::Thread { view, .. } => view.entity_id(),
+            Tab::Agent(agent) => agent.entity_id(),
             Tab::Terminal(term) => term.entity_id(),
             Tab::Review(review) => review.entity_id(),
         }
@@ -98,7 +100,7 @@ impl Tab {
 
     fn state(&self, project_dir: &std::path::Path, cx: &App) -> TabState {
         match self {
-            Tab::Thread { id, .. } => TabState::Thread { id: id.clone() },
+            Tab::Agent(_) => TabState::Agent,
             Tab::Terminal(term) => {
                 TabState::Terminal { cwd: term.read(cx).cwd().unwrap_or_else(|| project_dir.to_path_buf()) }
             }
@@ -106,9 +108,10 @@ impl Tab {
         }
     }
 
-    fn thread_id(&self) -> Option<&str> {
+    /// The thread the agent tab shows.
+    fn thread_id(&self, cx: &App) -> Option<String> {
         match self {
-            Tab::Thread { id, .. } => Some(id),
+            Tab::Agent(agent) => agent.read(cx).thread_id().map(str::to_owned),
             _ => None,
         }
     }
@@ -303,7 +306,7 @@ impl Node {
 pub enum PaneEvent {
     /// Panes or tabs opened, closed or moved; worth saving.
     LayoutChanged,
-    /// A conversation tab got focus; the header and overview follow it.
+    /// The agent tab got focus, showing this thread; the header follows it.
     ThreadFocused(String),
     /// The last review tab closed.
     ReviewClosed,
@@ -311,7 +314,8 @@ pub enum PaneEvent {
 
 impl EventEmitter<PaneEvent> for Panes {}
 
-/// What a new area starts with, when there's no saved layout.
+/// What a new area starts with. The thread is shown in the agent tab; with no saved layout,
+/// that tab (and a terminal, if asked for) is all there is.
 pub struct Start {
     pub thread: Option<(String, Entity<ThreadView>)>,
     pub terminal: bool,
@@ -322,6 +326,8 @@ pub struct Panes {
     focused: usize,
     next_pane: usize,
     project_dir: PathBuf,
+    /// The project's agent, shown in its one agent tab.
+    agent: Entity<AgentSlot>,
     /// The project's review, shared by any review tab.
     review: Entity<ReviewView>,
     /// The shell to run; the user's login shell when `None` (tests use `/bin/sh`).
@@ -334,13 +340,14 @@ pub struct Panes {
 }
 
 impl Panes {
-    /// Restore `layout` (threads come from `threads`; ones not there are dropped), or start
-    /// with `start` when there's nothing to restore.
+    /// Restore `layout`, or start with `start` when there's nothing to restore. A layout from
+    /// before there was one agent tab may have several conversation tabs: the first becomes the
+    /// agent tab and the rest are dropped.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_dir: PathBuf,
         layout: Option<&PaneLayout>,
-        threads: &HashMap<String, Entity<ThreadView>>,
+        agent: Entity<AgentSlot>,
         review: Entity<ReviewView>,
         start: Start,
         shell: Option<Shell>,
@@ -352,6 +359,7 @@ impl Panes {
             focused: 0,
             next_pane: 0,
             project_dir,
+            agent: agent.clone(),
             review,
             shell,
             reported_thread: None,
@@ -359,9 +367,15 @@ impl Panes {
             error: None,
             _subscriptions: Vec::new(),
         };
-        this.root = layout.and_then(|layout| this.restore(layout, threads, window, cx));
+        this._subscriptions.push(cx.observe(&agent, |_, _, cx| cx.notify()));
+        let has_thread = start.thread.is_some();
+        if let Some((id, view)) = start.thread {
+            agent.update(cx, |a, cx| a.set_thread(&id, view, cx));
+        }
+        let mut agent_placed = false;
+        this.root = layout.and_then(|layout| this.restore(layout, &mut agent_placed, window, cx));
         if this.root.is_none() {
-            let mut tabs: Vec<Tab> = start.thread.into_iter().map(|(id, view)| Tab::Thread { id, view }).collect();
+            let mut tabs: Vec<Tab> = has_thread.then(|| Tab::Agent(agent)).into_iter().collect();
             if start.terminal || tabs.is_empty() {
                 tabs.extend(this.spawn(None, window, cx).map(Tab::Terminal));
             }
@@ -377,7 +391,7 @@ impl Panes {
     fn restore(
         &mut self,
         layout: &PaneLayout,
-        threads: &HashMap<String, Entity<ThreadView>>,
+        agent_placed: &mut bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Node> {
@@ -387,8 +401,8 @@ impl Panes {
                 let tabs: Vec<Tab> = tabs
                     .iter()
                     .filter_map(|tab| match tab {
-                        TabState::Thread { id } => {
-                            threads.get(id).map(|view| Tab::Thread { id: id.clone(), view: view.clone() })
+                        TabState::Agent | TabState::Thread { .. } => {
+                            (!std::mem::replace(agent_placed, true)).then(|| Tab::Agent(self.agent.clone()))
                         }
                         // A directory that no longer exists falls back to the project folder.
                         TabState::Terminal { cwd } => {
@@ -403,7 +417,7 @@ impl Panes {
                 })
             }
             PaneLayout::Split { direction, ratio, first, second } => {
-                match (self.restore(first, threads, window, cx), self.restore(second, threads, window, cx)) {
+                match (self.restore(first, agent_placed, window, cx), self.restore(second, agent_placed, window, cx)) {
                     (Some(first), Some(second)) => Some(Node::Split {
                         direction: *direction,
                         ratio: ratio.clamp(MIN_RATIO, 1.0 - MIN_RATIO),
@@ -509,8 +523,19 @@ impl Panes {
         matches!(self.active_tab(), Some(Tab::Review(_)))
     }
 
-    pub fn active_thread_id(&self) -> Option<String> {
-        self.active_tab().and_then(|t| t.thread_id().map(str::to_owned))
+    /// The thread showing in the focused pane, if its visible tab is the agent.
+    pub fn active_thread_id(&self, cx: &App) -> Option<String> {
+        self.active_tab().and_then(|t| t.thread_id(cx))
+    }
+
+    /// Tell the workspace which thread the agent tab shows, if that changed.
+    fn report_thread(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_thread_id(cx)
+            && self.reported_thread.as_deref() != Some(&id)
+        {
+            self.reported_thread = Some(id.clone());
+            cx.emit(PaneEvent::ThreadFocused(id));
+        }
     }
 
     fn changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -519,16 +544,15 @@ impl Panes {
         cx.notify();
     }
 
-    /// Focus the focused pane's visible tab, and tell the workspace if it's a conversation.
+    /// Focus the focused pane's visible tab, and tell the workspace if it's the agent.
     pub fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_tab().cloned() {
-            Some(Tab::Thread { id, view }) => {
-                let focus = view.read(cx).prompt_focus(cx);
-                window.focus(&focus, cx);
-                if self.reported_thread.as_deref() != Some(&id) {
-                    self.reported_thread = Some(id.clone());
-                    cx.emit(PaneEvent::ThreadFocused(id));
+            Some(Tab::Agent(agent)) => {
+                match agent.read(cx).thread().map(|view| view.read(cx).prompt_focus(cx)) {
+                    Some(focus) => window.focus(&focus, cx),
+                    None => self.focus.focus(window, cx),
                 }
+                self.report_thread(cx);
             }
             Some(Tab::Terminal(term)) => {
                 let focus = Focusable::focus_handle(term.read(cx), cx);
@@ -571,11 +595,13 @@ impl Panes {
         cx.notify();
     }
 
-    /// Show a conversation: focus its tab if open, else open it in the focused pane.
+    /// Show a thread in the agent tab, in place of the one there, and focus it. If the agent
+    /// tab was closed, it opens again in the focused pane.
     pub fn show_thread(&mut self, id: &str, view: Entity<ThreadView>, window: &mut Window, cx: &mut Context<Self>) {
-        match self.find(|t| t.thread_id() == Some(id)) {
+        self.agent.update(cx, |a, cx| a.set_thread(id, view, cx));
+        match self.find(|t| matches!(t, Tab::Agent(_))) {
             Some(at) => self.activate_at(at, window, cx),
-            None => self.push_tab(Tab::Thread { id: id.to_string(), view }, window, cx),
+            None => self.push_tab(Tab::Agent(self.agent.clone()), window, cx),
         }
     }
 
@@ -608,16 +634,15 @@ impl Panes {
         self.changed(window, cx);
     }
 
-    /// Close a conversation's tab, if it has one (archived or deleted threads).
-    pub fn close_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.find_tab(|t| matches!(t, Tab::Thread { id, .. } if id == thread_id)) {
-            self.close_entity(id, window, cx);
+    /// Stop showing a thread (archived or deleted): the agent tab empties until another
+    /// thread is picked.
+    pub fn close_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if self.agent.read(cx).thread_id() == Some(thread_id) {
+            self.agent.update(cx, |a, cx| a.clear(cx));
+            if self.reported_thread.as_deref() == Some(thread_id) {
+                self.reported_thread = None;
+            }
         }
-    }
-
-    fn find_tab(&self, matches: impl Fn(&Tab) -> bool) -> Option<EntityId> {
-        let (pane_id, ix) = self.find(&matches)?;
-        self.root.as_ref()?.pane(pane_id).map(|pane| pane.tabs[ix].entity_id())
     }
 
     pub fn close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -626,8 +651,8 @@ impl Panes {
         }
     }
 
-    /// Close the tab showing `id`. A closed conversation stays in the sidebar; a closed
-    /// terminal's shell ends. An emptied pane is removed and its split folds.
+    /// Close the tab showing `id`. A closed agent tab opens again when a thread is picked; a
+    /// closed terminal's shell ends. An emptied pane is removed and its split folds.
     fn close_entity(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
         let Some((pane_id, ix)) = self.find(|t| t.entity_id() == id) else { return };
         let Some(root) = self.root.as_mut() else { return };
@@ -647,9 +672,7 @@ impl Panes {
                 self.focused = remaining.get(at.min(remaining.len().saturating_sub(1))).copied().unwrap_or(0);
             }
         }
-        if let Tab::Thread { id, .. } = &closed
-            && self.reported_thread.as_deref() == Some(id)
-        {
+        if matches!(closed, Tab::Agent(_)) {
             self.reported_thread = None;
         }
         if matches!(closed, Tab::Review(_)) && self.find(|t| matches!(t, Tab::Review(_))).is_none() {
@@ -816,15 +839,17 @@ impl Panes {
         let pane_id = pane.id;
         let tabs = pane.tabs.iter().enumerate().map(|(ix, tab)| {
             let (title, dot) = match tab {
-                Tab::Thread { view, .. } => {
-                    let t = view.read(cx);
-                    let dot = match t.status {
-                        Status::Idle => None,
-                        Status::Running => Some(running),
-                        Status::AwaitingApproval => Some(waiting),
-                    };
-                    (t.title.clone().unwrap_or_else(|| "New thread".into()), dot)
-                }
+                Tab::Agent(agent) => match agent.read(cx).thread().map(|v| v.read(cx)) {
+                    Some(t) => {
+                        let dot = match t.status {
+                            Status::Idle => None,
+                            Status::Running => Some(running),
+                            Status::AwaitingApproval => Some(waiting),
+                        };
+                        (t.title.clone().unwrap_or_else(|| "New thread".into()), dot)
+                    }
+                    None => ("Agent".into(), None),
+                },
                 Tab::Terminal(term) => {
                     let t = term.read(cx);
                     (tab_title(t.title(), t.cwd()), None)
@@ -862,7 +887,7 @@ impl Panes {
                 )
         });
         let content: Option<AnyElement> = pane.tabs.get(pane.active).map(|tab| match tab {
-            Tab::Thread { view, .. } => view.clone().into_any_element(),
+            Tab::Agent(agent) => agent.clone().into_any_element(),
             Tab::Terminal(term) => term.clone().into_any_element(),
             Tab::Review(review) => review.clone().into_any_element(),
         });
@@ -873,12 +898,7 @@ impl Panes {
                 cx.listener(move |this, _, _, cx| {
                     if this.focused != pane_id {
                         this.focused = pane_id;
-                        if let Some(id) = this.active_tab().and_then(|t| t.thread_id().map(str::to_owned))
-                            && this.reported_thread.as_deref() != Some(&id)
-                        {
-                            this.reported_thread = Some(id.clone());
-                            cx.emit(PaneEvent::ThreadFocused(id));
-                        }
+                        this.report_thread(cx);
                         cx.notify();
                     }
                 }),
@@ -977,7 +997,7 @@ mod tests {
         AppContext as _, Entity, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, bounds, point, px,
         size,
     };
-    use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     struct Setup {
         window: gpui_kit::AnyWindowHandle,
@@ -1018,11 +1038,11 @@ mod tests {
             let (window, panes) = gpui_kit::open_window(options, cx, |window, cx| {
                 let thread = cx.new(|cx| ThreadView::new(Backend::Scripted(Vec::new()), window, cx));
                 let changes = cx.new(|cx| ProjectChanges::new(project.clone(), cx));
-                let review = cx.new(|cx| ReviewView::new(changes, true, cx));
-                let threads = HashMap::from([("t1".to_string(), thread.clone())]);
+                let review = cx.new(|cx| ReviewView::new(changes.clone(), true, cx));
+                let agent = cx.new(|cx| crate::agent_slot::AgentSlot::new(project.clone(), changes, cx));
                 let start = Start { thread: start_thread.then(|| ("t1".to_string(), thread.clone())), terminal: true };
                 let panes = cx.new(|cx| {
-                    Panes::new(project, layout.as_ref(), &threads, review, start, Some(shell.clone()), window, cx)
+                    Panes::new(project, layout.as_ref(), agent, review, start, Some(shell.clone()), window, cx)
                 });
                 cx.subscribe(&panes, move |_, event: &PaneEvent, _| {
                     log.borrow_mut().push(match event {
@@ -1055,11 +1075,49 @@ mod tests {
         let s = open(cx, None, true);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
         assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2]);
-        assert_eq!(s.panes.read_with(cx, |p, _| p.active_thread_id()), Some("t1".into()));
+        assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t1".into()));
         let layout = s.panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
         let PaneLayout::Pane { tabs, .. } = layout else { panic!() };
-        assert_eq!(tabs[0], TabState::Thread { id: "t1".into() });
+        assert_eq!(tabs[0], TabState::Agent);
         assert!(matches!(tabs[1], TabState::Terminal { .. }));
+    }
+
+    #[gpui_kit::test]
+    fn picking_another_thread_swaps_the_agent_tab_and_leaves_terminals_alone(cx: &mut TestAppContext) {
+        let s = open(cx, None, true);
+        let cx = &mut VisualTestContext::from_window(s.window, cx);
+        s.panes.update_in(cx, |p, window, cx| {
+            p.split(SplitDirection::Right, window, cx);
+            p.new_terminal(window, cx);
+        });
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 2]);
+        let before = s.panes.read_with(cx, |p, cx| p.snapshot(cx));
+
+        let other = cx.update(|window, cx| cx.new(|cx| ThreadView::new(Backend::Scripted(Vec::new()), window, cx)));
+        s.panes.update_in(cx, |p, window, cx| p.show_thread("t2", other, window, cx));
+        cx.run_until_parked();
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 2], "no tab added for the second thread");
+        assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t2".into()));
+        assert_eq!(s.panes.read_with(cx, |p, cx| p.snapshot(cx)), before, "terminals and splits are untouched");
+        assert!(s.events.borrow().iter().any(|e| e == "focus:t2"));
+
+        // Back to the first: still the same one tab.
+        let thread = s.thread.clone();
+        s.panes.update_in(cx, |p, window, cx| p.show_thread("t1", thread, window, cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 2]);
+        assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t1".into()));
+    }
+
+    #[gpui_kit::test]
+    fn a_closed_agent_tab_opens_again_in_the_focused_pane(cx: &mut TestAppContext) {
+        let s = open(cx, None, true);
+        let cx = &mut VisualTestContext::from_window(s.window, cx);
+        s.panes.update_in(cx, |p, window, cx| p.close_tab(window, cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1], "just the terminal is left");
+        let thread = s.thread.clone();
+        s.panes.update_in(cx, |p, window, cx| p.show_thread("t1", thread, window, cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2]);
+        assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t1".into()));
     }
 
     #[gpui_kit::test]
@@ -1067,12 +1125,12 @@ mod tests {
         let s = open(cx, None, true);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
         s.panes.update_in(cx, |p, window, cx| p.cycle_tab(1, window, cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.active_thread_id()), None, "the terminal tab is showing");
+        assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), None, "the terminal tab is showing");
         let thread = s.thread.clone();
         s.panes.update_in(cx, |p, window, cx| p.show_thread("t1", thread, window, cx));
         cx.run_until_parked();
         assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2], "no second tab");
-        assert_eq!(s.panes.read_with(cx, |p, _| p.active_thread_id()), Some("t1".into()));
+        assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t1".into()));
         assert!(s.events.borrow().iter().any(|e| e == "focus:t1"));
     }
 
@@ -1190,6 +1248,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn a_saved_layout_restores_every_kind_of_tab(cx: &mut TestAppContext) {
+        // Saved before there was one agent tab: two conversation tabs, one of a deleted thread.
         let layout = PaneLayout::Split {
             direction: SplitDirection::Right,
             ratio: 0.6,
@@ -1208,11 +1267,11 @@ mod tests {
         };
         let s = open(cx, Some(layout), false);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "an unknown thread is dropped");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "the conversations become one agent tab");
         let restored = s.panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
         let PaneLayout::Split { ratio, first, second, .. } = restored else { panic!("{restored:?}") };
         assert_eq!(ratio, 0.6);
-        let expected = vec![TabState::Thread { id: "t1".into() }, TabState::Review];
+        let expected = vec![TabState::Agent, TabState::Review];
         assert!(matches!(*first, PaneLayout::Pane { ref tabs, .. } if *tabs == expected));
         let PaneLayout::Pane { tabs, .. } = *second else { panic!() };
         assert_eq!(
