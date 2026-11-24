@@ -202,9 +202,9 @@ pub struct Project {
     pub mode: Option<PermissionMode>,
     #[serde(default)]
     pub threads: Vec<ThreadMeta>,
-    /// The project's terminal panes and tabs, with each shell's directory.
+    /// The project's panes and their tabs (conversations, terminals, the review).
     #[serde(default)]
-    pub terminals: Option<TerminalLayout>,
+    pub layout: Option<PaneLayout>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,22 +216,53 @@ pub enum SplitDirection {
     Down,
 }
 
-/// A saved terminal layout: panes of tabs, split right or down.
+/// One saved tab.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TerminalLayout {
+pub enum TabState {
+    /// A conversation, by thread id.
+    Thread { id: String },
+    /// A shell, by its working directory.
+    Terminal { cwd: PathBuf },
+    /// The review of the project's changes.
+    Review,
+}
+
+/// A saved layout: panes of tabs, split right or down.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PaneLayout {
     Pane {
-        /// Each tab's working directory.
-        tabs: Vec<PathBuf>,
+        tabs: Vec<TabState>,
         active: usize,
     },
     Split {
         direction: SplitDirection,
         /// The first pane's share, 0.15 to 0.85.
         ratio: f32,
-        first: Box<TerminalLayout>,
-        second: Box<TerminalLayout>,
+        first: Box<PaneLayout>,
+        second: Box<PaneLayout>,
     },
+}
+
+impl PaneLayout {
+    /// Thread ids anywhere in the layout.
+    pub fn thread_ids(&self) -> Vec<String> {
+        match self {
+            PaneLayout::Pane { tabs, .. } => tabs
+                .iter()
+                .filter_map(|t| match t {
+                    TabState::Thread { id } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect(),
+            PaneLayout::Split { first, second, .. } => {
+                let mut ids = first.thread_ids();
+                ids.extend(second.thread_ids());
+                ids
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -276,7 +307,7 @@ impl State {
             account: None,
             mode: None,
             threads: Vec::new(),
-            terminals: None,
+            layout: None,
         });
         self.projects.last_mut().unwrap()
     }

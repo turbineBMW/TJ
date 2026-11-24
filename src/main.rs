@@ -6,11 +6,11 @@ mod demo;
 mod keymap;
 mod omarchy;
 mod overview;
+mod panes;
 mod sample;
 mod settings;
 mod store;
 mod terminal;
-mod terminal_area;
 mod thread;
 mod workspace;
 
@@ -72,7 +72,7 @@ impl Args {
             scripted,
             type_text: self.type_text,
             paths,
-            hide_terminal: false,
+            shell: None,
             no_summaries: false,
             review: self.review,
         }

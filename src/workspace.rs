@@ -1,5 +1,6 @@
-//! The window: a full-height sidebar of projects and threads, the active thread, and the
-//! project's terminal. Laid out like a GNOME app: no title bar; the headers move the window.
+//! The window: a full-height sidebar of projects and threads; the project's panes, where
+//! conversations, terminals and the review are tabs; and the overview on the right when
+//! there's something in it. Laid out like a GNOME app: no title bar; the headers move it.
 
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
@@ -15,15 +16,15 @@ use gpui_kit::component::{
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::agent::{AgentEvent, PermissionMode, claude::SessionOptions};
-use crate::changes::{ChangeKind, ProjectChanges, Summarizer};
+use crate::changes::{ChangeKind, ProjectChanges, ReviewView, Summarizer};
+use crate::panes::{PaneEvent, Panes, Start};
 use crate::settings::Settings;
 use crate::store::{self, Accounts, Paths, State};
-use crate::terminal_area::{LayoutChanged, TerminalArea};
 use crate::thread::{self, Backend, Status, ThreadChanged, ThreadSetup, ThreadView};
-use gpui_kit::component::diff::{Diff, DiffAnnotation, DiffMode};
 
 const SIDEBAR_WIDTH: f32 = 264.0;
 const HEADER_HEIGHT: f32 = 46.0;
+const OVERVIEW_WIDTH: f32 = 340.0;
 
 /// How the workspace starts.
 #[derive(Default)]
@@ -38,8 +39,8 @@ pub struct Launch {
     /// Text to type into the first terminal.
     pub type_text: Option<String>,
     pub paths: Option<Paths>,
-    /// Start with the terminal hidden.
-    pub hide_terminal: bool,
+    /// The shell terminals run; the login shell when `None` (tests use `/bin/sh`).
+    pub shell: Option<alacritty_terminal::tty::Shell>,
     /// Don't call Claude for change summaries (tests).
     pub no_summaries: bool,
     /// Open the review of the project's changes at launch (test hook).
@@ -52,10 +53,13 @@ pub struct Workspace {
     accounts: Accounts,
     state: State,
     threads: HashMap<String, Entity<ThreadView>>,
-    /// Per project: its terminal panes and tabs.
-    terminals: HashMap<String, Entity<TerminalArea>>,
+    /// Per project: its panes of conversations, terminals and the review.
+    panes: HashMap<String, Entity<Panes>>,
+    /// Per project: the review of its changes, shown in a tab.
+    reviews: HashMap<String, Entity<ReviewView>>,
+    /// The conversation the header and overview follow (the last one focused).
     active: Option<String>,
-    show_terminal: bool,
+    shell: Option<alacritty_terminal::tty::Shell>,
     model: Option<String>,
     scripted: Option<Vec<(Duration, AgentEvent)>>,
     type_text: Option<String>,
@@ -63,8 +67,6 @@ pub struct Workspace {
     problem: Option<SharedString>,
     /// Per project: its uncommitted changes, kept fresh.
     changes: HashMap<String, Entity<ProjectChanges>>,
-    /// The main area shows the review of the active project's changes instead of the thread.
-    reviewing: bool,
     no_summaries: bool,
     /// The sidebar-opacity slider in the settings popover.
     opacity_slider: Entity<SliderState>,
@@ -101,15 +103,15 @@ impl Workspace {
             accounts,
             state,
             threads: HashMap::new(),
-            terminals: HashMap::new(),
+            panes: HashMap::new(),
+            reviews: HashMap::new(),
             active: None,
-            show_terminal: !launch.hide_terminal,
+            shell: launch.shell,
             model: launch.model,
             scripted: launch.scripted,
             type_text: launch.type_text,
             problem,
             changes: HashMap::new(),
-            reviewing: false,
             no_summaries: launch.no_summaries,
             opacity_slider,
             _subscriptions: vec![slider_events],
@@ -140,12 +142,12 @@ impl Workspace {
             }
         }
         if launch.review {
-            this.open_review(None, cx);
+            this.open_review(None, window, cx);
         }
         // Save each terminal's current directory when the window closes.
         let workspace = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
-            let _ = workspace.update(cx, |w, cx| w.save_terminal_layouts(cx));
+            let _ = workspace.update(cx, |w, cx| w.save_layouts(cx));
             true
         });
         this.save();
@@ -168,8 +170,14 @@ impl Workspace {
 
     // ---------- threads ----------
 
-    fn open_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((project, meta)) = self.state.thread(thread_id) else { return };
+    /// The thread's view, created (and its transcript replayed) on first use.
+    fn ensure_thread(
+        &mut self,
+        thread_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ThreadView>> {
+        let (project, meta) = self.state.thread(thread_id)?;
         if !self.threads.contains_key(thread_id) {
             let account = self.accounts.resolve(meta.account.as_deref(), project.account.as_deref()).clone();
             // A Claude session lives in its account's config directory; resume it only there.
@@ -203,12 +211,19 @@ impl Workspace {
             }));
             self.threads.insert(thread_id.to_string(), thread);
         }
+        self.threads.get(thread_id).cloned()
+    }
+
+    /// Show a conversation in its project's panes (focusing its tab, or opening one).
+    fn open_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.ensure_thread(thread_id, window, cx) else { return };
+        let Some(project_id) = self.state.thread(thread_id).map(|(p, _)| p.id.clone()) else { return };
         self.active = Some(thread_id.to_string());
         self.state.selected_thread = self.active.clone();
-        self.set_reviewing(None, cx);
-        if let Some(thread) = self.active_thread() {
-            let focus = thread.read(cx).prompt_focus(cx);
-            window.focus(&focus, cx);
+        let start = Some((thread_id.to_string(), view.clone()));
+        if let Some(panes) = self.project_panes(&project_id, start, window, cx) {
+            let id = thread_id.to_string();
+            panes.update(cx, |p, cx| p.show_thread(&id, view, window, cx));
         }
         self.save();
         cx.notify();
@@ -305,8 +320,12 @@ impl Workspace {
             Some(dir) => format!("CLAUDE_CONFIG_DIR={} claude auth login\r", shell_quote(&dir.display().to_string())),
             None => "claude auth login\r".to_string(),
         };
-        self.show_terminal = true;
-        if let Some(term) = self.project_terminals(window, cx).and_then(|area| area.read(cx).active_terminal()) {
+        let Some(project_id) = self.active_project().map(|p| p.id.clone()) else { return };
+        let Some(panes) = self.project_panes(&project_id, None, window, cx) else { return };
+        if panes.read(cx).any_terminal().is_none() {
+            panes.update(cx, |p, cx| p.new_terminal(window, cx));
+        }
+        if let Some(term) = panes.read(cx).any_terminal() {
             term.update(cx, |t, _| t.type_text(&command));
             let focus = term.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
@@ -410,9 +429,23 @@ impl Workspace {
         Some(changes)
     }
 
-    /// Open the review (scrolled to `path`, if given) or close it with `None` after it's open.
-    fn open_review(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+    /// The active project's review, created on demand.
+    fn project_review(&mut self, cx: &mut Context<Self>) -> Option<Entity<ReviewView>> {
+        let changes = self.project_changes(cx)?;
+        let project_id = self.active_project()?.id.clone();
+        let no_summaries = self.no_summaries;
+        Some(
+            self.reviews
+                .entry(project_id)
+                .or_insert_with(|| cx.new(|cx| ReviewView::new(changes, no_summaries, cx)))
+                .clone(),
+        )
+    }
+
+    /// Show the review tab (scrolled to `path`, if given), with summaries being written.
+    fn open_review(&mut self, path: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(changes) = self.project_changes(cx) else { return };
+        let Some(review) = self.project_review(cx) else { return };
         let summarizer = if self.no_summaries {
             Summarizer::Off
         } else {
@@ -425,22 +458,16 @@ impl Workspace {
         changes.update(cx, |c, cx| {
             c.set_auto_summarize(Some((summarizer, requests)), cx);
             c.refresh(cx);
-            if let Some(path) = &path {
-                c.diff.update(cx, |d, cx| d.scroll_to_file(path, cx));
-            }
         });
-        self.reviewing = true;
-        cx.notify();
-    }
-
-    fn set_reviewing(&mut self, open: Option<String>, cx: &mut Context<Self>) {
-        if open.is_none() && self.reviewing {
-            self.reviewing = false;
-            for changes in self.changes.values() {
-                changes.update(cx, |c, cx| c.set_auto_summarize(None, cx));
-            }
-            cx.notify();
+        if let Some(path) = &path {
+            let diff = review.read(cx).changes.read(cx).diff.clone();
+            diff.update(cx, |d, cx| d.scroll_to_file(path, cx));
         }
+        let Some(project_id) = self.active_project().map(|p| p.id.clone()) else { return };
+        if let Some(panes) = self.project_panes(&project_id, None, window, cx) {
+            panes.update(cx, |p, cx| p.show_review(window, cx));
+        }
+        cx.notify();
     }
 
     /// Goal, Now, Next and tasks for the active thread, with its usage underneath (like pi's sidebar).
@@ -450,6 +477,9 @@ impl Workspace {
         let theme = cx.theme();
         let (muted, border, accent, fg) = (theme.muted_foreground, theme.border, theme.primary, theme.foreground);
         let ov = &t.overview;
+        if ov.is_empty() {
+            return None;
+        }
         let label =
             |text: &'static str| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(text);
         let field = |name: &'static str, value: &Option<String>, color: Hsla| {
@@ -508,6 +538,7 @@ impl Workspace {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .when(task.done, |el| el.text_color(muted).line_through())
                             .child(task.text.clone()),
                     )
@@ -615,7 +646,7 @@ impl Workspace {
                 .py_0p5()
                 .cursor_pointer()
                 .hover(|el| el.bg(border.opacity(0.5)))
-                .on_click(cx.listener(move |this, _, _, cx| this.open_review(Some(path.clone()), cx)))
+                .on_click(cx.listener(move |this, _, window, cx| this.open_review(Some(path.clone()), window, cx)))
                 .child(div().w_3().text_xs().font_family(mono.clone()).text_color(color).child(file.kind.letter()))
                 .child(
                     h_flex()
@@ -659,7 +690,7 @@ impl Workspace {
                                 .xsmall()
                                 .ghost()
                                 .label("Review")
-                                .on_click(cx.listener(|this, _, _, cx| this.open_review(None, cx))),
+                                .on_click(cx.listener(|this, _, window, cx| this.open_review(None, window, cx))),
                         ),
                 )
                 .child(div().id("changes-list").pb_1().overflow_y_scroll().children(rows))
@@ -667,114 +698,83 @@ impl Workspace {
         )
     }
 
-    fn review(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(changes) = self.project_changes(cx) else { return div().into_any_element() };
-        let model = changes.read(cx);
-        let theme = cx.theme();
-        let (muted, border, danger, secondary) = (theme.muted_foreground, theme.border, theme.danger, theme.secondary);
-        let summaries: HashMap<String, Option<String>> =
-            model.changes.files.iter().map(|f| (f.path.clone(), model.summary(f).map(str::to_owned))).collect();
-        let summarizing = model.summarizing;
-        let no_summaries = self.no_summaries;
-        let mode = model.diff.read(cx).mode();
-        let diff_state = model.diff.clone();
-        let annotations: Vec<DiffAnnotation> = model
-            .changes
-            .files
-            .iter()
-            .enumerate()
-            .map(|(ix, f)| DiffAnnotation::file(SharedString::from(format!("summary-{ix}")), f.path.clone()))
-            .collect();
-        let heading = format!(
-            "{} files changed · +{} −{}",
-            model.changes.files.len(),
-            model.changes.additions(),
-            model.changes.deletions()
-        );
-        let error = model.error.clone();
-        let empty = model.changes.files.is_empty();
-
-        let diff = Diff::new(&diff_state).syntax_highlight(true).annotations(annotations).render_annotation(
-            move |annotation, _window, _cx| {
-                let summary = summaries.get(annotation.path().as_ref()).cloned().flatten();
-                let text = match summary {
-                    Some(summary) => summary,
-                    None if no_summaries => String::new(),
-                    None if summarizing => "Summarizing…".into(),
-                    None => "No summary yet.".into(),
-                };
-                div().px_3().py_2().bg(secondary).text_sm().child(text)
-            },
-        );
-
-        v_flex()
-            .size_full()
-            .child(
-                h_flex()
-                    .px_3()
-                    .py_1p5()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(
-                        Button::new("back-to-thread")
-                            .xsmall()
-                            .ghost()
-                            .label("← Thread")
-                            .on_click(cx.listener(|this, _, _, cx| this.set_reviewing(None, cx))),
-                    )
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(heading))
-                    .when(summarizing, |el| el.child(div().text_xs().text_color(muted).child("Writing summaries…")))
-                    .child(div().flex_1())
-                    .children([DiffMode::Unified, DiffMode::Split].map(|m| {
-                        let state = diff_state.clone();
-                        Button::new(SharedString::from(format!("diff-mode-{m:?}")))
-                            .xsmall()
-                            .ghost()
-                            .selected(mode == m)
-                            .label(if m == DiffMode::Split { "Side by side" } else { "Unified" })
-                            .on_click(move |_, _, cx| state.update(cx, |d, cx| d.set_mode(m, cx)))
-                    })),
-            )
-            .when_some(error, |el, error| el.child(div().px_3().py_1().text_sm().text_color(danger).child(error)))
-            .child(if empty {
-                div().p_4().text_sm().text_color(muted).child("No uncommitted changes.").into_any_element()
-            } else {
-                div().flex_1().min_h_0().child(diff).into_any_element()
-            })
-            .into_any_element()
-    }
-
-    /// The active project's terminals, restored from its saved layout on first use.
-    fn project_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TerminalArea>> {
-        let project = self.active_project()?.clone();
-        if let Some(area) = self.terminals.get(&project.id) {
-            return Some(area.clone());
+    /// A project's panes, restored from its saved layout on first use. `start` is the
+    /// conversation to show when there's no saved layout.
+    fn project_panes(
+        &mut self,
+        project_id: &str,
+        start: Option<(String, Entity<ThreadView>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Panes>> {
+        if let Some(panes) = self.panes.get(project_id) {
+            return Some(panes.clone());
         }
-        let area = cx.new(|cx| TerminalArea::new(project.path.clone(), project.terminals.as_ref(), None, window, cx));
-        let project_id = project.id.clone();
-        self._subscriptions.push(cx.subscribe(&area, move |this, area, _: &LayoutChanged, cx| {
-            let layout = area.read(cx).snapshot(cx);
-            if let Some(project) = this.state.project_mut(&project_id) {
-                project.terminals = layout;
+        let project = self.state.project(project_id)?.clone();
+        // Saved conversation tabs need their threads first.
+        let ids = project.layout.as_ref().map(|l| l.thread_ids()).unwrap_or_default();
+        let threads: HashMap<String, Entity<ThreadView>> =
+            ids.into_iter().filter_map(|id| self.ensure_thread(&id, window, cx).map(|view| (id, view))).collect();
+        let changes = self
+            .changes
+            .entry(project.id.clone())
+            .or_insert_with(|| cx.new(|cx| ProjectChanges::new(project.path.clone(), cx)))
+            .clone();
+        let no_summaries = self.no_summaries;
+        let review = self
+            .reviews
+            .entry(project.id.clone())
+            .or_insert_with(|| cx.new(|cx| ReviewView::new(changes.clone(), no_summaries, cx)))
+            .clone();
+        let shell = self.shell.clone();
+        let panes = cx.new(|cx| {
+            Panes::new(
+                project.path.clone(),
+                project.layout.as_ref(),
+                &threads,
+                review,
+                Start { thread: start, terminal: true },
+                shell,
+                window,
+                cx,
+            )
+        });
+        let id = project.id.clone();
+        self._subscriptions.push(cx.subscribe(&panes, move |this, panes, event: &PaneEvent, cx| match event {
+            PaneEvent::LayoutChanged => {
+                let layout = panes.read(cx).snapshot(cx);
+                if let Some(project) = this.state.project_mut(&id) {
+                    project.layout = layout;
+                }
+                this.save();
             }
-            this.save();
+            PaneEvent::ThreadFocused(thread) => {
+                this.active = Some(thread.clone());
+                this.state.selected_thread = this.active.clone();
+                this.save();
+                cx.notify();
+            }
+            PaneEvent::ReviewClosed => {
+                if let Some(changes) = this.changes.get(&id).cloned() {
+                    changes.update(cx, |c, cx| c.set_auto_summarize(None, cx));
+                }
+            }
         }));
-        self._subscriptions.push(cx.observe(&area, |_, _, cx| cx.notify()));
-        if let (Some(text), Some(term)) = (self.type_text.take(), area.read(cx).active_terminal()) {
+        self._subscriptions.push(cx.observe(&changes, |_, _, cx| cx.notify()));
+        self._subscriptions.push(cx.observe(&panes, |_, _, cx| cx.notify()));
+        if let (Some(text), Some(term)) = (self.type_text.take(), panes.read(cx).any_terminal()) {
             term.update(cx, |t, _| t.type_text(&text.replace("\\r", "\r")));
         }
-        self.terminals.insert(project.id.clone(), area.clone());
-        Some(area)
+        self.panes.insert(project.id.clone(), panes.clone());
+        Some(panes)
     }
 
-    /// Record every open terminal layout with each shell's current directory.
-    pub fn save_terminal_layouts(&mut self, cx: &mut Context<Self>) {
-        let layouts: Vec<_> =
-            self.terminals.iter().map(|(id, area)| (id.clone(), area.read(cx).snapshot(cx))).collect();
+    /// Record every open layout, with each terminal's current directory.
+    pub fn save_layouts(&mut self, cx: &mut Context<Self>) {
+        let layouts: Vec<_> = self.panes.iter().map(|(id, panes)| (id.clone(), panes.read(cx).snapshot(cx))).collect();
         for (id, layout) in layouts {
             if let Some(project) = self.state.project_mut(&id) {
-                project.terminals = layout;
+                project.layout = layout;
             }
         }
         self.save();
@@ -976,20 +976,9 @@ impl Workspace {
             })
             .child(drag_area())
             .child(div().text_sm().text_color(warning).child(status))
-            .child(
-                Button::new("toggle-terminal")
-                    .xsmall()
-                    .ghost()
-                    .selected(self.show_terminal)
-                    .label("Terminal")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_terminal = !this.show_terminal;
-                        cx.notify();
-                    })),
-            )
             .child(Button::new("close-window").xsmall().ghost().label("✕").tooltip("Close").on_click(cx.listener(
                 |this, _, window, cx| {
-                    this.save_terminal_layouts(cx);
+                    this.save_layouts(cx);
                     window.remove_window();
                 },
             )))
@@ -1021,19 +1010,14 @@ fn shell_quote(text: &str) -> String {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let terminal = if self.show_terminal && self.active_project().is_some() {
-            self.project_terminals(window, cx)
-        } else {
-            None
-        };
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let panes = self.active_project().and_then(|p| self.panes.get(&p.id)).cloned();
         let overview_panel = self.overview_panel(cx);
         let changes_list = self.changes_list(cx);
-        let main =
-            if self.reviewing { Some(self.review(cx)) } else { self.active_thread().map(|t| t.into_any_element()) };
         let theme = cx.theme();
         let (bg, fg, border, danger) = (theme.background, theme.foreground, theme.border, theme.danger);
-        let right_column = terminal.is_some() || changes_list.is_some() || overview_panel.is_some();
+        // The overview pane only appears when it has something to show.
+        let right_pane = overview_panel.is_some() || changes_list.is_some();
 
         // The window itself is transparent: only the content area paints an opaque background,
         // so the sidebar can be see-through.
@@ -1047,18 +1031,20 @@ impl Render for Workspace {
                 .when_some(self.problem.clone(), |el, problem| {
                     el.child(div().px_4().py_2().text_sm().text_color(danger).child(problem))
                 })
-                .child(h_flex().flex_1().min_h_0().child(div().flex_1().min_w_0().h_full().children(main)).when(
-                    right_column,
+                .child(h_flex().flex_1().min_h_0().child(div().flex_1().min_w_0().h_full().children(panes)).when(
+                    right_pane,
                     |el| {
                         el.child(
                             v_flex()
-                                .w(relative(0.42))
+                                .id("overview-pane")
+                                .w(px(OVERVIEW_WIDTH))
+                                .flex_none()
                                 .h_full()
+                                .overflow_y_scroll()
                                 .border_l_1()
                                 .border_color(border)
                                 .children(overview_panel)
-                                .children(changes_list)
-                                .when_some(terminal, |el, area| el.child(div().flex_1().min_h_0().child(area))),
+                                .children(changes_list),
                         )
                     },
                 )),
@@ -1088,7 +1074,7 @@ mod tests {
         let launch = Launch {
             project: Some(project.clone()),
             paths: Some(paths.clone()),
-            hide_terminal: true,
+            shell: Some(alacritty_terminal::tty::Shell::new("/bin/sh".into(), vec![])),
             no_summaries: true,
             ..Default::default()
         };
@@ -1132,7 +1118,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_a_changed_file_opens_the_review_and_back_returns(cx: &mut TestAppContext) {
+    fn clicking_a_changed_file_opens_the_review_tab_and_closing_it_returns(cx: &mut TestAppContext) {
         let (window, workspace, _, project) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         let run = |args: &[&str]| {
@@ -1159,13 +1145,16 @@ mod tests {
             window.render_frame(cx);
             window.click(SharedString::from("change-0"), cx);
         });
-        assert!(workspace.read_with(cx, |w, _| w.reviewing));
+        let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
+        assert!(panes.read_with(cx, |p, _| p.review_is_showing()), "the review opens as a tab");
 
+        // Ctrl+Shift+W closes it like any tab, and the conversation shows again.
         cx.update(|window, cx| {
             window.render_frame(cx);
-            window.click(SharedString::from("back-to-thread"), cx);
+            window.press("ctrl-shift-w", cx);
         });
-        assert!(!workspace.read_with(cx, |w, _| w.reviewing));
+        assert!(!panes.read_with(cx, |p, _| p.review_is_showing()));
+        assert!(panes.read_with(cx, |p, _| p.active_thread_id().is_some()));
     }
 
     #[gpui_kit::test]

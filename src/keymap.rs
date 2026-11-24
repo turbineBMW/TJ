@@ -12,5 +12,5 @@ pub fn init(cx: &mut App) {
     ]);
     crate::terminal::init(cx);
     // Vmux's pane and tab shortcuts, inside the terminal area only.
-    cx.bind_keys(crate::terminal_area::bindings());
+    cx.bind_keys(crate::panes::bindings());
 }
