@@ -10,6 +10,7 @@ mod sample;
 mod settings;
 mod store;
 mod terminal;
+mod terminal_area;
 mod thread;
 mod workspace;
 

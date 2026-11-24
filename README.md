@@ -13,6 +13,16 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **Changes and review.** The right column lists the project's uncommitted changes (git's working tree against HEAD, new files included) with A/M/D/R, paths and line counts; a dot marks files the current thread edited. Click a file, or **Review**, to see every diff stacked (unified or side by side), scrolled to that file. Under each file's header is a short summary of what changed and why, written by Haiku on the thread's account with your recent requests as context; summaries are cached until the file changes again. The list refreshes as the agent works.
 - **Omarchy theme, live.** TJ takes its colours from the active Omarchy theme (`~/.local/state/omarchy/current/theme/colors.toml`, resolved with the same cascade as Bubo and Rustle, so legacy themes work too) and follows theme switches within two seconds. Light themes get a readable "ink" for text, as in Bubo. The terminal follows the theme's `alacritty.toml`, like your other terminals, so a light theme that pins its terminals dark stays dark there.
 - **Transparent sidebar**, as an app setting like the rest of the app family: ⚙ in the sidebar header has **Transparent sidebar** (off by default) and an **Opacity** slider (0.8 by default), plus **Follow Omarchy theme**. Settings are saved in `~/.config/tj/settings.toml`.
+- **Terminal panes and tabs**, like Vmux. Each project's terminal area splits right or down, and every pane has its own tabs; closing a pane's last tab folds its split back up, and a shell that exits closes its tab. New tabs and panes open where the focused shell is. The layout and each tab's directory are saved per project and restored. Vmux's shortcuts work while a terminal has focus:
+
+  | Keys | Action |
+  |---|---|
+  | `Ctrl+Shift+T` / `Ctrl+Shift+W` | New tab / close tab |
+  | `Ctrl+Shift+E` / `Ctrl+Shift+O` | Split right / down |
+  | `Ctrl+Alt+←/→/↑/↓` | Focus the pane in that direction |
+  | `Ctrl+Shift+A` | Focus the next pane |
+  | `Ctrl+Shift+=` / `Ctrl+Shift+-` | Grow / shrink the pane |
+  | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |
 - **GNOME-style window**: no title bar; drag either header to move it, double-click to maximize.
 - **Streaming replies** in markdown, with tool calls shown as cards you can expand to see their output.
 - **Approval cards** when Claude wants to do something risky: **Approve**, **Approve for session**, **Decline** (with optional feedback that's passed to Claude) or **Cancel turn**.
@@ -20,7 +30,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **Usage and cost**: subscription usage windows (for example "7d 4%"), plus the cost of each turn and the whole thread.
 - **Stop** interrupts a running turn. If `claude` exits, the next message resumes the conversation.
 
-Terminal splits and tabs are next; see [ROADMAP.md](ROADMAP.md).
+Next ideas are in [ROADMAP.md](ROADMAP.md); see [ROADMAP.md](ROADMAP.md).
 
 ## Run
 

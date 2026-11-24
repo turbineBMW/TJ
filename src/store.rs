@@ -202,6 +202,36 @@ pub struct Project {
     pub mode: Option<PermissionMode>,
     #[serde(default)]
     pub threads: Vec<ThreadMeta>,
+    /// The project's terminal panes and tabs, with each shell's directory.
+    #[serde(default)]
+    pub terminals: Option<TerminalLayout>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitDirection {
+    /// Side by side; the new pane goes on the right.
+    Right,
+    /// Stacked; the new pane goes below.
+    Down,
+}
+
+/// A saved terminal layout: panes of tabs, split right or down.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TerminalLayout {
+    Pane {
+        /// Each tab's working directory.
+        tabs: Vec<PathBuf>,
+        active: usize,
+    },
+    Split {
+        direction: SplitDirection,
+        /// The first pane's share, 0.15 to 0.85.
+        ratio: f32,
+        first: Box<TerminalLayout>,
+        second: Box<TerminalLayout>,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -239,7 +269,15 @@ impl State {
         }
         let name =
             path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
-        self.projects.push(Project { id: new_id(), name, path, account: None, mode: None, threads: Vec::new() });
+        self.projects.push(Project {
+            id: new_id(),
+            name,
+            path,
+            account: None,
+            mode: None,
+            threads: Vec::new(),
+            terminals: None,
+        });
         self.projects.last_mut().unwrap()
     }
 

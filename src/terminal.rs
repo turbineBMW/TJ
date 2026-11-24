@@ -59,6 +59,11 @@ impl Dimensions for GridSize {
     }
 }
 
+/// The shell ended; the terminal area closes its tab.
+pub struct TerminalExited;
+
+impl EventEmitter<TerminalExited> for TerminalView {}
+
 pub struct TerminalView {
     term: Arc<FairMutex<Term<Listener>>>,
     notifier: Notifier,
@@ -67,6 +72,8 @@ pub struct TerminalView {
     cell: Size<Pixels>,
     title: Option<String>,
     exited: bool,
+    /// The shell's process id, for reading its working directory.
+    pid: Option<u32>,
     _pump: Task<()>,
     /// Bytes produced by key presses, so tests can check what the shell received.
     #[cfg(test)]
@@ -94,6 +101,7 @@ impl TerminalView {
         env.insert("TERM_PROGRAM".into(), "tj".into());
         let options = tty::Options { shell, working_directory: cwd, drain_on_exit: false, env };
         let pty = tty::new(&options, window_size(size, cell), 0)?;
+        let pid = Some(pty.child().id());
 
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let notifier = Notifier(event_loop.channel());
@@ -120,6 +128,7 @@ impl TerminalView {
                 cell,
                 title: None,
                 exited: false,
+                pid,
                 _pump: pump,
                 #[cfg(test)]
                 keys_sent: Vec::new(),
@@ -129,6 +138,11 @@ impl TerminalView {
 
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// The shell's current directory (Linux: `/proc/<pid>/cwd`).
+    pub fn cwd(&self) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{}/cwd", self.pid?)).ok()
     }
 
     fn handle_events(&mut self, events: Vec<TermEvent>, cx: &mut Context<Self>) {
@@ -150,7 +164,12 @@ impl TerminalView {
                     let rgb = self.term.lock().colors()[index].unwrap_or_else(|| default_rgb(index, &ansi));
                     self.write(format(rgb).into_bytes());
                 }
-                TermEvent::Exit | TermEvent::ChildExit(_) => self.exited = true,
+                TermEvent::Exit | TermEvent::ChildExit(_) => {
+                    if !self.exited {
+                        self.exited = true;
+                        cx.emit(TerminalExited);
+                    }
+                }
                 TermEvent::Wakeup | TermEvent::Bell | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {
                 }
             }

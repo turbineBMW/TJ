@@ -18,7 +18,7 @@ use crate::agent::{AgentEvent, PermissionMode, claude::SessionOptions};
 use crate::changes::{ChangeKind, ProjectChanges, Summarizer};
 use crate::settings::Settings;
 use crate::store::{self, Accounts, Paths, State};
-use crate::terminal::TerminalView;
+use crate::terminal_area::{LayoutChanged, TerminalArea};
 use crate::thread::{self, Backend, Status, ThreadChanged, ThreadSetup, ThreadView};
 use gpui_kit::component::diff::{Diff, DiffAnnotation, DiffMode};
 
@@ -52,7 +52,8 @@ pub struct Workspace {
     accounts: Accounts,
     state: State,
     threads: HashMap<String, Entity<ThreadView>>,
-    terminals: HashMap<String, Entity<TerminalView>>,
+    /// Per project: its terminal panes and tabs.
+    terminals: HashMap<String, Entity<TerminalArea>>,
     active: Option<String>,
     show_terminal: bool,
     model: Option<String>,
@@ -141,6 +142,12 @@ impl Workspace {
         if launch.review {
             this.open_review(None, cx);
         }
+        // Save each terminal's current directory when the window closes.
+        let workspace = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = workspace.update(cx, |w, cx| w.save_terminal_layouts(cx));
+            true
+        });
         this.save();
         this
     }
@@ -299,7 +306,7 @@ impl Workspace {
             None => "claude auth login\r".to_string(),
         };
         self.show_terminal = true;
-        if let Some(term) = self.project_terminal(window, cx) {
+        if let Some(term) = self.project_terminals(window, cx).and_then(|area| area.read(cx).active_terminal()) {
             term.update(cx, |t, _| t.type_text(&command));
             let focus = term.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
@@ -738,25 +745,39 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn project_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
+    /// The active project's terminals, restored from its saved layout on first use.
+    fn project_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TerminalArea>> {
         let project = self.active_project()?.clone();
-        if let Some(term) = self.terminals.get(&project.id) {
-            return Some(term.clone());
+        if let Some(area) = self.terminals.get(&project.id) {
+            return Some(area.clone());
         }
-        match TerminalView::spawn(Some(project.path.clone()), None, window, cx) {
-            Ok(term) => {
-                self._subscriptions.push(cx.observe(&term, |_, _, cx| cx.notify()));
-                if let Some(text) = self.type_text.take() {
-                    term.update(cx, |t, _| t.type_text(&text.replace("\\r", "\r")));
-                }
-                self.terminals.insert(project.id.clone(), term.clone());
-                Some(term)
+        let area = cx.new(|cx| TerminalArea::new(project.path.clone(), project.terminals.as_ref(), None, window, cx));
+        let project_id = project.id.clone();
+        self._subscriptions.push(cx.subscribe(&area, move |this, area, _: &LayoutChanged, cx| {
+            let layout = area.read(cx).snapshot(cx);
+            if let Some(project) = this.state.project_mut(&project_id) {
+                project.terminals = layout;
             }
-            Err(err) => {
-                self.problem = Some(format!("Terminal failed: {err:#}").into());
-                None
+            this.save();
+        }));
+        self._subscriptions.push(cx.observe(&area, |_, _, cx| cx.notify()));
+        if let (Some(text), Some(term)) = (self.type_text.take(), area.read(cx).active_terminal()) {
+            term.update(cx, |t, _| t.type_text(&text.replace("\\r", "\r")));
+        }
+        self.terminals.insert(project.id.clone(), area.clone());
+        Some(area)
+    }
+
+    /// Record every open terminal layout with each shell's current directory.
+    pub fn save_terminal_layouts(&mut self, cx: &mut Context<Self>) {
+        let layouts: Vec<_> =
+            self.terminals.iter().map(|(id, area)| (id.clone(), area.read(cx).snapshot(cx))).collect();
+        for (id, layout) in layouts {
+            if let Some(project) = self.state.project_mut(&id) {
+                project.terminals = layout;
             }
         }
+        self.save();
     }
 
     // ---------- rendering ----------
@@ -966,14 +987,12 @@ impl Workspace {
                         cx.notify();
                     })),
             )
-            .child(
-                Button::new("close-window")
-                    .xsmall()
-                    .ghost()
-                    .label("✕")
-                    .tooltip("Close")
-                    .on_click(|_, window, _| window.remove_window()),
-            )
+            .child(Button::new("close-window").xsmall().ghost().label("✕").tooltip("Close").on_click(cx.listener(
+                |this, _, window, cx| {
+                    this.save_terminal_layouts(cx);
+                    window.remove_window();
+                },
+            )))
     }
 }
 
@@ -1004,7 +1023,7 @@ fn shell_quote(text: &str) -> String {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let terminal = if self.show_terminal && self.active_project().is_some() {
-            self.project_terminal(window, cx)
+            self.project_terminals(window, cx)
         } else {
             None
         };
@@ -1013,10 +1032,7 @@ impl Render for Workspace {
         let main =
             if self.reviewing { Some(self.review(cx)) } else { self.active_thread().map(|t| t.into_any_element()) };
         let theme = cx.theme();
-        let (bg, fg, border, muted, danger) =
-            (theme.background, theme.foreground, theme.border, theme.muted_foreground, theme.danger);
-        let terminal_title =
-            terminal.as_ref().and_then(|t| t.read(cx).title().map(str::to_owned)).unwrap_or_else(|| "Terminal".into());
+        let (bg, fg, border, danger) = (theme.background, theme.foreground, theme.border, theme.danger);
         let right_column = terminal.is_some() || changes_list.is_some() || overview_panel.is_some();
 
         // The window itself is transparent: only the content area paints an opaque background,
@@ -1042,10 +1058,7 @@ impl Render for Workspace {
                                 .border_color(border)
                                 .children(overview_panel)
                                 .children(changes_list)
-                                .when_some(terminal, |el, term| {
-                                    el.child(div().px_3().py_1().text_xs().text_color(muted).child(terminal_title))
-                                        .child(div().flex_1().min_h_0().child(term))
-                                }),
+                                .when_some(terminal, |el, area| el.child(div().flex_1().min_h_0().child(area))),
                         )
                     },
                 )),

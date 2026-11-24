@@ -11,4 +11,6 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-tab", NoAction, Some("Root")),
     ]);
     crate::terminal::init(cx);
+    // Vmux's pane and tab shortcuts, inside the terminal area only.
+    cx.bind_keys(crate::terminal_area::bindings());
 }
