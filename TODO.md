@@ -18,8 +18,8 @@ What's missing or rough, roughly in priority order. ROADMAP.md has the direction
 
 ## Terminal and panes
 
-- [ ] Mouse selection and copy in the terminal.
-- [ ] Mouse reporting for terminal apps (vim, htop, less).
+- [x] Mouse selection and copy in the terminal (drag, double- and triple-click; primary selection, Ctrl+Shift+C, middle-click paste).
+- [x] Mouse reporting for terminal apps (vim, htop, less): clicks, drags, motion and the wheel; Shift selects instead.
 - [ ] Blinking cursor.
 - [ ] Images (SIXEL/kitty), as in the vte fork.
 - [ ] Drag to resize splits (today: Ctrl+Shift+= and Ctrl+Shift+-).

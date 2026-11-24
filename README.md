@@ -59,6 +59,8 @@ cargo run -- --model haiku               # pick a model
 
 The prompt box sends on Enter; Shift+Enter adds a line. Tab never moves focus. Click the terminal to focus it; Tab, Shift+Tab and Ctrl+C go to the shell, and Ctrl+Shift+V pastes.
 
+In the terminal, drag to select text, double-click for a word and triple-click for a line. What you select goes to the primary selection, as in other Linux terminals: middle-click pastes it. Ctrl+Shift+C copies the selection to the clipboard. Apps that ask for the mouse (vim, htop, less with mouse on) get clicks, drags and the scroll wheel, in the SGR or classic encoding they ask for; hold Shift to select text in them instead.
+
 Test hooks:
 
 - `--prompt "text"` sends a prompt in a new thread at launch.
