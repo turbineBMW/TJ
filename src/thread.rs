@@ -98,7 +98,7 @@ enum NoticeKind {
     Error,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ToolStatus {
     Running,
     Done,
@@ -112,7 +112,27 @@ struct ToolRow {
     status: ToolStatus,
     output: Option<String>,
     expanded: bool,
+    /// When this call started a subagent: what it's doing and what it did.
+    subagent: Option<Subagent>,
 }
+
+/// A subagent's work, shown inside the Agent tool row that started it.
+#[derive(Default)]
+struct Subagent {
+    agent_type: Option<String>,
+    /// What it's doing right now, while it runs.
+    now: Option<String>,
+    /// Its tool calls and messages, in order.
+    log: Vec<String>,
+    tool_uses: Option<u64>,
+    tokens: Option<u64>,
+    /// Set when it finishes: its status ("completed", "failed", ...) and report.
+    finished: Option<String>,
+    summary: Option<String>,
+}
+
+/// How many log lines a subagent keeps.
+const SUBAGENT_LOG_LINES: usize = 60;
 
 struct ApprovalRow {
     request: PermissionRequest,
@@ -635,6 +655,25 @@ impl ThreadView {
         self.remeasure(ix, cx);
     }
 
+    fn tool_row(&self, tool_use_id: &str) -> Option<usize> {
+        self.rows.iter().rposition(|r| matches!(r, Row::Tool(t) if t.id == tool_use_id))
+    }
+
+    /// Update the subagent started by tool call `tool_use_id` (creating it if events arrive
+    /// before its start was seen).
+    fn with_subagent(&mut self, tool_use_id: &str, cx: &mut Context<Self>, update: impl FnOnce(&mut Subagent)) {
+        let Some(ix) = self.tool_row(tool_use_id) else { return };
+        if let Row::Tool(tool) = &mut self.rows[ix] {
+            let sub = tool.subagent.get_or_insert_with(Subagent::default);
+            update(sub);
+            if sub.log.len() > SUBAGENT_LOG_LINES {
+                let extra = sub.log.len() - SUBAGENT_LOG_LINES;
+                sub.log.drain(..extra);
+            }
+        }
+        self.remeasure(ix, cx);
+    }
+
     /// Pick (or, for a multi-select, toggle) option `oi` of question `qi` on card `ix`.
     pub fn pick(&mut self, ix: usize, qi: usize, oi: usize, cx: &mut Context<Self>) {
         if let Some(Row::Approval(ApprovalRow { kind: ApprovalKind::Question(card), outcome: None, .. })) =
@@ -719,6 +758,13 @@ impl ThreadView {
     }
 
     fn handle_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
+        // Claude can start a turn on its own (to report a background subagent's result).
+        if !self.replaying
+            && self.status == Status::Idle
+            && matches!(event, AgentEvent::TextStarted | AgentEvent::TextDelta(_) | AgentEvent::ToolStarted { .. })
+        {
+            self.status = Status::Running;
+        }
         match event {
             AgentEvent::Started { version, permission_mode } => {
                 if let Some(version) = version.filter(|v| claude::is_newer_than_tested(v)) {
@@ -738,6 +784,56 @@ impl ThreadView {
             AgentEvent::SessionInfo { session_id, model } => {
                 self.session_id = Some(session_id);
                 self.model = model.or(self.model.take());
+            }
+            AgentEvent::SubagentStarted { tool_use_id, description, agent_type } => {
+                if let Some(ix) = self.tool_row(&tool_use_id) {
+                    if let Row::Tool(tool) = &mut self.rows[ix] {
+                        tool.status = ToolStatus::Running;
+                        if !description.is_empty() {
+                            tool.summary = description;
+                        }
+                        tool.subagent = Some(Subagent { agent_type, ..Default::default() });
+                    }
+                    self.remeasure(ix, cx);
+                }
+            }
+            AgentEvent::SubagentProgress { tool_use_id, description, tool_uses, tokens } => {
+                self.with_subagent(&tool_use_id, cx, |sub| {
+                    if !description.is_empty() {
+                        sub.now = Some(description);
+                    }
+                    sub.tool_uses = tool_uses.or(sub.tool_uses);
+                    sub.tokens = tokens.or(sub.tokens);
+                });
+            }
+            AgentEvent::SubagentTool { tool_use_id, name, input } => {
+                let line = format!("{name}: {}", truncate(&tool_summary(&name, &input), 200));
+                self.with_subagent(&tool_use_id, cx, |sub| {
+                    sub.now = Some(line.clone());
+                    sub.log.push(line);
+                });
+            }
+            AgentEvent::SubagentText { tool_use_id, text } => {
+                self.with_subagent(&tool_use_id, cx, |sub| sub.log.push(truncate(text.trim(), 600)));
+            }
+            AgentEvent::SubagentFinished { tool_use_id, status, summary } => {
+                if let Some(ix) = self.tool_row(&tool_use_id)
+                    && let Row::Tool(tool) = &mut self.rows[ix]
+                {
+                    tool.status = if status == "completed" { ToolStatus::Done } else { ToolStatus::Failed };
+                    let sub = tool.subagent.get_or_insert_with(Subagent::default);
+                    sub.now = None;
+                    sub.finished = Some(status.clone());
+                    sub.summary = summary.clone();
+                    // The report is what the overview writer most needs from a subagent.
+                    self.plain.push(format!(
+                        "(Subagent \"{}\" {status}: {})",
+                        tool.summary,
+                        truncate(summary.as_deref().unwrap_or(""), 800)
+                    ));
+                    self.plain_current = None;
+                    self.remeasure(ix, cx);
+                }
             }
             AgentEvent::TextStarted => {
                 self.current_text = Some(self.push_text_row(false, "", cx));
@@ -803,6 +899,7 @@ impl ThreadView {
                         status: ToolStatus::Running,
                         output: None,
                         expanded: false,
+                        subagent: None,
                     }),
                     cx,
                 );
@@ -810,6 +907,12 @@ impl ThreadView {
             AgentEvent::ToolFinished { id, output, is_error } => {
                 if let Some(ix) = self.rows.iter().rposition(|r| matches!(r, Row::Tool(t) if t.id == id)) {
                     if let Row::Tool(tool) = &mut self.rows[ix] {
+                        // A background subagent's call returns at once ("Async agent launched");
+                        // the row stays working until the subagent itself finishes.
+                        if tool.subagent.as_ref().is_some_and(|s| s.finished.is_none()) && !is_error {
+                            self.remeasure(ix, cx);
+                            return;
+                        }
                         tool.status = if is_error { ToolStatus::Failed } else { ToolStatus::Done };
                         if is_error {
                             self.plain.push(format!("({} failed: {})", tool.name, truncate(&output, 240)));
@@ -1002,12 +1105,56 @@ impl ThreadView {
                 pad(div()).py_2().child(TextView::new(body).selectable(true).stream_fade(true)).into_any_element()
             }
             Row::Tool(tool) => {
-                let (dot, label) = match tool.status {
+                let (dot, status) = match tool.status {
                     ToolStatus::Running => (muted, "running"),
                     ToolStatus::Done => (theme.success, "done"),
                     ToolStatus::Failed => (danger, "failed"),
                 };
-                let output = tool.output.clone().filter(|_| tool.expanded);
+                let sub = tool.subagent.as_ref();
+                // A subagent's row says what it is and how far along it is.
+                let label = match sub {
+                    Some(sub) => {
+                        let mut parts =
+                            vec![if sub.finished.is_none() { "working".to_string() } else { status.to_string() }];
+                        if let Some(n) = sub.tool_uses {
+                            parts.push(format!("{n} tool{}", if n == 1 { "" } else { "s" }));
+                        }
+                        if let Some(t) = sub.tokens {
+                            parts.push(format!("{}k tokens", t / 1000));
+                        }
+                        parts.join(" · ")
+                    }
+                    None => status.to_string(),
+                };
+                let name = match sub.and_then(|s| s.agent_type.clone()) {
+                    Some(agent_type) => format!("{} · {agent_type}", tool.name),
+                    None => tool.name.clone(),
+                };
+                let now = sub.and_then(|s| s.now.clone()).filter(|_| tool.status == ToolStatus::Running);
+                let details: Option<AnyElement> = if !tool.expanded {
+                    None
+                } else if let Some(sub) = sub {
+                    Some(
+                        v_flex()
+                            .gap_1()
+                            .children(sub.log.iter().map(|line| {
+                                div().text_xs().font_family(mono.clone()).text_color(muted).child(line.clone())
+                            }))
+                            .when_some(sub.summary.clone(), |el, summary| {
+                                el.child(div().pt_1().text_sm().child(summary))
+                            })
+                            .into_any_element(),
+                    )
+                } else {
+                    tool.output.clone().map(|output| {
+                        div()
+                            .text_xs()
+                            .font_family(mono.clone())
+                            .text_color(muted)
+                            .child(truncate(&output, 4000))
+                            .into_any_element()
+                    })
+                };
                 pad(div())
                     .child(
                         v_flex()
@@ -1028,7 +1175,7 @@ impl ThreadView {
                                         this.remeasure(ix, cx);
                                     }))
                                     .child(div().size_2().rounded_full().bg(dot))
-                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(tool.name.clone()))
+                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(name))
                                     .child(
                                         div()
                                             .flex_1()
@@ -1043,18 +1190,21 @@ impl ThreadView {
                                     )
                                     .child(div().text_xs().text_color(muted).child(label)),
                             )
-                            .when_some(output, |el, output| {
+                            .when_some(now, |el, now| {
                                 el.child(
                                     div()
-                                        .border_t_1()
-                                        .border_color(border)
                                         .px_3()
-                                        .py_2()
+                                        .pb_1p5()
                                         .text_xs()
-                                        .font_family(mono)
                                         .text_color(muted)
-                                        .child(truncate(&output, 4000)),
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(format!("↳ {now}")),
                                 )
+                            })
+                            .when_some(details, |el, details| {
+                                el.child(div().border_t_1().border_color(border).px_3().py_2().child(details))
                             }),
                     )
                     .into_any_element()
@@ -1936,6 +2086,53 @@ mod tests {
         });
         assert_eq!(responses(&thread, cx), vec![Decision::Decline { feedback: Some("Also add a test".into()) }]);
         assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)).as_deref(), Some("Kept planning"));
+    }
+
+    #[gpui_kit::test]
+    fn a_background_subagent_stays_working_until_it_reports(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let events = fixture("2.1.331-subagent.jsonl");
+        let first_turn_end = events.iter().position(|e| matches!(e, AgentEvent::TurnFinished { .. })).unwrap();
+        let agent_row = |t: &ThreadView| {
+            t.rows
+                .iter()
+                .find_map(|r| match r {
+                    super::Row::Tool(tool) if tool.name == "Agent" => Some((
+                        tool.status,
+                        tool.subagent.as_ref().map(|s| (s.finished.clone(), s.log.len(), s.summary.is_some())),
+                    )),
+                    _ => None,
+                })
+                .unwrap()
+        };
+
+        thread.update(cx, |t, cx| {
+            t.send("Count the files", cx);
+            for event in events[..=first_turn_end].iter().cloned() {
+                t.handle(event, cx);
+            }
+        });
+        let (status, sub) = thread.read_with(cx, |t, _| agent_row(t));
+        assert_eq!(status, super::ToolStatus::Running, "the instant 'launched' result doesn't finish the row");
+        assert_eq!(sub.as_ref().map(|s| s.0.clone()), Some(None));
+        assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Idle, "the first turn ended");
+
+        // Claude's own follow-up turn: the subagent finishes, then Claude reports.
+        let mut saw_running = false;
+        for event in events[first_turn_end + 1..].iter().cloned() {
+            thread.update(cx, |t, cx| t.handle(event, cx));
+            saw_running |= thread.read_with(cx, |t, _| t.status) == Status::Running;
+        }
+        assert!(saw_running, "a turn Claude starts on its own shows as working");
+        let (status, sub) = thread.read_with(cx, |t, _| agent_row(t));
+        let (finished, log_lines, has_summary) = sub.unwrap();
+        assert_eq!(status, super::ToolStatus::Done);
+        assert_eq!(finished.as_deref(), Some("completed"));
+        assert!(log_lines >= 2, "its tool call and its text are logged");
+        assert!(has_summary);
+        assert!(thread.read_with(cx, |t, _| t.plain.iter().any(|l| l.starts_with("(Subagent "))));
+        assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Idle);
     }
 
     #[gpui_kit::test]

@@ -24,6 +24,8 @@ def scrub_str(s, workdirs):
         s = s.replace(w, "/work")
     # Streamed text can split a path across chunks, so whole-path replacement misses pieces.
     s = s.replace("/tmp/", "/work/")
+    # Claude's per-user temp folder is named after the user id (claude-<uid>).
+    s = re.sub(r"claude-\d+", "claude-uid", s)
     s = s.replace(home, "/home/user").replace(user, "user")
     s = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "user@example.com", s)
     return s
@@ -71,6 +73,8 @@ for record in records:
     out.append({"dir": record["dir"], "msg": scrub(m, workdirs)})
 
 text = "\n".join(json.dumps(r) for r in out) + "\n"
+if re.search(r"claude-\d+", text):
+    raise SystemExit("a per-user temp folder name survived scrubbing")
 for needle in [home, user, "@", "mcp__", "/tmp/"]:
     if needle == "@":
         leaks = [e for e in re.findall(r"[\w.+-]+@[\w-]+\.[\w.]+", text) if e != "user@example.com"]

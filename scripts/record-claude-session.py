@@ -50,7 +50,10 @@ send({"type": "control_request", "request_id": "tj-initialize-1", "request": {"s
 send({"type": "user", "parent_tool_use_id": None, "message": {"role": "user", "content": [
     {"type": "text", "text": prompt}]}})
 
-deadline = time.time() + 150
+# Background subagents finish after the first turn ends; TJ_RECORD_TURNS waits for more turns.
+turns_wanted = int(os.environ.get("TJ_RECORD_TURNS", "1"))
+turns = 0
+deadline = time.time() + 150 * turns_wanted
 usage_sent = False
 while time.time() < deadline:
     try:
@@ -81,7 +84,9 @@ while time.time() < deadline:
             result = {"behavior": "deny", "message": "The user declined this tool call."}
         send({"type": "control_response", "response": {
             "subtype": "success", "request_id": msg["request_id"], "response": result}})
-    elif t == "result" and not usage_sent:
+    elif t == "result":
+        turns += 1
+    if t == "result" and turns >= turns_wanted and not usage_sent:
         usage_sent = True
         send({"type": "control_request", "request_id": "tj-get_usage-2", "request": {"subtype": "get_usage"}})
     elif t == "control_response" and msg.get("response", {}).get("request_id") == "tj-get_usage-2":

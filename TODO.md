@@ -5,7 +5,7 @@ What's missing or rough, roughly in priority order. ROADMAP.md has the direction
 ## Agent
 
 - [x] **Claude's questions and plans.** AskUserQuestion has its own card (pick options, multi-select, or type an answer); ExitPlanMode shows the plan with Start, accepting edits / Start, asking first / Keep planning.
-- [ ] **Subagent activity.** Work done through the Task tool is hidden from the transcript.
+- [x] **Subagent activity.** The Agent tool's row shows what its (background) subagent is doing, its tool calls, counts and report.
 - [ ] **Model picker.** The model can only be chosen with `--model`.
 - [ ] **Attachments and `@file` mentions** in the prompt box.
 - [ ] **Account-switch handoff** sends the raw transcript (up to 30k characters); a summary would be shorter and cheaper.
