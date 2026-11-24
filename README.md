@@ -39,6 +39,16 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 
 Next ideas are in [ROADMAP.md](ROADMAP.md); see [ROADMAP.md](ROADMAP.md).
 
+## Install
+
+```sh
+./install.sh            # build, then install to ~/.local: the tj command, a launcher entry and the icon
+./uninstall.sh          # remove it again; projects, threads and settings stay
+./uninstall.sh --purge  # and remove those too
+```
+
+`install.sh` installs any missing system packages with pacman (Vulkan loader, xkbcommon, xcb, git), builds a release binary and puts TJ in the app launcher. TJ runs agents through the `claude` command (Claude Code), which you install and log in to yourself; the script says so if it's missing. The window's app ID is `dev.turbinebmw.TJ`, matching the launcher entry, so the running window shows TJ's icon. The icon ships as PNGs from 16 to 512 px plus an SVG wrapping the 512 px art, so launchers that prefer SVG (Omarchy's does) draw it sharp instead of scaling up a small PNG.
+
 ## Run
 
 ```bash

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=TJ
+GenericName=Coding agent
+Comment=Projects, threads and terminals for Claude Code
+Exec=tj
+Icon=dev.turbinebmw.TJ
+Terminal=false
+Type=Application
+Categories=Development;IDE;
+Keywords=claude;agent;ai;code;terminal;
+StartupNotify=true
+StartupWMClass=dev.turbinebmw.TJ

@@ -143,7 +143,9 @@ fn main() {
         // GNOME-style: no title bar; the sidebar and content headers move the window.
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1500.), px(940.)), cx))),
-            app_id: Some("tj".into()),
+            // Matches the installed .desktop file, so the launcher and the window list show
+            // TJ's icon for the running window.
+            app_id: Some("dev.turbinebmw.TJ".into()),
             titlebar: None,
             window_decorations: Some(WindowDecorations::Client),
             // Transparent so the sidebar can be see-through; everything else paints opaque.

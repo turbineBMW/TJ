@@ -26,7 +26,8 @@ What's missing or rough, roughly in priority order. ROADMAP.md has the direction
 
 ## Distribution
 
-- [ ] A `.desktop` file and a package (PKGBUILD and install script), like the rest of the app family, so TJ shows up in the launcher.
+- [x] A `.desktop` file, icon and `install.sh` / `uninstall.sh`, like Bubo, so TJ shows up in the launcher.
+- [ ] A PKGBUILD, if TJ should install as a pacman package.
 
 ## Verified
 
