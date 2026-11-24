@@ -9,6 +9,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **Projects and threads.** A full-height sidebar lists your projects with their threads. Add a project with **+** at the top; start a thread with a project's **+**. Each thread keeps its Claude session running in the background, and a dot shows threads that are working (amber) or waiting for you.
 - **Accounts.** Each thread runs on an account: the thread's own choice, else the project's default, else the global default. The account menu in the header switches the thread for now, makes the account the project default, or starts `claude auth login` for it in the terminal. Switching a thread that has history starts a new Claude session on the other account, with the conversation so far as context (a session can't change accounts).
 - **Saved across restarts.** Projects, threads and transcripts are saved; reopening a thread shows its history and resumes its Claude conversation.
+- **Overview and usage**, like the pi session sidebar. The top of the right column shows the thread's **Goal**, **Now**, **Next** and **Tasks** (recent done ones struck through), rewritten by Haiku on the thread's account after each turn and every minute during long ones, from the newest part of the conversation. Claude's own task list (TodoWrite) feeds into it. The thread's title in the sidebar comes from it too. Underneath: context used against the model's window, subscription usage windows, cost (marked ≈ on a subscription, where it's an estimate) and the model. **↻** updates it now.
 - **Changes and review.** The right column lists the project's uncommitted changes (git's working tree against HEAD, new files included) with A/M/D/R, paths and line counts; a dot marks files the current thread edited. Click a file, or **Review**, to see every diff stacked (unified or side by side), scrolled to that file. Under each file's header is a short summary of what changed and why, written by Haiku on the thread's account with your recent requests as context; summaries are cached until the file changes again. The list refreshes as the agent works.
 - **GNOME-style window**: no title bar; drag either header to move it, double-click to maximize.
 - **Streaming replies** in markdown, with tool calls shown as cards you can expand to see their output.
@@ -17,7 +18,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **Usage and cost**: subscription usage windows (for example "7d 4%"), plus the cost of each turn and the whole thread.
 - **Stop** interrupts a running turn. If `claude` exits, the next message resumes the conversation.
 
-The task panel, the transparent sidebar, Omarchy theming and terminal splits are next; see [ROADMAP.md](ROADMAP.md).
+The transparent sidebar, Omarchy theming and terminal splits are next; see [ROADMAP.md](ROADMAP.md).
 
 ## Run
 

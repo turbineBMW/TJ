@@ -4,6 +4,7 @@ mod agent;
 mod changes;
 mod demo;
 mod keymap;
+mod overview;
 mod sample;
 mod store;
 mod terminal;

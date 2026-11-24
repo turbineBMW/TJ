@@ -320,6 +320,11 @@ pub enum Record {
         from: String,
         to: String,
     },
+    /// A new overview, covering the conversation up to `mark` (an index into its plain text).
+    Overview {
+        overview: crate::overview::Overview,
+        mark: usize,
+    },
 }
 
 /// Appends records to a transcript file.
