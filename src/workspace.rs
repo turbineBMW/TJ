@@ -6,8 +6,10 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Sizable as _, WindowExt as _,
+    button::{Button, ButtonVariant, ButtonVariants as _},
+    input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt as _, PopupMenuItem},
     popover::Popover,
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     switch::Switch,
@@ -74,6 +76,10 @@ pub struct Workspace {
     no_summaries: bool,
     /// The sidebar-opacity slider in the settings popover.
     opacity_slider: Entity<SliderState>,
+    /// The thread whose title is being edited in the sidebar, and the editor.
+    renaming: Option<(String, Entity<InputState>)>,
+    /// Projects whose archived threads are listed.
+    show_archived: std::collections::HashSet<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -118,6 +124,8 @@ impl Workspace {
             changes: HashMap::new(),
             models: HashMap::new(),
             models_loading: Default::default(),
+            renaming: None,
+            show_archived: Default::default(),
             no_summaries: launch.no_summaries,
             opacity_slider,
             _subscriptions: vec![slider_events],
@@ -196,6 +204,7 @@ impl Workspace {
                 model_choice: model_choice.clone(),
                 effort: effort.clone(),
                 title: meta.title.clone(),
+                named: meta.named,
                 session_id,
                 account_id: account.id.clone(),
                 account_name: account.name.clone(),
@@ -345,8 +354,9 @@ impl Workspace {
         let t = thread.read(cx);
         let (title, session_id, account_id, mode) =
             (t.title.clone(), t.session_id.clone(), t.account_id.clone(), t.mode);
-        let (model, effort) = (t.model_choice.clone(), t.effort.clone());
+        let (model, effort, named) = (t.model_choice.clone(), t.effort.clone(), t.named);
         let Some(meta) = self.state.thread_mut(thread_id) else { return };
+        meta.named = named;
         let changed = meta.title != title || meta.session_id != session_id;
         meta.title = title;
         meta.session_account = session_id.as_ref().map(|_| account_id.clone());
@@ -359,6 +369,159 @@ impl Workspace {
             meta.updated_at = store::now();
         }
         self.save();
+    }
+
+    // ---------- renaming, archiving, deleting ----------
+
+    /// Edit a thread's title in place in the sidebar.
+    fn start_rename(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, meta)) = self.state.thread(thread_id) else { return };
+        let title = meta.title.clone().unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title).placeholder("Thread name"));
+        input.update(cx, |i, cx| {
+            i.focus(window, cx);
+            i.select_all(window, cx);
+        });
+        let id = thread_id.to_string();
+        self._subscriptions.push(cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur)
+                && this.renaming.as_ref().is_some_and(|(r, _)| *r == id)
+            {
+                this.finish_rename(true, cx);
+            }
+        }));
+        self.renaming = Some((thread_id.to_string(), input));
+        cx.notify();
+    }
+
+    /// Keep (or drop) the title being typed. An empty title lets TJ name the thread again.
+    fn finish_rename(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some((id, input)) = self.renaming.take() else { return };
+        if keep {
+            let title = input.read(cx).value().trim().to_string();
+            self.rename_thread(&id, &title, cx);
+        }
+        cx.notify();
+    }
+
+    fn rename_thread(&mut self, thread_id: &str, title: &str, cx: &mut Context<Self>) {
+        if let Some(thread) = self.threads.get(thread_id).cloned() {
+            // The thread works out a fallback title for an empty one; sync_thread saves it.
+            thread.update(cx, |t, cx| t.rename(title, cx));
+        } else if let Some(meta) = self.state.thread_mut(thread_id) {
+            meta.named = !title.is_empty();
+            meta.title = meta.named.then(|| title.to_string()).or(meta.title.take());
+            self.save();
+        }
+        cx.notify();
+    }
+
+    fn set_archived(&mut self, thread_id: &str, archived: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(meta) = self.state.thread_mut(thread_id) else { return };
+        meta.archived = archived;
+        if archived {
+            self.close_thread_tab(thread_id, window, cx);
+        }
+        self.save();
+        cx.notify();
+    }
+
+    fn confirm_delete_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, meta)) = self.state.thread(thread_id) else { return };
+        let title = meta.title.clone().unwrap_or_else(|| "New thread".into());
+        let (workspace, id) = (cx.entity().downgrade(), thread_id.to_string());
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (workspace, id) = (workspace.clone(), id.clone());
+            alert
+                .confirm()
+                .title(format!("Delete “{title}”?"))
+                .description("Its conversation, attached images and overview are deleted from TJ. Files the agent changed in the project are not touched.")
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let _ = workspace.update(cx, |w, cx| w.delete_thread(&id, window, cx));
+                    true
+                })
+        });
+    }
+
+    fn delete_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_thread_tab(thread_id, window, cx);
+        // Dropping the view ends its Claude process.
+        self.threads.remove(thread_id);
+        self.state.remove_thread(thread_id);
+        self.paths.delete_thread_files(thread_id);
+        if self.active.as_deref() == Some(thread_id) {
+            self.active = None;
+            self.pick_active(window, cx);
+        }
+        self.save();
+        cx.notify();
+    }
+
+    fn confirm_remove_project(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.state.project(project_id) else { return };
+        let (name, count) = (project.name.clone(), project.threads.len());
+        let threads = match count {
+            0 => "It has no threads.".to_string(),
+            1 => "Its thread is deleted from TJ.".to_string(),
+            n => format!("Its {n} threads are deleted from TJ."),
+        };
+        let (workspace, id) = (cx.entity().downgrade(), project_id.to_string());
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (workspace, id) = (workspace.clone(), id.clone());
+            alert
+                .confirm()
+                .title(format!("Remove {name} from TJ?"))
+                .description(format!(
+                    "{threads} The project's folder and files are not touched; add it again any time."
+                ))
+                .ok_text("Remove")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let _ = workspace.update(cx, |w, cx| w.remove_project(&id, window, cx));
+                    true
+                })
+        });
+    }
+
+    fn remove_project(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.state.remove_project(project_id) else { return };
+        for meta in &project.threads {
+            self.threads.remove(&meta.id);
+            self.paths.delete_thread_files(&meta.id);
+        }
+        // Its panes go too: their terminals' shells end with them.
+        self.panes.remove(project_id);
+        self.reviews.remove(project_id);
+        self.changes.remove(project_id);
+        self.show_archived.remove(project_id);
+        if self.active.as_ref().is_some_and(|id| project.threads.iter().any(|t| &t.id == id)) {
+            self.active = None;
+            self.pick_active(window, cx);
+        }
+        self.save();
+        cx.notify();
+    }
+
+    fn close_thread_tab(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self.state.thread(thread_id).map(|(p, _)| p.id.clone()) else { return };
+        if let Some(panes) = self.panes.get(&project_id).cloned() {
+            panes.update(cx, |p, cx| p.close_thread(thread_id, window, cx));
+        }
+    }
+
+    /// After the active thread went away: the conversation its panes now show, else the
+    /// newest thread left (archived ones aside), else nothing.
+    fn pick_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = self.panes.values().find_map(|p| p.read(cx).active_thread_id());
+        let next = shown.or_else(|| {
+            self.state.projects.iter().flat_map(|p| p.threads.iter()).find(|t| !t.archived).map(|t| t.id.clone())
+        });
+        match next {
+            Some(id) => self.open_thread(&id, window, cx),
+            None => self.state.selected_thread = None,
+        }
     }
 
     fn new_thread(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -922,74 +1085,169 @@ impl Workspace {
             (theme.sidebar_foreground.opacity(0.6), theme.sidebar_accent, theme.sidebar_foreground);
         let (running, waiting) = (theme.warning, theme.primary);
         let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
-        let sidebar_bg = theme.sidebar.opacity(alpha);
+        let (sidebar_bg, sidebar_border) = (theme.sidebar.opacity(alpha), theme.sidebar_border);
         let active = self.active.clone();
 
-        let projects = self.state.projects.iter().map(|project| {
-            let project_id = project.id.clone();
-            let threads = project.threads.iter().map(|meta| {
-                let id = meta.id.clone();
-                let status = self.threads.get(&meta.id).map(|t| t.read(cx).status).unwrap_or(Status::Idle);
-                let dot = match status {
-                    Status::Idle => None,
-                    Status::Running => Some(running),
-                    Status::AwaitingApproval => Some(waiting),
+        let workspace = cx.entity();
+        let renaming = self.renaming.clone();
+        let thread_row = |meta: &store::ThreadMeta, cx: &mut Context<Self>| {
+            let id = meta.id.clone();
+            let status = self.threads.get(&meta.id).map(|t| t.read(cx).status).unwrap_or(Status::Idle);
+            let dot = match status {
+                Status::Idle => None,
+                Status::Running => Some(running),
+                Status::AwaitingApproval => Some(waiting),
+            };
+            let selected = active.as_deref() == Some(meta.id.as_str());
+            let editing = renaming.as_ref().filter(|(r, _)| *r == meta.id).map(|(_, input)| input.clone());
+            let label = div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_sm()
+                .text_color(if meta.archived { muted } else { fg })
+                .child(meta.title.clone().unwrap_or_else(|| "New thread".into()));
+            let menu =
+                {
+                    let (workspace, id, archived) = (workspace.clone(), meta.id.clone(), meta.archived);
+                    move |menu: gpui_kit::component::menu::PopupMenu, _: &mut Window, _: &mut Context<_>| {
+                        let (w1, w2, w3) = (workspace.clone(), workspace.clone(), workspace.clone());
+                        let (i1, i2, i3) = (id.clone(), id.clone(), id.clone());
+                        menu.item(
+                            PopupMenuItem::new("Rename")
+                                .on_click(move |_, window, cx| w1.update(cx, |w, cx| w.start_rename(&i1, window, cx))),
+                        )
+                        .item(PopupMenuItem::new(if archived { "Unarchive" } else { "Archive" }).on_click(
+                            move |_, window, cx| w2.update(cx, |w, cx| w.set_archived(&i2, !archived, window, cx)),
+                        ))
+                        .separator()
+                        .item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
+                            w3.update(cx, |w, cx| w.confirm_delete_thread(&i3, window, cx))
+                        }))
+                    }
                 };
-                let selected = active.as_deref() == Some(meta.id.as_str());
-                h_flex()
-                    .id(SharedString::from(format!("thread-{}", meta.id)))
-                    .test_support()
-                    .gap_2()
-                    .mx_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(selected, |el| el.bg(accent_bg))
-                    .hover(|el| el.bg(accent_bg.opacity(0.6)))
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_thread(&id, window, cx)))
-                    .child(
+            h_flex()
+                .id(SharedString::from(format!("thread-{}", meta.id)))
+                .test_support()
+                .gap_2()
+                .mx_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(selected, |el| el.bg(accent_bg))
+                .hover(|el| el.bg(accent_bg.opacity(0.6)))
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    // A double click renames, as in a file manager.
+                    if event.click_count() >= 2 {
+                        this.start_rename(&id, window, cx);
+                    } else {
+                        this.open_thread(&id, window, cx);
+                    }
+                }))
+                .map(|el| match editing {
+                    Some(input) => el.child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_sm()
-                            .text_color(fg)
-                            .child(meta.title.clone().unwrap_or_else(|| "New thread".into())),
+                            .capture_action(cx.listener(|this, _: &gpui_kit::component::input::Escape, _, cx| {
+                                this.finish_rename(false, cx);
+                                cx.stop_propagation();
+                            }))
+                            .child(Input::new(&input).xsmall()),
+                    ),
+                    None => el.child(label),
+                })
+                .when_some(dot, |el, color| el.child(div().size_2().rounded_full().bg(color)))
+                .context_menu(menu)
+        };
+
+        let mut projects = Vec::new();
+        for project in &self.state.projects {
+            let project_id = project.id.clone();
+            let open: Vec<_> = project.threads.iter().filter(|t| !t.archived).map(|t| thread_row(t, cx)).collect();
+            let archived: Vec<&store::ThreadMeta> = project.threads.iter().filter(|t| t.archived).collect();
+            let showing_archived = self.show_archived.contains(&project.id);
+            let archived_rows: Vec<_> =
+                if showing_archived { archived.iter().map(|t| thread_row(t, cx)).collect() } else { Vec::new() };
+            let header_menu = {
+                let (workspace, id) = (workspace.clone(), project.id.clone());
+                move |menu: gpui_kit::component::menu::PopupMenu, _: &mut Window, _: &mut Context<_>| {
+                    let (w1, w2) = (workspace.clone(), workspace.clone());
+                    let (i1, i2) = (id.clone(), id.clone());
+                    menu.item(
+                        PopupMenuItem::new("New thread")
+                            .on_click(move |_, window, cx| w1.update(cx, |w, cx| w.new_thread(&i1, window, cx))),
                     )
-                    .when_some(dot, |el, color| el.child(div().size_2().rounded_full().bg(color)))
-            });
-            v_flex()
-                .pb_2()
-                .child(
-                    h_flex()
-                        .px_4()
-                        .pt_2()
-                        .pb_1()
-                        .gap_1()
-                        .child(
+                    .separator()
+                    .item(PopupMenuItem::new("Remove from TJ…").on_click(move |_, window, cx| {
+                        w2.update(cx, |w, cx| w.confirm_remove_project(&i2, window, cx))
+                    }))
+                }
+            };
+            let toggle_id = project.id.clone();
+            projects.push(
+                v_flex()
+                    .pb_2()
+                    .child(
+                        h_flex()
+                            .id(SharedString::from(format!("project-{}", project.id)))
+                            .px_4()
+                            .pt_2()
+                            .pb_1()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(muted)
+                                    .child(project.name.to_uppercase()),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("new-thread-{}", project.id)))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("+")
+                                    .tooltip("New thread")
+                                    .on_click(
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.new_thread(&project_id, window, cx)
+                                        }),
+                                    ),
+                            )
+                            .context_menu(header_menu),
+                    )
+                    .children(open)
+                    .when(!archived.is_empty(), |el| {
+                        el.child(
                             div()
-                                .flex_1()
+                                .id(SharedString::from(format!("archived-{}", project.id)))
+                                .test_support()
+                                .mx_2()
+                                .px_2()
+                                .py_0p5()
                                 .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(muted)
-                                .child(project.name.to_uppercase()),
+                                .cursor_pointer()
+                                .child(format!(
+                                    "{} Archived ({})",
+                                    if showing_archived { "▾" } else { "▸" },
+                                    archived.len()
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.show_archived.remove(&toggle_id) {
+                                        this.show_archived.insert(toggle_id.clone());
+                                    }
+                                    cx.notify();
+                                })),
                         )
-                        .child(
-                            Button::new(SharedString::from(format!("new-thread-{}", project.id)))
-                                .ghost()
-                                .xsmall()
-                                .label("+")
-                                .tooltip("New thread")
-                                .on_click(
-                                    cx.listener(move |this, _, window, cx| this.new_thread(&project_id, window, cx)),
-                                ),
-                        ),
-                )
-                .children(threads)
-        });
+                    })
+                    .children(archived_rows),
+            );
+        }
 
         v_flex()
             .w(px(SIDEBAR_WIDTH))
@@ -997,7 +1255,7 @@ impl Workspace {
             .flex_none()
             .bg(sidebar_bg)
             .border_r_1()
-            .border_color(theme.sidebar_border)
+            .border_color(sidebar_border)
             .child(
                 // "TJ" sits in the middle of the header; the controls and drag areas lie over it.
                 div()
@@ -1300,6 +1558,104 @@ mod tests {
         let saved = State::load(&paths).unwrap();
         assert_eq!(saved.projects[0].threads.len(), 2);
         assert_eq!(saved.selected_thread, Some(first));
+    }
+
+    /// Two threads in the demo project: (project id, first thread, second thread, which is active).
+    fn two_threads(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> (String, String, String) {
+        let (project_id, first) =
+            workspace.read_with(cx, |w, _| (w.state.projects[0].id.clone(), w.active.clone().unwrap()));
+        workspace.update_in(cx, |w, window, cx| w.new_thread(&project_id, window, cx));
+        let second = workspace.read_with(cx, |w, _| w.active.clone().unwrap());
+        (project_id, first, second)
+    }
+
+    #[gpui_kit::test]
+    fn a_renamed_thread_keeps_its_name_until_cleared(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let id = workspace.read_with(cx, |w, _| w.active.clone().unwrap());
+        workspace.update_in(cx, |w, window, cx| w.start_rename(&id, window, cx));
+        cx.simulate_input("Release notes");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let saved = State::load(&paths).unwrap();
+        let meta = &saved.projects[0].threads[0];
+        assert_eq!((meta.title.as_deref(), meta.named), (Some("Release notes"), true));
+
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        let overview = crate::overview::Overview { title: Some("Changelog work".into()), ..Default::default() };
+        thread.update(cx, |t, cx| t.apply_overview(overview, 0, cx));
+        assert_eq!(thread.read_with(cx, |t, _| t.title.clone()).as_deref(), Some("Release notes"));
+
+        // Escape keeps the old name; an empty name hands naming back to the overview.
+        workspace.update_in(cx, |w, window, cx| w.start_rename(&id, window, cx));
+        cx.simulate_input("Typo");
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(thread.read_with(cx, |t, _| t.title.clone()).as_deref(), Some("Release notes"));
+        assert!(workspace.read_with(cx, |w, _| w.renaming.is_none()));
+        workspace.update(cx, |w, cx| w.rename_thread(&id, "  ", cx));
+        cx.run_until_parked();
+        let meta = State::load(&paths).unwrap().projects[0].threads[0].clone();
+        assert_eq!((meta.title.as_deref(), meta.named), (Some("Changelog work"), false));
+    }
+
+    #[gpui_kit::test]
+    fn archiving_hides_a_thread_until_unarchived(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (project_id, first, second) = two_threads(&workspace, cx);
+        workspace.update_in(cx, |w, window, cx| w.set_archived(&second, true, window, cx));
+        let saved = State::load(&paths).unwrap();
+        assert!(saved.projects[0].threads.iter().any(|t| t.id == second && t.archived));
+        assert_eq!(workspace.read_with(cx, |w, _| w.active.clone()), Some(first.clone()), "its tab closed");
+
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from(format!("archived-{project_id}")), cx);
+        });
+        assert!(workspace.read_with(cx, |w, _| w.show_archived.contains(&project_id)));
+        workspace.update_in(cx, |w, window, cx| w.set_archived(&second, false, window, cx));
+        assert!(!State::load(&paths).unwrap().projects[0].threads.iter().any(|t| t.archived));
+    }
+
+    #[gpui_kit::test]
+    fn deleting_a_thread_removes_its_files_and_moves_on(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (_, first, second) = two_threads(&workspace, cx);
+        let transcript = paths.transcript(&second);
+        std::fs::create_dir_all(crate::composer::files_dir(&transcript)).unwrap();
+        std::fs::write(&transcript, "{}\n").unwrap();
+
+        // The confirmation opens without trouble; the test then deletes directly.
+        workspace.update_in(cx, |w, window, cx| w.confirm_delete_thread(&second, window, cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        workspace.update_in(cx, |w, window, cx| w.delete_thread(&second, window, cx));
+
+        let saved = State::load(&paths).unwrap();
+        assert_eq!(saved.projects[0].threads.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), vec![first.clone()]);
+        assert!(!transcript.exists() && !crate::composer::files_dir(&transcript).exists());
+        assert_eq!(workspace.read_with(cx, |w, _| w.active.clone()), Some(first));
+        assert!(workspace.read_with(cx, |w, _| !w.threads.contains_key(&second)));
+    }
+
+    #[gpui_kit::test]
+    fn removing_a_project_forgets_it_but_leaves_its_folder(cx: &mut TestAppContext) {
+        let (window, workspace, paths, project) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (project_id, first, _) = two_threads(&workspace, cx);
+        std::fs::create_dir_all(paths.transcript(&first).parent().unwrap()).unwrap();
+        std::fs::write(paths.transcript(&first), "{}\n").unwrap();
+        workspace.update_in(cx, |w, window, cx| w.confirm_remove_project(&project_id, window, cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        workspace.update_in(cx, |w, window, cx| w.remove_project(&project_id, window, cx));
+
+        assert!(State::load(&paths).unwrap().projects.is_empty());
+        assert!(!paths.transcript(&first).exists());
+        assert!(project.exists(), "the project's own folder is untouched");
+        assert_eq!(workspace.read_with(cx, |w, _| (w.active.clone(), w.panes.len(), w.threads.len())), (None, 0, 0));
+        cx.update(|window, cx| window.render_frame(cx));
     }
 
     #[gpui_kit::test]

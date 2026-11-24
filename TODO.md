@@ -13,8 +13,8 @@ What's missing or rough, roughly in priority order. ROADMAP.md has the direction
 
 ## Threads and projects
 
-- [ ] Rename, archive and delete threads.
-- [ ] Remove a project.
+- [x] Rename, archive and delete threads (right-click menu; double-click renames).
+- [x] Remove a project (right-click its name; the folder is not touched).
 
 ## Terminal and panes
 

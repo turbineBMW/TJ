@@ -473,7 +473,6 @@ impl Panes {
         matches!(self.active_tab(), Some(Tab::Review(_)))
     }
 
-    #[cfg(test)]
     pub fn active_thread_id(&self) -> Option<String> {
         self.active_tab().and_then(|t| t.thread_id().map(str::to_owned))
     }
@@ -571,6 +570,18 @@ impl Panes {
         });
         self.focused = id;
         self.changed(window, cx);
+    }
+
+    /// Close a conversation's tab, if it has one (archived or deleted threads).
+    pub fn close_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.find_tab(|t| matches!(t, Tab::Thread { id, .. } if id == thread_id)) {
+            self.close_entity(id, window, cx);
+        }
+    }
+
+    fn find_tab(&self, matches: impl Fn(&Tab) -> bool) -> Option<EntityId> {
+        let (pane_id, ix) = self.find(&matches)?;
+        self.root.as_ref()?.pane(pane_id).map(|pane| pane.tabs[ix].entity_id())
     }
 
     pub fn close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
