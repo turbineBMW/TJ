@@ -14,6 +14,56 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Which coding agent runs a thread. Claude is the only backend today; the others are the
+/// agents T3 Code supports, listed so a thread can name one (and show its mark) once TJ
+/// grows a backend for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    #[default]
+    Claude,
+    Codex,
+    OpenCode,
+    Cursor,
+    Grok,
+    Pi,
+    Kiro,
+    Muse,
+    Fx,
+    Antigravity,
+}
+
+impl AgentKind {
+    #[cfg(test)]
+    pub const ALL: [AgentKind; 10] = [
+        Self::Claude,
+        Self::Codex,
+        Self::OpenCode,
+        Self::Cursor,
+        Self::Grok,
+        Self::Pi,
+        Self::Kiro,
+        Self::Muse,
+        Self::Fx,
+        Self::Antigravity,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::OpenCode => "OpenCode",
+            Self::Cursor => "Cursor",
+            Self::Grok => "Grok",
+            Self::Pi => "Pi",
+            Self::Kiro => "Kiro",
+            Self::Muse => "Muse Code",
+            Self::Fx => "fx",
+            Self::Antigravity => "Antigravity",
+        }
+    }
+}
+
 /// How much the agent may do without asking. Mirrors Claude Code's permission modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Eq)]
 pub enum PermissionMode {

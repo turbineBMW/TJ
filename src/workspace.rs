@@ -1346,6 +1346,22 @@ impl Workspace {
                     None => el.child(label),
                 })
                 .when_some(dot, |el, color| el.child(div().size_2().rounded_full().bg(color)))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("thread-agent-{}", meta.id)))
+                        .flex_none()
+                        .size(px(14.))
+                        .when(meta.archived, |el| el.opacity(0.6))
+                        .tooltip({
+                            let label = meta.agent.label();
+                            move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
+                        })
+                        .child(
+                            img(crate::agent_icon::icon(meta.agent, if meta.archived { muted } else { fg }))
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                )
                 .context_menu(menu)
         };
 

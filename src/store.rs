@@ -17,7 +17,7 @@ use std::{
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentEvent, PermissionMode};
+use crate::agent::{AgentEvent, AgentKind, PermissionMode};
 
 /// Where TJ's files live.
 #[derive(Clone, Debug)]
@@ -206,6 +206,9 @@ pub struct ThreadMeta {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    /// The agent running the thread; threads saved before TJ knew other agents are Claude's.
+    #[serde(default)]
+    pub agent: AgentKind,
     /// Hidden from the sidebar's list (shown under "Archived").
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
@@ -393,6 +396,7 @@ impl State {
                 mode: None,
                 model: None,
                 effort: None,
+                agent: AgentKind::default(),
                 archived: false,
                 named: false,
             },
