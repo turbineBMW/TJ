@@ -40,6 +40,8 @@ impl EventEmitter<ThreadChanged> for ThreadView {}
 #[derive(Clone, Debug, PartialEq)]
 pub enum ThreadAction {
     SwitchAccount(String),
+    /// Make the thread's model and effort the default for new threads in its project.
+    MakeModelDefault,
     /// Make the thread's account the default for new threads in its project.
     MakeAccountDefault,
     /// Make the thread's mode the default for new threads in its project.
@@ -58,6 +60,10 @@ pub struct MenuContext {
     pub project_name: String,
     pub project_account: String,
     pub project_mode: PermissionMode,
+    /// The models the thread's account offers, and the project's default model and effort.
+    pub models: Vec<crate::agent::ModelChoice>,
+    pub project_model: Option<String>,
+    pub project_effort: Option<String>,
     /// The project folder for display (`~/Projects/TJ`), and its git branch.
     pub project_dir: String,
     pub branch: Option<String>,
@@ -73,6 +79,9 @@ pub struct ThreadSetup {
     pub session_id: Option<String>,
     pub account_id: String,
     pub account_name: String,
+    /// The model (`--model` value) and effort chosen for this thread; defaults when `None`.
+    pub model_choice: Option<String>,
+    pub effort: Option<String>,
     /// Where to append the transcript; nothing is saved when `None` (demos, tests).
     pub transcript: Option<PathBuf>,
 }
@@ -257,6 +266,9 @@ pub struct ThreadView {
     pub context_window: Option<u64>,
     /// What the account and mode menus offer.
     pub menus: MenuContext,
+    /// The model and effort picked for this thread (`None`: Claude Code's defaults).
+    pub model_choice: Option<String>,
+    pub effort: Option<String>,
     scroller: Entity<MessageScrollerState>,
     prompt: Entity<TextareaState>,
     backend: Option<Backend>,
@@ -322,6 +334,8 @@ impl ThreadView {
             context_tokens: None,
             context_window: None,
             menus: MenuContext::default(),
+            model_choice: setup.model_choice.clone(),
+            effort: setup.effort.clone(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             prompt,
             backend: Some(backend),
@@ -443,6 +457,72 @@ impl ThreadView {
             self.plain.iter().rev().filter_map(|line| line.strip_prefix("User: ")).take(n).map(str::to_owned).collect();
         requests.reverse();
         requests
+    }
+
+    /// Pick the model; a running session switches at once, a new one starts with it.
+    pub fn set_model_choice(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+        if self.model_choice == model {
+            return;
+        }
+        self.model_choice = model.clone();
+        if let Some(Backend::Claude(options)) = &mut self.backend {
+            options.model = model.clone();
+        }
+        // The new model may not offer the current effort level; drop it if so.
+        let efforts = self.model_info().map(|m| m.efforts.clone()).unwrap_or_default();
+        if self.effort.as_ref().is_some_and(|e| !efforts.contains(e)) {
+            self.set_effort(None, cx);
+        }
+        if let Some(agent) = &self.agent
+            && let Err(err) = agent.set_model(model.as_deref())
+        {
+            self.notice(NoticeKind::Error, format!("Could not switch model: {err:#}"), cx);
+        }
+        cx.emit(ThreadChanged);
+        cx.notify();
+    }
+
+    pub fn set_effort(&mut self, effort: Option<String>, cx: &mut Context<Self>) {
+        if self.effort == effort {
+            return;
+        }
+        self.effort = effort.clone();
+        if let Some(Backend::Claude(options)) = &mut self.backend {
+            options.effort = effort.clone();
+        }
+        if let Some(agent) = &self.agent
+            && let Err(err) = agent.set_effort(effort.as_deref())
+        {
+            self.notice(NoticeKind::Error, format!("Could not change effort: {err:#}"), cx);
+        }
+        cx.emit(ThreadChanged);
+        cx.notify();
+    }
+
+    /// The catalog entry for the picked model (or for "default").
+    fn model_info(&self) -> Option<&crate::agent::ModelChoice> {
+        let value = self.model_choice.as_deref().unwrap_or("default");
+        self.menus.models.iter().find(|m| m.value == value)
+    }
+
+    /// "Opus 5.5 · High": the picked model's name, else the model the session runs, else the
+    /// default's; then the effort, when one is set.
+    pub fn model_label(&self) -> String {
+        let name = match (&self.model_choice, self.model_info()) {
+            (Some(_), Some(info)) => info.name.clone(),
+            (Some(value), None) => value.clone(),
+            (None, _) => match &self.model {
+                Some(running) => short_model(running),
+                None => self
+                    .model_info()
+                    .and_then(|m| m.description.split(" · ").next().filter(|d| !d.is_empty()).map(str::to_owned))
+                    .unwrap_or_else(|| "Default model".into()),
+            },
+        };
+        match &self.effort {
+            Some(effort) => format!("{name} · {}", capitalize(effort)),
+            None => name,
+        }
     }
 
     /// A thread that hasn't started yet shows the intro instead of an empty conversation.
@@ -952,6 +1032,7 @@ impl ThreadView {
                     self.remeasure(ix, cx);
                 }
             }
+            AgentEvent::ModelInUse(model) => self.model = Some(model),
             AgentEvent::Context { tokens, window } => {
                 self.context_tokens = tokens.or(self.context_tokens);
                 self.context_window = window.or(self.context_window);
@@ -1543,6 +1624,62 @@ impl ThreadView {
                 }
             });
 
+        let model_menu = Button::new("model-menu")
+            .ghost()
+            .xsmall()
+            .label(self.model_label())
+            .icon(gpui_kit::assets::IconName::ChevronDown)
+            .dropdown_menu({
+                let (menus, thread) = (menus.clone(), thread.clone());
+                let (choice, effort) = (self.model_choice.clone(), self.effort.clone());
+                let efforts = self.model_info().map(|m| m.efforts.clone()).unwrap_or_default();
+                move |menu, _window, _cx| {
+                    let mut menu = menu.label("Model");
+                    for model in &menus.models {
+                        let (thread, value) = (thread.clone(), model.value.clone());
+                        let picked = choice.as_deref().unwrap_or("default") == model.value;
+                        let label = if model.description.is_empty() {
+                            model.name.clone()
+                        } else {
+                            format!("{} — {}", model.name, model.description)
+                        };
+                        menu = menu.item(PopupMenuItem::new(label).checked(picked).on_click(move |_, _, cx| {
+                            let value = (value != "default").then(|| value.clone());
+                            thread.update(cx, |t, cx| t.set_model_choice(value, cx))
+                        }));
+                    }
+                    if !efforts.is_empty() {
+                        menu = menu.separator().label("Effort");
+                        let t = thread.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new("Model's default")
+                                .checked(effort.is_none())
+                                .on_click(move |_, _, cx| t.update(cx, |t, cx| t.set_effort(None, cx))),
+                        );
+                        for level in &efforts {
+                            let (thread, level) = (thread.clone(), level.clone());
+                            menu = menu.item(
+                                PopupMenuItem::new(capitalize(&level))
+                                    .checked(effort.as_deref() == Some(level.as_str()))
+                                    .on_click(move |_, _, cx| {
+                                        let level = level.clone();
+                                        thread.update(cx, |t, cx| t.set_effort(Some(level), cx))
+                                    }),
+                            );
+                        }
+                    }
+                    let is_default = choice == menus.project_model && effort == menus.project_effort;
+                    let thread = thread.clone();
+                    menu.separator().item(
+                        PopupMenuItem::new(format!("Use for new threads in {}", menus.project_name))
+                            .checked(is_default)
+                            .on_click(move |_, _, cx| {
+                                thread.update(cx, |_, cx| cx.emit(ThreadAction::MakeModelDefault))
+                            }),
+                    )
+                }
+            });
+
         let send = if running {
             Button::new("stop").small().label("Stop").on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
         } else {
@@ -1555,7 +1692,7 @@ impl ThreadView {
         };
 
         if self.is_fresh() {
-            return self.render_intro(account_menu, mode_menu, cx).into_any_element();
+            return self.render_intro(account_menu, mode_menu, model_menu, cx).into_any_element();
         }
 
         v_flex()
@@ -1579,6 +1716,7 @@ impl ThreadView {
                                 .child(account_menu)
                                 .child(mode_menu)
                                 .child(div().flex_1())
+                                .child(model_menu)
                                 .child(send),
                         ),
                 ),
@@ -1592,6 +1730,7 @@ impl ThreadView {
         &self,
         account_menu: impl IntoElement,
         mode_menu: impl IntoElement,
+        model_menu: impl IntoElement,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -1652,7 +1791,15 @@ impl ThreadView {
                         .border_color(border)
                         .bg(card)
                         .child(div().min_h(px(64.)).child(Textarea::new(&self.prompt).appearance(false)))
-                        .child(h_flex().gap_1().child(account_menu).child(mode_menu).child(div().flex_1()).child(send)),
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(account_menu)
+                                .child(mode_menu)
+                                .child(div().flex_1())
+                                .child(model_menu)
+                                .child(send),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -1667,6 +1814,11 @@ impl ThreadView {
                 ),
         )
     }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
 }
 
 /// A thread title from its first prompt: the first line, shortened.
@@ -2133,6 +2285,50 @@ mod tests {
         assert!(has_summary);
         assert!(thread.read_with(cx, |t, _| t.plain.iter().any(|l| l.starts_with("(Subagent "))));
         assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Idle);
+    }
+
+    #[gpui_kit::test]
+    fn picking_a_model_and_effort_reaches_a_running_session(cx: &mut TestAppContext) {
+        use crate::agent::ModelChoice;
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let model = |value: &str, name: &str, efforts: &[&str]| ModelChoice {
+            value: value.into(),
+            name: name.into(),
+            description: String::new(),
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+        };
+        thread.update(cx, |t, cx| {
+            t.menus.models = vec![
+                ModelChoice {
+                    description: "Opus 5.5 · Best for everyday tasks".into(),
+                    ..model("default", "Default", &["low", "high"])
+                },
+                model("sonnet", "Sonnet 5.5", &["low", "high"]),
+                model("claude-haiku-4-5", "Haiku 4.5", &[]),
+            ];
+            assert_eq!(t.model_label(), "Opus 5.5", "the default's model name, before a session says otherwise");
+            t.set_model_choice(Some("sonnet".into()), cx);
+            t.set_effort(Some("high".into()), cx);
+            assert_eq!(t.model_label(), "Sonnet 5.5 · High");
+            // A model without effort levels drops the effort.
+            t.set_model_choice(Some("claude-haiku-4-5".into()), cx);
+            assert_eq!(t.effort, None);
+            assert_eq!(t.model_label(), "Haiku 4.5");
+        });
+        let sent: Vec<ScriptedCall> = calls(&thread, cx)
+            .into_iter()
+            .filter(|c| matches!(c, ScriptedCall::SetModel(_) | ScriptedCall::SetEffort(_)))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                ScriptedCall::SetModel(Some("sonnet".into())),
+                ScriptedCall::SetEffort(Some("high".into())),
+                ScriptedCall::SetEffort(None),
+                ScriptedCall::SetModel(Some("claude-haiku-4-5".into())),
+            ]
+        );
     }
 
     #[gpui_kit::test]

@@ -42,7 +42,7 @@ pub struct Launch {
     pub paths: Option<Paths>,
     /// The shell terminals run; the login shell when `None` (tests use `/bin/sh`).
     pub shell: Option<alacritty_terminal::tty::Shell>,
-    /// Don't call Claude for change summaries (tests).
+    /// Don't call Claude for change summaries or the model list (tests).
     pub no_summaries: bool,
     /// Open the review of the project's changes at launch (test hook).
     pub review: bool,
@@ -68,6 +68,9 @@ pub struct Workspace {
     problem: Option<SharedString>,
     /// Per project: its uncommitted changes, kept fresh.
     changes: HashMap<String, Entity<ProjectChanges>>,
+    /// Per account: the models `claude` offers it (loaded once, in the background).
+    models: HashMap<String, Vec<crate::agent::ModelChoice>>,
+    models_loading: std::collections::HashSet<String>,
     no_summaries: bool,
     /// The sidebar-opacity slider in the settings popover.
     opacity_slider: Entity<SliderState>,
@@ -113,6 +116,8 @@ impl Workspace {
             type_text: launch.type_text,
             problem,
             changes: HashMap::new(),
+            models: HashMap::new(),
+            models_loading: Default::default(),
             no_summaries: launch.no_summaries,
             opacity_slider,
             _subscriptions: vec![slider_events],
@@ -184,7 +189,12 @@ impl Workspace {
             // A Claude session lives in its account's config directory; resume it only there.
             let session_id = meta.session_id.clone().filter(|_| meta.session_account.as_deref() == Some(&account.id));
             let mode = meta.mode.or(project.mode).unwrap_or_default();
+            // The thread's own model and effort, else the project's, else `--model` / defaults.
+            let model_choice = meta.model.clone().or(project.model.clone()).or(self.model.clone());
+            let effort = meta.effort.clone().or(project.effort.clone());
             let setup = ThreadSetup {
+                model_choice: model_choice.clone(),
+                effort: effort.clone(),
                 title: meta.title.clone(),
                 session_id,
                 account_id: account.id.clone(),
@@ -196,7 +206,8 @@ impl Workspace {
                 None => Backend::Claude(SessionOptions {
                     cwd: project.path.clone(),
                     config_dir: account.config_path(&self.home),
-                    model: self.model.clone(),
+                    model: model_choice,
+                    effort,
                     permission_mode: mode,
                     ..Default::default()
                 }),
@@ -221,14 +232,64 @@ impl Workspace {
                         ThreadAction::SwitchAccount(account) => this.switch_account(account, cx),
                         ThreadAction::MakeAccountDefault => this.make_project_default_account(cx),
                         ThreadAction::MakeModeDefault => this.make_project_default_mode(cx),
+                        ThreadAction::MakeModelDefault => this.make_project_default_model(cx),
                         ThreadAction::LogIn => this.log_in(window, cx),
                     }
                 },
             ));
+            self.load_models(&account.id, cx);
             self.threads.insert(thread_id.to_string(), thread);
             self.refresh_menus(cx);
         }
         self.threads.get(thread_id).cloned()
+    }
+
+    /// Ask `claude` once, in the background, which models an account offers.
+    fn load_models(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        if self.no_summaries
+            || self.models.contains_key(account_id)
+            || !self.models_loading.insert(account_id.to_string())
+        {
+            return;
+        }
+        let config_dir = self.accounts.get(account_id).and_then(|a| a.config_path(&self.home));
+        let id = account_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let models = cx
+                .background_executor()
+                .spawn(async move { crate::agent::claude::list_models(config_dir.as_deref()) })
+                .await;
+            let _ = this.update(cx, |this: &mut Workspace, cx| {
+                this.models_loading.remove(&id);
+                match models {
+                    Ok(models) => {
+                        this.models.insert(id, models);
+                        this.refresh_menus(cx);
+                    }
+                    // The fallback list stays; the session itself still works.
+                    Err(err) => eprintln!("tj: could not list models: {err:#}"),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn make_project_default_model(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.active_thread() else { return };
+        let (model, effort) = {
+            let t = thread.read(cx);
+            (t.model_choice.clone(), t.effort.clone())
+        };
+        let Some(project_id) = self.active_project().map(|p| p.id.clone()) else { return };
+        if let Some(project) = self.state.project_mut(&project_id) {
+            project.model = model;
+            project.effort = effort;
+        }
+        if let Some(id) = self.active.clone() {
+            self.sync_thread(&id, cx);
+        }
+        self.refresh_menus(cx);
+        cx.notify();
     }
 
     /// Tell every open thread what its account and mode menus offer (accounts, project defaults).
@@ -244,6 +305,13 @@ impl Workspace {
                 project_mode: project.mode.unwrap_or_default(),
                 project_dir: display_path(&project.path, &self.home),
                 branch: git_branch(&project.path),
+                models: self
+                    .models
+                    .get(&thread.read(cx).account_id)
+                    .cloned()
+                    .unwrap_or_else(crate::agent::ModelChoice::fallback),
+                project_model: project.model.clone(),
+                project_effort: project.effort.clone(),
             };
             thread.update(cx, |t, cx| {
                 t.menus = menus;
@@ -273,9 +341,11 @@ impl Workspace {
         let Some((project, _)) = self.state.thread(thread_id) else { return };
         let project_account = self.accounts.resolve(None, project.account.as_deref()).id.clone();
         let project_mode = project.mode.unwrap_or_default();
+        let (project_model, project_effort) = (project.model.clone(), project.effort.clone());
         let t = thread.read(cx);
         let (title, session_id, account_id, mode) =
             (t.title.clone(), t.session_id.clone(), t.account_id.clone(), t.mode);
+        let (model, effort) = (t.model_choice.clone(), t.effort.clone());
         let Some(meta) = self.state.thread_mut(thread_id) else { return };
         let changed = meta.title != title || meta.session_id != session_id;
         meta.title = title;
@@ -283,6 +353,8 @@ impl Workspace {
         meta.session_id = session_id;
         meta.account = (account_id != project_account).then_some(account_id);
         meta.mode = (mode != project_mode).then_some(mode);
+        meta.model = model.filter(|m| Some(m) != project_model.as_ref());
+        meta.effort = effort.filter(|e| Some(e) != project_effort.as_ref());
         if changed {
             meta.updated_at = store::now();
         }
@@ -321,6 +393,8 @@ impl Workspace {
         };
         let config_dir = account.config_path(&self.home);
         thread.update(cx, |t, cx| t.set_account(&account.id, &account.name, config_dir, cx));
+        self.load_models(&account.id, cx);
+        self.refresh_menus(cx);
     }
 
     fn make_project_default_account(&mut self, cx: &mut Context<Self>) {
@@ -1376,6 +1450,31 @@ mod tests {
         assert_eq!(super::initials("tj"), "TJ");
         assert_eq!(super::initials("nautilus-omarchy"), "NO");
         assert_eq!(super::initials("Vmux"), "VM");
+    }
+
+    #[gpui_kit::test]
+    fn a_model_made_the_project_default_starts_new_threads(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        thread.update(cx, |t, cx| {
+            t.set_model_choice(Some("sonnet".into()), cx);
+            t.set_effort(Some("low".into()), cx);
+        });
+        thread.update(cx, |_, cx| cx.emit(crate::thread::ThreadAction::MakeModelDefault));
+        cx.run_until_parked();
+        let saved = State::load(&paths).unwrap();
+        assert_eq!(saved.projects[0].model.as_deref(), Some("sonnet"));
+        assert_eq!(saved.projects[0].effort.as_deref(), Some("low"));
+        assert_eq!(saved.projects[0].threads[0].model, None, "matching the project, the thread keeps no override");
+
+        let project_id = saved.projects[0].id.clone();
+        workspace.update_in(cx, |w, window, cx| w.new_thread(&project_id, window, cx));
+        let (model, effort) = workspace.read_with(cx, |w, cx| {
+            let t = w.active_thread().unwrap().read(cx);
+            (t.model_choice.clone(), t.effort.clone())
+        });
+        assert_eq!((model.as_deref(), effort.as_deref()), (Some("sonnet"), Some("low")));
     }
 
     #[gpui_kit::test]

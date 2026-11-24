@@ -123,6 +123,8 @@ pub enum AgentEvent {
         session_id: String,
         model: Option<String>,
     },
+    /// The model that answered (it changes when the model is switched mid-session).
+    ModelInUse(String),
     /// A new block of assistant text begins; following deltas belong to it.
     TextStarted,
     TextDelta(String),
@@ -193,12 +195,48 @@ pub enum AgentEvent {
     },
 }
 
+/// A model the agent offers, as `claude` lists it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    /// What to pass to `--model` / `set_model`: an alias (`opus`) or a full id.
+    pub value: String,
+    pub name: String,
+    pub description: String,
+    /// Effort levels the model accepts (`low` ... `max`); empty when it has none.
+    pub efforts: Vec<String>,
+}
+
+impl ModelChoice {
+    /// Used until `claude` has listed the real ones (and if it can't).
+    pub fn fallback() -> Vec<Self> {
+        let effort = ["low", "medium", "high", "xhigh", "max"].map(String::from).to_vec();
+        [
+            ("default", "Default", "Claude Code's default model"),
+            ("opus", "Opus", ""),
+            ("sonnet", "Sonnet", ""),
+            ("haiku", "Haiku", ""),
+        ]
+        .into_iter()
+        .map(|(value, name, description)| Self {
+            value: value.into(),
+            name: name.into(),
+            description: description.into(),
+            efforts: effort.clone(),
+        })
+        .collect()
+    }
+}
+
 /// Commands from the UI to a running session.
 pub trait AgentSession {
     fn send_prompt(&self, text: &str) -> anyhow::Result<()>;
     fn respond(&self, request: &PermissionRequest, decision: Decision) -> anyhow::Result<()>;
     fn interrupt(&self) -> anyhow::Result<()>;
     fn set_permission_mode(&self, mode: PermissionMode) -> anyhow::Result<()>;
+    /// Switch model for the rest of the session; `None` goes back to the default.
+    fn set_model(&self, model: Option<&str>) -> anyhow::Result<()>;
+    /// Change effort for the rest of the session; `None` goes back to the model's default.
+    fn set_effort(&self, effort: Option<&str>) -> anyhow::Result<()>;
 }
 
 /// An agent that plays back a fixed list of events and records what the UI sends it.
@@ -213,6 +251,8 @@ pub enum ScriptedCall {
     Respond { request_id: String, decision: Decision },
     Interrupt,
     SetPermissionMode(PermissionMode),
+    SetModel(Option<String>),
+    SetEffort(Option<String>),
 }
 
 impl ScriptedAgent {
@@ -250,5 +290,11 @@ impl AgentSession for ScriptedAgent {
     }
     fn set_permission_mode(&self, mode: PermissionMode) -> anyhow::Result<()> {
         self.record(ScriptedCall::SetPermissionMode(mode))
+    }
+    fn set_model(&self, model: Option<&str>) -> anyhow::Result<()> {
+        self.record(ScriptedCall::SetModel(model.map(str::to_owned)))
+    }
+    fn set_effort(&self, effort: Option<&str>) -> anyhow::Result<()> {
+        self.record(ScriptedCall::SetEffort(effort.map(str::to_owned)))
     }
 }
