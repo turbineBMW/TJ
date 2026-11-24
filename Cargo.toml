@@ -22,3 +22,5 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 gpui-kit = { version = "0.11.0", features = ["test-support"] }
+# The SVG renderer gpui already builds; tests use it to check every agent mark draws.
+resvg = "0.46"
