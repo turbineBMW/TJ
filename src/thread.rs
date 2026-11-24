@@ -1,0 +1,855 @@
+//! A conversation with an agent: the transcript, approval cards, and the prompt box.
+
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
+use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    message_scroller::{MessageScroller, MessageScrollerState},
+    text::{TextView, TextViewState},
+};
+use gpui_kit::{prelude::FluentBuilder as _, *};
+use serde_json::Value;
+
+use crate::agent::{
+    AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, ScriptedAgent, ScriptedCall, UsageWindow,
+    claude::{self, ClaudeSession, SessionOptions},
+};
+
+/// How the thread starts its agent when the first prompt is sent.
+pub enum Backend {
+    Claude(SessionOptions),
+    /// Plays back canned events (demos and tests); the events start on the first prompt.
+    Scripted(Vec<(std::time::Duration, AgentEvent)>),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Status {
+    Idle,
+    Running,
+    AwaitingApproval,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum NoticeKind {
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ToolStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+struct ToolRow {
+    id: String,
+    name: String,
+    summary: String,
+    status: ToolStatus,
+    output: Option<String>,
+    expanded: bool,
+}
+
+struct ApprovalRow {
+    request: PermissionRequest,
+    /// `None` while waiting; otherwise what happened, shown in place of the buttons.
+    outcome: Option<&'static str>,
+    /// Created on first render, since an input needs a window.
+    feedback: Option<Entity<InputState>>,
+}
+
+enum Row {
+    User(Entity<TextViewState>),
+    Assistant(Entity<TextViewState>),
+    Tool(ToolRow),
+    Approval(ApprovalRow),
+    Notice(NoticeKind, SharedString),
+    Footer(SharedString),
+}
+
+pub struct ThreadView {
+    rows: Vec<Row>,
+    scroller: Entity<MessageScrollerState>,
+    prompt: Entity<TextareaState>,
+    backend: Option<Backend>,
+    agent: Option<Box<dyn AgentSession>>,
+    _pump: Option<Task<()>>,
+    /// The assistant text row that deltas go to.
+    current_text: Option<usize>,
+    pub status: Status,
+    pub mode: PermissionMode,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub cost_usd: f64,
+    pub usage: Vec<UsageWindow>,
+    /// What a scripted agent was asked to do; tests read it.
+    pub scripted_log: Option<Arc<Mutex<Vec<ScriptedCall>>>>,
+}
+
+impl ThreadView {
+    pub fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mode = match &backend {
+            Backend::Claude(options) => options.permission_mode,
+            Backend::Scripted(_) => PermissionMode::default(),
+        };
+        let prompt = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .placeholder("Ask Claude…  (Enter sends, Shift+Enter adds a line)")
+        });
+        cx.subscribe_in(&prompt, window, |this, _, event: &InputEvent, window, cx| {
+            // Shift+Enter has already inserted a newline; only a plain or Ctrl+Enter sends.
+            if let InputEvent::PressEnter { shift: false, .. } = event {
+                this.submit(window, cx);
+            }
+        })
+        .detach();
+
+        Self {
+            rows: Vec::new(),
+            scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
+            prompt,
+            backend: Some(backend),
+            agent: None,
+            _pump: None,
+            current_text: None,
+            status: Status::Idle,
+            mode,
+            session_id: None,
+            model: None,
+            cost_usd: 0.0,
+            usage: Vec::new(),
+            scripted_log: None,
+        }
+    }
+
+    pub fn prompt_focus(&self, cx: &App) -> FocusHandle {
+        self.prompt.focus_handle(cx)
+    }
+
+    // ---------- commands ----------
+
+    /// Send what's in the prompt box.
+    pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.prompt.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.prompt.update(cx, |p, cx| p.set_value("", window, cx));
+        self.send(&text, cx);
+    }
+
+    /// Send `text` as the next user message.
+    pub fn send(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.push_text_row(true, text, cx);
+        self.current_text = None;
+        if let Err(err) = self.ensure_agent(cx).and_then(|agent| agent.send_prompt(text)) {
+            self.notice(NoticeKind::Error, format!("Could not send: {err:#}"), cx);
+            return;
+        }
+        self.status = Status::Running;
+        cx.notify();
+    }
+
+    pub fn interrupt(&mut self, cx: &mut Context<Self>) {
+        if let Some(agent) = &self.agent
+            && let Err(err) = agent.interrupt()
+        {
+            self.notice(NoticeKind::Error, format!("Could not stop: {err:#}"), cx);
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
+        self.mode = mode;
+        if let Some(Backend::Claude(options)) = &mut self.backend {
+            options.permission_mode = mode;
+        }
+        if let Some(agent) = &self.agent
+            && let Err(err) = agent.set_permission_mode(mode)
+        {
+            self.notice(NoticeKind::Error, format!("Could not change mode: {err:#}"), cx);
+        }
+        cx.notify();
+    }
+
+    /// Answer the approval card in row `ix`.
+    pub fn decide(&mut self, ix: usize, decision: Decision, cx: &mut Context<Self>) {
+        let Some(Row::Approval(row)) = self.rows.get_mut(ix) else { return };
+        if row.outcome.is_some() {
+            return;
+        }
+        let decision = match decision {
+            Decision::Decline { .. } => {
+                let feedback = row.feedback.as_ref().map(|f| f.read(cx).value().trim().to_string()).unwrap_or_default();
+                Decision::Decline { feedback: (!feedback.is_empty()).then_some(feedback) }
+            }
+            other => other,
+        };
+        row.outcome = Some(match decision {
+            Decision::Approve => "Approved",
+            Decision::ApproveForSession => "Approved for this session",
+            Decision::Decline { .. } => "Declined",
+            Decision::Cancel => "Cancelled the turn",
+        });
+        let request = row.request.clone();
+        if let Some(agent) = &self.agent
+            && let Err(err) = agent.respond(&request, decision)
+        {
+            self.notice(NoticeKind::Error, format!("Could not answer: {err:#}"), cx);
+        }
+        if !self.has_pending_approval() && self.status == Status::AwaitingApproval {
+            self.status = Status::Running;
+        }
+        self.remeasure(ix, cx);
+    }
+
+    fn ensure_agent(&mut self, cx: &mut Context<Self>) -> anyhow::Result<&dyn AgentSession> {
+        if self.agent.is_none() {
+            let (agent, events): (Box<dyn AgentSession>, _) = match self.backend.as_mut() {
+                Some(Backend::Claude(options)) => {
+                    options.resume = self.session_id.clone();
+                    let (session, events) = ClaudeSession::spawn(options)?;
+                    let _ = session.request_usage();
+                    (Box::new(session), events)
+                }
+                Some(Backend::Scripted(events)) => {
+                    let (agent, rx) = ScriptedAgent::start(std::mem::take(events));
+                    self.scripted_log = Some(agent.log.clone());
+                    (Box::new(agent), rx)
+                }
+                None => anyhow::bail!("no agent backend"),
+            };
+            self._pump = Some(cx.spawn(async move |this, cx| {
+                while let Ok(event) = events.recv().await {
+                    if this.update(cx, |this: &mut ThreadView, cx| this.handle(event, cx)).is_err() {
+                        break;
+                    }
+                }
+            }));
+            self.agent = Some(agent);
+        }
+        Ok(self.agent.as_deref().expect("agent was just set"))
+    }
+
+    #[cfg(test)]
+    /// Use a scripted agent that is already running (tests).
+    pub fn attach_scripted(&mut self, agent: ScriptedAgent) {
+        self.scripted_log = Some(agent.log.clone());
+        self.agent = Some(Box::new(agent));
+    }
+
+    // ---------- events ----------
+
+    pub fn handle(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
+        match event {
+            AgentEvent::Started { version, permission_mode } => {
+                if let Some(version) = version.filter(|v| claude::is_newer_than_tested(v)) {
+                    self.notice(
+                        NoticeKind::Warning,
+                        format!(
+                            "claude {version} is newer than the version TJ was tested with ({}). If something looks wrong, that's the likely cause.",
+                            claude::TESTED_VERSION
+                        ),
+                        cx,
+                    );
+                }
+                if let Some(mode) = permission_mode {
+                    self.mode = mode;
+                }
+            }
+            AgentEvent::SessionInfo { session_id, model } => {
+                self.session_id = Some(session_id);
+                self.model = model.or(self.model.take());
+            }
+            AgentEvent::TextStarted => {
+                self.current_text = Some(self.push_text_row(false, "", cx));
+            }
+            AgentEvent::TextDelta(text) => {
+                let ix = match self.current_text {
+                    Some(ix) => ix,
+                    None => {
+                        let ix = self.push_text_row(false, "", cx);
+                        self.current_text = Some(ix);
+                        ix
+                    }
+                };
+                if let Some(Row::Assistant(body)) = self.rows.get(ix) {
+                    body.update(cx, |state, cx| state.push_str(&text, cx));
+                }
+                self.remeasure(ix, cx);
+            }
+            AgentEvent::ToolStarted { id, name, input } => {
+                self.current_text = None;
+                let summary = tool_summary(&name, &input);
+                self.push_row(
+                    Row::Tool(ToolRow {
+                        id,
+                        name,
+                        summary,
+                        status: ToolStatus::Running,
+                        output: None,
+                        expanded: false,
+                    }),
+                    cx,
+                );
+            }
+            AgentEvent::ToolFinished { id, output, is_error } => {
+                if let Some(ix) = self.rows.iter().rposition(|r| matches!(r, Row::Tool(t) if t.id == id)) {
+                    if let Row::Tool(tool) = &mut self.rows[ix] {
+                        tool.status = if is_error { ToolStatus::Failed } else { ToolStatus::Done };
+                        tool.output = Some(output);
+                    }
+                    self.remeasure(ix, cx);
+                }
+            }
+            AgentEvent::PermissionRequested(request) => {
+                self.current_text = None;
+                self.push_row(Row::Approval(ApprovalRow { request, outcome: None, feedback: None }), cx);
+                self.status = Status::AwaitingApproval;
+            }
+            AgentEvent::PermissionWithdrawn { id } => {
+                if let Some(ix) = self.rows.iter().position(|r| matches!(r, Row::Approval(a) if a.request.id == id)) {
+                    if let Row::Approval(row) = &mut self.rows[ix]
+                        && row.outcome.is_none()
+                    {
+                        row.outcome = Some("No longer needed");
+                    }
+                    self.remeasure(ix, cx);
+                }
+            }
+            AgentEvent::Usage(windows) => {
+                for window in windows {
+                    match self.usage.iter_mut().find(|w| w.id == window.id) {
+                        Some(existing) => *existing = window,
+                        None => self.usage.push(window),
+                    }
+                }
+            }
+            AgentEvent::TurnFinished { cost_usd, duration_ms, is_error, error } => {
+                self.current_text = None;
+                self.status = Status::Idle;
+                if let Some(cost) = cost_usd {
+                    self.cost_usd += cost;
+                }
+                if is_error {
+                    self.notice(NoticeKind::Error, error.unwrap_or_else(|| "The turn failed.".into()), cx);
+                }
+                let mut parts = Vec::new();
+                if let Some(model) = &self.model {
+                    parts.push(short_model(model));
+                }
+                if let Some(cost) = cost_usd {
+                    parts.push(format!("${cost:.4}"));
+                }
+                if let Some(ms) = duration_ms {
+                    parts.push(format!("{:.1}s", ms as f64 / 1000.0));
+                }
+                if !parts.is_empty() {
+                    self.push_row(Row::Footer(parts.join(" · ").into()), cx);
+                }
+            }
+            AgentEvent::Error(message) => self.notice(NoticeKind::Error, message, cx),
+            AgentEvent::Exited { code, stderr } => {
+                self.agent = None;
+                self._pump = None;
+                self.current_text = None;
+                if self.status != Status::Idle || code.is_some_and(|c| c != 0) {
+                    let detail = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+                    let code = code.map_or("a signal".to_string(), |c| format!("code {c}"));
+                    self.notice(
+                        NoticeKind::Error,
+                        format!("Claude stopped ({code}). {detail} Sending another message resumes the conversation."),
+                        cx,
+                    );
+                }
+                self.status = Status::Idle;
+            }
+        }
+        cx.notify();
+    }
+
+    fn has_pending_approval(&self) -> bool {
+        self.rows.iter().any(|r| matches!(r, Row::Approval(a) if a.outcome.is_none()))
+    }
+
+    // ---------- rows ----------
+
+    fn push_row(&mut self, row: Row, cx: &mut Context<Self>) -> usize {
+        self.rows.push(row);
+        self.scroller.update(cx, |s, cx| {
+            s.append(1, cx);
+        });
+        self.rows.len() - 1
+    }
+
+    fn push_text_row(&mut self, user: bool, text: &str, cx: &mut Context<Self>) -> usize {
+        let body = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
+        self.push_row(if user { Row::User(body) } else { Row::Assistant(body) }, cx)
+    }
+
+    fn notice(&mut self, kind: NoticeKind, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.push_row(Row::Notice(kind, text.into()), cx);
+        cx.notify();
+    }
+
+    fn remeasure(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.scroller.update(cx, |s, cx| {
+            s.remeasure_items(ix..ix + 1, cx);
+        });
+        cx.notify();
+    }
+
+    /// Add `pairs` finished prompt/reply pairs, to test a long history (`--demo history`).
+    pub fn add_history(&mut self, pairs: usize, prompt: &str, reply: &str, cx: &mut Context<Self>) {
+        for _ in 0..pairs {
+            self.push_text_row(true, prompt, cx);
+            self.push_text_row(false, reply, cx);
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn approval_rows(&self) -> Vec<usize> {
+        (0..self.rows.len()).filter(|ix| matches!(self.rows[*ix], Row::Approval(_))).collect()
+    }
+
+    #[cfg(test)]
+    pub fn approval_outcome(&self, ix: usize) -> Option<&'static str> {
+        match self.rows.get(ix) {
+            Some(Row::Approval(row)) => row.outcome,
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn feedback_input(&self, ix: usize) -> Option<Entity<InputState>> {
+        match self.rows.get(ix) {
+            Some(Row::Approval(row)) => row.feedback.clone(),
+            _ => None,
+        }
+    }
+
+    // ---------- rendering ----------
+
+    fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(Row::Approval(row)) = self.rows.get_mut(ix)
+            && row.outcome.is_none()
+            && row.feedback.is_none()
+        {
+            row.feedback =
+                Some(cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("Optional: tell Claude why, or what to do instead")
+                }));
+        }
+        let theme = cx.theme();
+        let (border, muted, secondary, accent) = (theme.border, theme.muted_foreground, theme.secondary, theme.primary);
+        let mono = theme.mono_font_family.clone();
+        let (danger, warning) = (theme.danger, theme.warning);
+        let pad = |el: Div| el.w_full().px_4().py_1p5();
+
+        match &self.rows[ix] {
+            Row::User(body) => h_flex()
+                .w_full()
+                .px_4()
+                .py_2()
+                .justify_end()
+                .child(
+                    div()
+                        .max_w(relative(0.8))
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(secondary)
+                        .child(TextView::new(body).selectable(true)),
+                )
+                .into_any_element(),
+            Row::Assistant(body) => {
+                pad(div()).py_2().child(TextView::new(body).selectable(true).stream_fade(true)).into_any_element()
+            }
+            Row::Tool(tool) => {
+                let (dot, label) = match tool.status {
+                    ToolStatus::Running => (muted, "running"),
+                    ToolStatus::Done => (theme.success, "done"),
+                    ToolStatus::Failed => (danger, "failed"),
+                };
+                let output = tool.output.clone().filter(|_| tool.expanded);
+                pad(div())
+                    .child(
+                        v_flex()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                h_flex()
+                                    .id(SharedString::from(format!("tool-{ix}")))
+                                    .gap_2()
+                                    .px_3()
+                                    .py_1p5()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(Row::Tool(tool)) = this.rows.get_mut(ix) {
+                                            tool.expanded = !tool.expanded;
+                                        }
+                                        this.remeasure(ix, cx);
+                                    }))
+                                    .child(div().size_2().rounded_full().bg(dot))
+                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(tool.name.clone()))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_sm()
+                                            .font_family(mono.clone())
+                                            .text_color(muted)
+                                            .child(tool.summary.clone()),
+                                    )
+                                    .child(div().text_xs().text_color(muted).child(label)),
+                            )
+                            .when_some(output, |el, output| {
+                                el.child(
+                                    div()
+                                        .border_t_1()
+                                        .border_color(border)
+                                        .px_3()
+                                        .py_2()
+                                        .text_xs()
+                                        .font_family(mono)
+                                        .text_color(muted)
+                                        .child(truncate(&output, 4000)),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
+            Row::Approval(row) => {
+                let request = &row.request;
+                let summary = tool_summary(&request.tool_name, &request.input);
+                let pending = row.outcome.is_none();
+                pad(div())
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if pending { accent } else { border })
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("Claude wants to use {}", request.tool_name)),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(secondary)
+                                    .text_sm()
+                                    .font_family(mono)
+                                    .child(truncate(&summary, 2000)),
+                            )
+                            .when_some(request.description.clone().filter(|d| *d != summary), |el, d| {
+                                el.child(div().text_sm().text_color(muted).child(d))
+                            })
+                            .when_some(request.reason.clone(), |el, reason| {
+                                el.child(div().text_sm().text_color(warning).child(reason))
+                            })
+                            .map(|el| match row.outcome {
+                                Some(outcome) => el.child(div().text_sm().text_color(muted).child(outcome)),
+                                None => {
+                                    el.when_some(row.feedback.as_ref(), |el, f| el.child(Input::new(f).small())).child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                Button::new(SharedString::from(format!("approve-{ix}")))
+                                                    .primary()
+                                                    .small()
+                                                    .label("Approve")
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.decide(ix, Decision::Approve, cx)
+                                                    })),
+                                            )
+                                            .when(!request.no_standing_grant, |el| {
+                                                el.child(
+                                                    Button::new(SharedString::from(format!("approve-session-{ix}")))
+                                                        .small()
+                                                        .label("Approve for session")
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.decide(ix, Decision::ApproveForSession, cx)
+                                                        })),
+                                                )
+                                            })
+                                            .child(
+                                                Button::new(SharedString::from(format!("decline-{ix}")))
+                                                    .small()
+                                                    .label("Decline")
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.decide(ix, Decision::Decline { feedback: None }, cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!("cancel-{ix}")))
+                                                    .ghost()
+                                                    .small()
+                                                    .label("Cancel turn")
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.decide(ix, Decision::Cancel, cx)
+                                                    })),
+                                            ),
+                                    )
+                                }
+                            }),
+                    )
+                    .into_any_element()
+            }
+            Row::Notice(kind, text) => {
+                let color = match kind {
+                    NoticeKind::Warning => warning,
+                    NoticeKind::Error => danger,
+                };
+                pad(div()).text_sm().text_color(color).child(text.clone()).into_any_element()
+            }
+            Row::Footer(text) => pad(div()).pb_3().text_xs().text_color(muted).child(text.clone()).into_any_element(),
+        }
+    }
+}
+
+impl Render for ThreadView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (bg, border) = (theme.background, theme.border);
+        let this = cx.entity();
+        let running = self.status != Status::Idle;
+
+        let transcript = MessageScroller::new("transcript", self.scroller.clone(), move |ix, window, cx| {
+            this.update(cx, |thread, cx| {
+                if ix < thread.rows.len() { thread.render_row(ix, window, cx) } else { div().into_any_element() }
+            })
+        })
+        .scrollbar(true)
+        .jump_button(true)
+        .with_bottom_fade(bg);
+
+        v_flex().size_full().bg(bg).child(div().flex_1().min_h_0().child(transcript)).child(
+            h_flex()
+                .items_end()
+                .gap_2()
+                .p_3()
+                .border_t_1()
+                .border_color(border)
+                .child(div().flex_1().child(Textarea::new(&self.prompt)))
+                .child(if running {
+                    Button::new("stop").label("Stop").on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
+                } else {
+                    Button::new("send")
+                        .primary()
+                        .label("Send")
+                        .disabled(self.agent.is_none() && self.backend.is_none())
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+                }),
+        )
+    }
+}
+
+/// One line describing a tool call, e.g. the command for Bash or the path for Edit.
+pub fn tool_summary(name: &str, input: &Value) -> String {
+    let field = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_owned);
+    let found = match name {
+        "Bash" => field("command"),
+        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => field("file_path").or(field("notebook_path")),
+        "Glob" | "Grep" => field("pattern"),
+        "WebFetch" => field("url"),
+        "WebSearch" => field("query"),
+        "Task" | "Agent" => field("description"),
+        "TodoWrite" => input.get("todos").and_then(Value::as_array).map(|t| format!("{} tasks", t.len())),
+        _ => None,
+    };
+    found.unwrap_or_else(|| truncate(&input.to_string(), 160))
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// "claude-opus-5-5" -> "Opus 5.5"
+pub fn short_model(model: &str) -> String {
+    let parts: Vec<&str> = model.trim_start_matches("claude-").split('-').collect();
+    match parts.as_slice() {
+        [family, major, minor, ..] if major.chars().all(|c| c.is_ascii_digit()) => {
+            let mut name = family.to_string();
+            if let Some(first) = name.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            format!("{name} {major}.{minor}")
+        }
+        _ => model.to_string(),
+    }
+}
+
+/// Where a new thread runs.
+pub fn default_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Backend, Status, ThreadView};
+    use crate::agent::{AgentEvent, Decision, ScriptedAgent, ScriptedCall, claude};
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{
+        AppContext as _, Entity, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, bounds, point, px,
+        size,
+    };
+
+    fn fixture(name: &str) -> Vec<AgentEvent> {
+        let path = format!("{}/tests/fixtures/claude/{name}", env!("CARGO_MANIFEST_DIR"));
+        let mut parser = claude::Parser;
+        claude::read_fixture(std::fs::File::open(path).unwrap()).iter().flat_map(|m| parser.parse(m)).collect()
+    }
+
+    /// A thread in a real gpui-kit window, wired to a scripted agent whose calls are logged.
+    fn open(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<ThreadView>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::keymap::init(cx);
+        });
+        cx.update(|cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds(point(px(0.), px(0.)), size(px(900.), px(1400.))))),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| {
+                    let mut thread = ThreadView::new(Backend::Scripted(Vec::new()), window, cx);
+                    thread.attach_scripted(ScriptedAgent::start(Vec::new()).0);
+                    thread
+                })
+            })
+            .expect("open test window")
+        })
+    }
+
+    fn calls(thread: &Entity<ThreadView>, cx: &mut VisualTestContext) -> Vec<ScriptedCall> {
+        thread.read_with(cx, |t, _| t.scripted_log.as_ref().unwrap().lock().unwrap().clone())
+    }
+
+    /// Feed the events up to and including the first permission request; return that row.
+    fn until_approval(thread: &Entity<ThreadView>, events: Vec<AgentEvent>, cx: &mut VisualTestContext) -> usize {
+        thread.update(cx, |t, cx| {
+            for event in events {
+                let stop = matches!(event, AgentEvent::PermissionRequested(_));
+                t.handle(event, cx);
+                if stop {
+                    break;
+                }
+            }
+        });
+        let rows = thread.read_with(cx, |t, _| t.approval_rows());
+        assert_eq!(rows.len(), 1);
+        rows[0]
+    }
+
+    #[gpui_kit::test]
+    fn approve_button_answers_the_request(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let ix = until_approval(&thread, fixture("2.1.331-approve.jsonl"), cx);
+        assert_eq!(thread.read_with(cx, |t, _| t.status), Status::AwaitingApproval);
+
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(gpui_kit::SharedString::from(format!("approve-{ix}")), cx);
+        });
+
+        let answered: Vec<_> = calls(&thread, cx)
+            .into_iter()
+            .filter_map(|c| match c {
+                ScriptedCall::Respond { decision, .. } => Some(decision),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answered, vec![Decision::Approve]);
+        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)), Some("Approved"));
+        assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Running);
+    }
+
+    #[gpui_kit::test]
+    fn decline_sends_the_typed_feedback(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let ix = until_approval(&thread, fixture("2.1.331-decline.jsonl"), cx);
+
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            let feedback = thread.read(cx).feedback_input(ix).expect("feedback field after render");
+            feedback.update(cx, |f, cx| f.set_value("use mktemp instead", window, cx));
+            window.click(gpui_kit::SharedString::from(format!("decline-{ix}")), cx);
+        });
+
+        let request_id = request_id(&thread, ix, cx);
+        assert!(calls(&thread, cx).contains(&ScriptedCall::Respond {
+            request_id,
+            decision: Decision::Decline { feedback: Some("use mktemp instead".into()) },
+        }));
+        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)), Some("Declined"));
+    }
+
+    fn request_id(thread: &Entity<ThreadView>, ix: usize, cx: &mut VisualTestContext) -> String {
+        thread.read_with(cx, |t, _| match &t.rows[ix] {
+            super::Row::Approval(row) => row.request.id.clone(),
+            _ => panic!("row {ix} is not an approval"),
+        })
+    }
+
+    #[gpui_kit::test]
+    fn enter_sends_the_prompt_and_shift_enter_does_not(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            let focus = thread.read(cx).prompt_focus(cx);
+            window.focus(&focus, cx);
+            window.input("first line", cx);
+            window.press("shift-enter", cx);
+            window.input("second line", cx);
+        });
+        assert!(calls(&thread, cx).iter().all(|c| !matches!(c, ScriptedCall::Prompt(_))), "shift-enter sent");
+
+        cx.update(|window, cx| window.press("enter", cx));
+        assert_eq!(calls(&thread, cx), vec![ScriptedCall::Prompt("first line\nsecond line".into())]);
+        assert_eq!(thread.read_with(cx, |t, cx| t.prompt.read(cx).value().to_string()), "");
+    }
+
+    #[gpui_kit::test]
+    fn tab_in_the_prompt_keeps_focus(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let focused = cx.update(|window, cx| {
+            window.render_frame(cx);
+            let focus = thread.read(cx).prompt_focus(cx);
+            window.focus(&focus, cx);
+            window.press("tab", cx);
+            focus.is_focused(window)
+        });
+        assert!(focused, "Tab moved focus out of the prompt box");
+    }
+}

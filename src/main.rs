@@ -1,80 +1,131 @@
-//! TJ spike: streaming markdown transcript next to an embedded terminal.
+//! TJ: a native GUI for coding agents.
 
-mod chat;
+mod agent;
+mod demo;
+mod keymap;
 mod sample;
 mod terminal;
+mod thread;
+
+use std::path::PathBuf;
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
-    ActiveTheme as _, Theme, ThemeMode,
+    ActiveTheme as _, Selectable as _, Sizable as _, Theme, ThemeMode,
     button::{Button, ButtonVariants as _},
 };
 use gpui_kit::*;
 
-use chat::{ChatView, Speed};
+use agent::{PermissionMode, claude::SessionOptions};
 use terminal::TerminalView;
+use thread::{Backend, Status, ThreadView};
+
+/// Command-line options. The test hooks let a window be exercised without clicks.
+#[derive(Default)]
+struct Args {
+    /// `stream`, `firehose` or `history`: play the canned sample reply.
+    demo: Option<String>,
+    /// Play back a recorded session file through the real parser.
+    replay: Option<PathBuf>,
+    /// Send this prompt to the agent at launch.
+    prompt: Option<String>,
+    /// Model alias or id for Claude, e.g. `haiku`.
+    model: Option<String>,
+    /// Text to type into the terminal at launch (`\r` for Enter).
+    type_text: Option<String>,
+}
+
+impl Args {
+    fn parse() -> Self {
+        let args: Vec<String> = std::env::args().collect();
+        let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+        Self {
+            demo: value("--demo"),
+            replay: value("--replay").map(PathBuf::from),
+            prompt: value("--prompt"),
+            model: value("--model"),
+            type_text: value("--type"),
+        }
+    }
+}
 
 struct Workspace {
-    chat: Entity<ChatView>,
+    thread: Entity<ThreadView>,
     terminal: Option<Entity<TerminalView>>,
     terminal_error: Option<String>,
+    cwd: PathBuf,
 }
 
 impl Workspace {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let chat = cx.new(ChatView::new);
-        cx.observe(&chat, |_, _, cx| cx.notify()).detach();
+    fn new(args: Args, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let cwd = thread::default_cwd();
+        let backend = if let Some(path) = &args.replay {
+            Backend::Scripted(demo::replay(path).unwrap_or_default())
+        } else if let Some(kind) = &args.demo {
+            Backend::Scripted(demo::sample_stream(kind != "stream"))
+        } else {
+            Backend::Claude(SessionOptions { cwd: cwd.clone(), model: args.model.clone(), ..Default::default() })
+        };
+        let thread = cx.new(|cx| ThreadView::new(backend, window, cx));
+        cx.observe(&thread, |_, _, cx| cx.notify()).detach();
 
-        let cwd = std::env::current_dir().ok();
-        let (terminal, terminal_error) = match TerminalView::spawn(cwd, None, window, cx) {
+        if args.demo.as_deref() == Some("history") {
+            thread.update(cx, |t, cx| t.add_history(50, sample::USER_PROMPT, sample::REPLY, cx));
+        }
+        let first_prompt = args
+            .prompt
+            .clone()
+            .or_else(|| (args.demo.is_some() || args.replay.is_some()).then(|| sample::USER_PROMPT.to_string()));
+        if let Some(prompt) = first_prompt {
+            thread.update(cx, |t, cx| t.send(&prompt, cx));
+        }
+
+        let (terminal, terminal_error) = match TerminalView::spawn(Some(cwd.clone()), None, window, cx) {
             Ok(term) => {
                 cx.observe(&term, |_, _, cx| cx.notify()).detach();
                 (Some(term), None)
             }
             Err(err) => (None, Some(format!("{err:#}"))),
         };
-
-        // Spike-only test hooks, so a hidden window can be exercised without clicks.
-        let args: Vec<String> = std::env::args().collect();
-        let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-        match arg("--demo").as_deref() {
-            Some("stream") => chat.update(cx, |c, cx| c.stream_reply(Speed::Realistic, cx)),
-            Some("firehose") => chat.update(cx, |c, cx| c.stream_reply(Speed::Firehose, cx)),
-            Some("history") => chat.update(cx, |c, cx| {
-                c.add_history(50, cx);
-                c.stream_reply(Speed::Firehose, cx);
-            }),
-            _ => {}
-        }
-        if let (Some(text), Some(term)) = (arg("--type"), &terminal) {
+        if let (Some(text), Some(term)) = (&args.type_text, &terminal) {
             let text = text.replace("\\r", "\r");
             term.update(cx, |t, _| t.type_text(&text));
         }
 
-        Self { chat, terminal, terminal_error }
+        let focus = thread.read(cx).prompt_focus(cx);
+        window.focus(&focus, cx);
+
+        Self { thread, terminal, terminal_error, cwd }
     }
 
-    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let chat = self.chat.read(cx);
-        let stats = chat.stats.clone();
-        let count = chat.message_count();
-        let rate = if stats.elapsed.as_secs_f32() > 0.0 {
-            stats.chars as f32 / stats.elapsed.as_secs_f32()
-        } else {
-            0.0
+    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let thread = self.thread.read(cx);
+        let mode = thread.mode;
+        let mut stats = Vec::new();
+        if let Some(model) = &thread.model {
+            stats.push(thread::short_model(model));
+        }
+        for window in &thread.usage {
+            let label = match window.id.as_str() {
+                "five_hour" => "5h",
+                "seven_day" => "7d",
+                other => other,
+            };
+            stats.push(format!("{label} {:.0}%", window.utilization * 100.0));
+        }
+        if thread.cost_usd > 0.0 {
+            stats.push(if thread.cost_usd < 1.0 {
+                format!("${:.3}", thread.cost_usd)
+            } else {
+                format!("${:.2}", thread.cost_usd)
+            });
+        }
+        let status = match thread.status {
+            Status::Idle => "",
+            Status::Running => "Working…",
+            Status::AwaitingApproval => "Waiting for you",
         };
-        let status = if stats.chunks == 0 {
-            format!("{count} messages")
-        } else {
-            format!(
-                "{count} messages · {} {} chars in {:.1}s ({:.0}/s, {} chunks)",
-                if stats.streaming { "streaming" } else { "streamed" },
-                stats.chars,
-                stats.elapsed.as_secs_f32(),
-                rate,
-                stats.chunks,
-            )
-        };
+        let project = self.cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let theme = cx.theme();
 
         h_flex()
@@ -83,29 +134,26 @@ impl Workspace {
             .py_2()
             .border_b_1()
             .border_color(theme.border)
-            .child(div().font_weight(FontWeight::BOLD).mr_2().child("TJ"))
-            .child(Button::new("stream").primary().label("Stream reply").on_click(cx.listener(
-                |this, _, _, cx| this.chat.update(cx, |c, cx| c.stream_reply(Speed::Realistic, cx)),
-            )))
-            .child(Button::new("firehose").label("Firehose").on_click(cx.listener(|this, _, _, cx| {
-                this.chat.update(cx, |c, cx| c.stream_reply(Speed::Firehose, cx))
-            })))
-            .child(Button::new("history").label("+50 replies").on_click(cx.listener(|this, _, _, cx| {
-                this.chat.update(cx, |c, cx| c.add_history(50, cx))
-            })))
-            .child(Button::new("clear").ghost().label("Clear").on_click(cx.listener(|this, _, _, cx| {
-                this.chat.update(cx, |c, cx| c.clear(cx))
-            })))
+            .child(div().font_weight(FontWeight::BOLD).child("TJ"))
+            .child(div().text_sm().text_color(theme.muted_foreground).mr_2().child(project))
+            .children(PermissionMode::ALL.map(|m| {
+                Button::new(SharedString::from(format!("mode-{}", m.claude_name())))
+                    .small()
+                    .ghost()
+                    .selected(m == mode)
+                    .label(m.label())
+                    .on_click(cx.listener(move |this, _, _, cx| this.thread.update(cx, |t, cx| t.set_mode(m, cx))))
+            }))
             .child(div().flex_1())
-            .child(div().text_sm().text_color(theme.muted_foreground).child(status))
+            .child(div().text_sm().text_color(theme.warning).child(status))
+            .child(div().text_sm().text_color(theme.muted_foreground).child(stats.join(" · ")))
     }
 }
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let border = theme.border;
-        let muted = theme.muted_foreground;
+        let (border, muted) = (theme.border, theme.muted_foreground);
         let title = self
             .terminal
             .as_ref()
@@ -118,26 +166,17 @@ impl Render for Workspace {
             (None, None) => div().into_any_element(),
         };
 
-        v_flex()
-            .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(self.toolbar(cx))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(div().flex_1().min_w_0().h_full().child(self.chat.clone()))
-                    .child(
-                        v_flex()
-                            .w(relative(0.42))
-                            .h_full()
-                            .border_l_1()
-                            .border_color(border)
-                            .child(div().px_3().py_1().text_xs().text_color(muted).child(title))
-                            .child(div().flex_1().min_h_0().child(terminal_pane)),
-                    ),
-            )
+        v_flex().size_full().bg(theme.background).text_color(theme.foreground).child(self.header(cx)).child(
+            h_flex().flex_1().min_h_0().child(div().flex_1().min_w_0().h_full().child(self.thread.clone())).child(
+                v_flex()
+                    .w(relative(0.4))
+                    .h_full()
+                    .border_l_1()
+                    .border_color(border)
+                    .child(div().px_3().py_1().text_xs().text_color(muted).child(title))
+                    .child(div().flex_1().min_h_0().child(terminal_pane)),
+            ),
+        )
     }
 }
 
@@ -179,9 +218,10 @@ fn desktop_ui_font() -> Option<String> {
 }
 
 fn main() {
-    gpui_kit::application().run(|cx| {
+    let args = Args::parse();
+    gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        terminal::init(cx);
+        keymap::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         if let Some(family) = desktop_ui_font() {
             Theme::global_mut(cx).font_family = family.into();
@@ -193,7 +233,7 @@ fn main() {
             titlebar: Some(TitlebarOptions { title: Some("TJ".into()), ..Default::default() }),
             ..Default::default()
         };
-        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(window, cx)))
+        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(args, window, cx)))
             .expect("failed to open window");
         cx.activate(true);
     });

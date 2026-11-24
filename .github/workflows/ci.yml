@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: build · clippy · test
+    runs-on: ubuntu-latest
+    # Build inside Arch to match the machines TJ runs on (current Rust, X11/Wayland stack).
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain and libraries
+        run: >
+          pacman -Syu --noconfirm --needed base-devel rust pkgconf git cmake
+          libxcb libxkbcommon libxkbcommon-x11 wayland vulkan-icd-loader fontconfig freetype2 ttf-dejavu
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-arch-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        # The live Claude test is #[ignore]d: CI has no Claude login.
+        run: cargo test
