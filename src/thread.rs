@@ -2096,7 +2096,7 @@ impl Render for ThreadView {
 impl ThreadView {
     fn render_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let (bg, border, muted) = (theme.background, theme.border, theme.muted_foreground);
+        let bg = theme.background;
         let this = cx.entity();
         let running = self.status != Status::Idle;
 
@@ -2240,17 +2240,6 @@ impl ThreadView {
                 }
             });
 
-        let send = if running {
-            Button::new("stop").small().label("Stop").on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
-        } else {
-            Button::new("send")
-                .primary()
-                .small()
-                .label("Send")
-                .disabled(self.agent.is_none() && self.backend.is_none())
-                .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
-        };
-
         let attach = Button::new("attach")
             .ghost()
             .xsmall()
@@ -2258,8 +2247,10 @@ impl ThreadView {
             .tooltip("Attach images or files (or paste or drop them here)")
             .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)));
 
+        let card =
+            self.render_composer_card(attach, account_menu, mode_menu, model_menu, running, cx).into_any_element();
         if self.is_fresh() {
-            return self.render_intro(attach, account_menu, mode_menu, model_menu, cx).into_any_element();
+            return self.render_intro(card, cx).into_any_element();
         }
 
         v_flex()
@@ -2267,66 +2258,90 @@ impl ThreadView {
             .bg(bg)
             .child(div().flex_1().min_h_0().child(transcript))
             .child(
-                h_flex().w_full().justify_center().border_t_1().border_color(border).child(
-                    self.composer_frame(cx)
-                        .w_full()
-                        .max_w(px(MAX_CONVERSATION_WIDTH))
-                        .gap_1()
-                        .px_3()
-                        .pt_3()
-                        .pb_2()
-                        .children(self.render_attachments(cx))
-                        .child(self.prompt_box(true, cx))
-                        .child(crate::caret::overlay(&self.prompt))
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .text_color(muted)
-                                .child(attach)
-                                .child(account_menu)
-                                .child(mode_menu)
-                                .child(div().flex_1())
-                                .child(model_menu)
-                                .child(send),
-                        ),
-                ),
+                h_flex()
+                    .w_full()
+                    .justify_center()
+                    .pb_3()
+                    // Same width and inset as the messages above, so the edges line up.
+                    .child(div().w_full().max_w(px(MAX_CONVERSATION_WIDTH)).px_3().child(card)),
             )
             .into_any_element()
     }
 
-    /// Before the first message: a heading, a large prompt card, and where the session will run.
-    /// Like T3 Code's new-session screen.
-    fn render_intro(
+    /// The prompt card: attachments, the prompt, and a row of menus with a round send button
+    /// (a stop button while the agent works). The same card on the start screen and in a session.
+    fn render_composer_card(
         &self,
         attach: impl IntoElement,
         account_menu: impl IntoElement,
         mode_menu: impl IntoElement,
         model_menu: impl IntoElement,
+        running: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let (bg, border, muted, fg, card) =
-            (theme.background, theme.border, theme.muted_foreground, theme.foreground, theme.secondary);
+        let (border, muted, card) = (theme.border, theme.muted_foreground, theme.secondary);
         let (accent, accent_fg) = (theme.primary, theme.primary_foreground);
-        let project = if self.menus.project_name.is_empty() {
-            "this project".to_string()
-        } else {
-            self.menus.project_name.clone()
-        };
         let can_send = self.agent.is_some() || self.backend.is_some();
-        let send = div()
-            .id("intro-send")
+        let fresh = self.is_fresh();
+        let button = div()
             .flex_none()
             .size_8()
             .rounded_full()
             .flex()
             .items_center()
             .justify_center()
-            .bg(if can_send { accent } else { muted })
             .text_color(accent_fg)
-            .cursor_pointer()
-            .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::ArrowUp).small())
-            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)));
+            .cursor_pointer();
+        let send = if running {
+            button
+                .id("stop")
+                .bg(accent)
+                .child(div().size(px(10.)).rounded(px(2.)).bg(accent_fg))
+                .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
+        } else {
+            button
+                .id("send")
+                .bg(if can_send { accent } else { muted })
+                .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::ArrowUp).small())
+                .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+        };
+
+        self.composer_frame(cx)
+            .w_full()
+            .gap_2()
+            .p_3()
+            .rounded_xl()
+            .border_1()
+            .border_color(border)
+            .bg(card)
+            .children(self.render_attachments(cx))
+            // Roomier on the start screen; in a session it grows with what's typed.
+            .child(div().when(fresh, |el| el.min_h(px(64.))).child(self.prompt_box(false, cx)))
+            .child(crate::caret::overlay(&self.prompt))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .text_color(muted)
+                    .child(attach)
+                    .child(account_menu)
+                    .child(mode_menu)
+                    .child(div().flex_1())
+                    .child(model_menu)
+                    .child(send),
+            )
+    }
+
+    /// Before the first message: a heading, a large prompt card, and where the session will run.
+    /// Like T3 Code's new-session screen.
+    fn render_intro(&self, card: impl IntoElement, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (bg, muted, fg) = (theme.background, theme.muted_foreground, theme.foreground);
+        let project = if self.menus.project_name.is_empty() {
+            "this project".to_string()
+        } else {
+            self.menus.project_name.clone()
+        };
         let footnote = |icon: gpui_kit::assets::IconName, text: String| {
             h_flex()
                 .gap_1()
@@ -2352,29 +2367,7 @@ impl ThreadView {
                         .text_color(fg)
                         .child(format!("What should we build in {project}?")),
                 )
-                .child(
-                    self.composer_frame(cx)
-                        .w_full()
-                        .gap_2()
-                        .p_3()
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(border)
-                        .bg(card)
-                        .children(self.render_attachments(cx))
-                        .child(div().min_h(px(64.)).child(self.prompt_box(false, cx)))
-                        .child(crate::caret::overlay(&self.prompt))
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .child(attach)
-                                .child(account_menu)
-                                .child(mode_menu)
-                                .child(div().flex_1())
-                                .child(model_menu)
-                                .child(send),
-                        ),
-                )
+                .child(card)
                 .child(
                     h_flex()
                         .px_2()
