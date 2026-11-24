@@ -2,7 +2,9 @@
 
 **Done:** a real Claude backend with approval cards and permission modes (milestone 1); projects and threads in a full-height sidebar, accounts per project with a temporary switch, saved transcripts and resumed sessions, and the window without a title bar (milestone 2).
 
-**Next (milestone 3):** the transparent-sidebar setting, following the Omarchy theme, the pi-style task panel, and the diff review with a summary of each file. Then terminal splits and tabs.
+**Done (milestone 3a):** the Changes list and the diff review with a summary of each file.
+
+**Next:** the pi-style task panel, then the transparent-sidebar setting and following the Omarchy theme, then terminal splits and tabs.
 
 These are steering decisions, not a schedule. Build toward them, but don't let them block the agent core.
 

@@ -12,9 +12,11 @@ use gpui_kit::component::{
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::agent::{AgentEvent, PermissionMode, claude::SessionOptions};
+use crate::changes::{ChangeKind, ProjectChanges, Summarizer};
 use crate::store::{self, Accounts, Paths, State};
 use crate::terminal::TerminalView;
 use crate::thread::{self, Backend, Status, ThreadChanged, ThreadSetup, ThreadView};
+use gpui_kit::component::diff::{Diff, DiffAnnotation, DiffMode};
 
 const SIDEBAR_WIDTH: f32 = 264.0;
 const HEADER_HEIGHT: f32 = 46.0;
@@ -34,6 +36,10 @@ pub struct Launch {
     pub paths: Option<Paths>,
     /// Start with the terminal hidden.
     pub hide_terminal: bool,
+    /// Don't call Claude for change summaries (tests).
+    pub no_summaries: bool,
+    /// Open the review of the project's changes at launch (test hook).
+    pub review: bool,
 }
 
 pub struct Workspace {
@@ -50,6 +56,11 @@ pub struct Workspace {
     type_text: Option<String>,
     /// Shown above the thread when something about the setup is wrong.
     problem: Option<SharedString>,
+    /// Per project: its uncommitted changes, kept fresh.
+    changes: HashMap<String, Entity<ProjectChanges>>,
+    /// The main area shows the review of the active project's changes instead of the thread.
+    reviewing: bool,
+    no_summaries: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -80,6 +91,9 @@ impl Workspace {
             scripted: launch.scripted,
             type_text: launch.type_text,
             problem,
+            changes: HashMap::new(),
+            reviewing: false,
+            no_summaries: launch.no_summaries,
             _subscriptions: Vec::new(),
         };
 
@@ -106,6 +120,9 @@ impl Workspace {
             if let (Some(prompt), Some(thread)) = (launch.prompt, this.active_thread()) {
                 thread.update(cx, |t, cx| t.send(&prompt, cx));
             }
+        }
+        if launch.review {
+            this.open_review(None, cx);
         }
         this.save();
         this
@@ -155,12 +172,16 @@ impl Workspace {
             let id = thread_id.to_string();
             self._subscriptions.push(cx.subscribe(&thread, move |this, _, _: &ThreadChanged, cx| {
                 this.sync_thread(&id, cx);
+                if let Some(changes) = this.state.thread(&id).and_then(|(p, _)| this.changes.get(&p.id)).cloned() {
+                    changes.update(cx, |c, cx| c.refresh(cx));
+                }
                 cx.notify();
             }));
             self.threads.insert(thread_id.to_string(), thread);
         }
         self.active = Some(thread_id.to_string());
         self.state.selected_thread = self.active.clone();
+        self.set_reviewing(None, cx);
         if let Some(thread) = self.active_thread() {
             let focus = thread.read(cx).prompt_focus(cx);
             window.focus(&focus, cx);
@@ -267,6 +288,216 @@ impl Workspace {
             window.focus(&focus, cx);
         }
         cx.notify();
+    }
+
+    /// The active project's changes, created (and first read) on demand.
+    fn project_changes(&mut self, cx: &mut Context<Self>) -> Option<Entity<ProjectChanges>> {
+        let project = self.active_project()?.clone();
+        if let Some(changes) = self.changes.get(&project.id) {
+            return Some(changes.clone());
+        }
+        let changes = cx.new(|cx| ProjectChanges::new(project.path.clone(), cx));
+        self._subscriptions.push(cx.observe(&changes, |_, _, cx| cx.notify()));
+        self.changes.insert(project.id.clone(), changes.clone());
+        Some(changes)
+    }
+
+    /// Open the review (scrolled to `path`, if given) or close it with `None` after it's open.
+    fn open_review(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        let Some(changes) = self.project_changes(cx) else { return };
+        let summarizer = if self.no_summaries {
+            Summarizer::Off
+        } else {
+            let config_dir = self
+                .active_thread()
+                .and_then(|t| self.accounts.get(&t.read(cx).account_id).and_then(|a| a.config_path(&self.home)));
+            Summarizer::Claude { config_dir }
+        };
+        let requests = self.active_thread().map(|t| t.read(cx).recent_requests(3)).unwrap_or_default();
+        changes.update(cx, |c, cx| {
+            c.set_auto_summarize(Some((summarizer, requests)), cx);
+            c.refresh(cx);
+            if let Some(path) = &path {
+                c.diff.update(cx, |d, cx| d.scroll_to_file(path, cx));
+            }
+        });
+        self.reviewing = true;
+        cx.notify();
+    }
+
+    fn set_reviewing(&mut self, open: Option<String>, cx: &mut Context<Self>) {
+        if open.is_none() && self.reviewing {
+            self.reviewing = false;
+            for changes in self.changes.values() {
+                changes.update(cx, |c, cx| c.set_auto_summarize(None, cx));
+            }
+            cx.notify();
+        }
+    }
+
+    fn changes_list(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let changes = self.project_changes(cx)?;
+        let touched = self
+            .active_thread()
+            .zip(self.active_project().map(|p| p.path.clone()))
+            .map(|(t, root)| crate::changes::touched_relative(&root, &t.read(cx).touched))
+            .unwrap_or_default();
+        let model = changes.read(cx);
+        if !model.changes.is_repo || model.changes.files.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let (muted, border, accent) = (theme.muted_foreground, theme.border, theme.primary);
+        let (added, deleted, modified) = (theme.success, theme.danger, theme.warning);
+        let mono = theme.mono_font_family.clone();
+        let rows = model.changes.files.iter().enumerate().map(|(ix, file)| {
+            let path = file.path.clone();
+            let (dir, name) = match path.rsplit_once('/') {
+                Some((dir, name)) => (format!("{dir}/"), name.to_string()),
+                None => (String::new(), path.clone()),
+            };
+            let color = match file.kind {
+                ChangeKind::Added => added,
+                ChangeKind::Deleted => deleted,
+                ChangeKind::Modified => modified,
+                ChangeKind::Renamed => accent,
+            };
+            h_flex()
+                .id(SharedString::from(format!("change-{ix}")))
+                .test_support()
+                .gap_2()
+                .px_3()
+                .py_0p5()
+                .cursor_pointer()
+                .hover(|el| el.bg(border.opacity(0.5)))
+                .on_click(cx.listener(move |this, _, _, cx| this.open_review(Some(path.clone()), cx)))
+                .child(div().w_3().text_xs().font_family(mono.clone()).text_color(color).child(file.kind.letter()))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_sm()
+                        .child(div().text_color(muted).child(dir))
+                        .child(div().child(name)),
+                )
+                .when(touched.contains(&file.path), |el| el.child(div().size_1p5().rounded_full().bg(accent)))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family(mono.clone())
+                        .text_color(muted)
+                        .child(format!("+{} −{}", file.additions, file.deletions)),
+                )
+        });
+        Some(
+            v_flex()
+                .flex_none()
+                .max_h(relative(0.45))
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .gap_2()
+                        .child(div().text_xs().text_color(muted).child(format!(
+                            "Changes · {} files · +{} −{}",
+                            model.changes.files.len(),
+                            model.changes.additions(),
+                            model.changes.deletions()
+                        )))
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("review-changes")
+                                .xsmall()
+                                .ghost()
+                                .label("Review")
+                                .on_click(cx.listener(|this, _, _, cx| this.open_review(None, cx))),
+                        ),
+                )
+                .child(div().id("changes-list").pb_1().overflow_y_scroll().children(rows))
+                .into_any_element(),
+        )
+    }
+
+    fn review(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(changes) = self.project_changes(cx) else { return div().into_any_element() };
+        let model = changes.read(cx);
+        let theme = cx.theme();
+        let (muted, border, danger, secondary) = (theme.muted_foreground, theme.border, theme.danger, theme.secondary);
+        let summaries: HashMap<String, Option<String>> =
+            model.changes.files.iter().map(|f| (f.path.clone(), model.summary(f).map(str::to_owned))).collect();
+        let summarizing = model.summarizing;
+        let no_summaries = self.no_summaries;
+        let mode = model.diff.read(cx).mode();
+        let diff_state = model.diff.clone();
+        let annotations: Vec<DiffAnnotation> = model
+            .changes
+            .files
+            .iter()
+            .enumerate()
+            .map(|(ix, f)| DiffAnnotation::file(SharedString::from(format!("summary-{ix}")), f.path.clone()))
+            .collect();
+        let heading = format!(
+            "{} files changed · +{} −{}",
+            model.changes.files.len(),
+            model.changes.additions(),
+            model.changes.deletions()
+        );
+        let error = model.error.clone();
+        let empty = model.changes.files.is_empty();
+
+        let diff = Diff::new(&diff_state).syntax_highlight(true).annotations(annotations).render_annotation(
+            move |annotation, _window, _cx| {
+                let summary = summaries.get(annotation.path().as_ref()).cloned().flatten();
+                let text = match summary {
+                    Some(summary) => summary,
+                    None if no_summaries => String::new(),
+                    None if summarizing => "Summarizing…".into(),
+                    None => "No summary yet.".into(),
+                };
+                div().px_3().py_2().bg(secondary).text_sm().child(text)
+            },
+        );
+
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        Button::new("back-to-thread")
+                            .xsmall()
+                            .ghost()
+                            .label("← Thread")
+                            .on_click(cx.listener(|this, _, _, cx| this.set_reviewing(None, cx))),
+                    )
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(heading))
+                    .when(summarizing, |el| el.child(div().text_xs().text_color(muted).child("Writing summaries…")))
+                    .child(div().flex_1())
+                    .children([DiffMode::Unified, DiffMode::Split].map(|m| {
+                        let state = diff_state.clone();
+                        Button::new(SharedString::from(format!("diff-mode-{m:?}")))
+                            .xsmall()
+                            .ghost()
+                            .selected(mode == m)
+                            .label(if m == DiffMode::Split { "Side by side" } else { "Unified" })
+                            .on_click(move |_, _, cx| state.update(cx, |d, cx| d.set_mode(m, cx)))
+                    })),
+            )
+            .when_some(error, |el, error| el.child(div().px_3().py_1().text_sm().text_color(danger).child(error)))
+            .child(if empty {
+                div().p_4().text_sm().text_color(muted).child("No uncommitted changes.").into_any_element()
+            } else {
+                div().flex_1().min_h_0().child(diff).into_any_element()
+            })
+            .into_any_element()
     }
 
     fn project_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
@@ -542,11 +773,15 @@ impl Render for Workspace {
         } else {
             None
         };
+        let changes_list = self.changes_list(cx);
+        let main =
+            if self.reviewing { Some(self.review(cx)) } else { self.active_thread().map(|t| t.into_any_element()) };
         let theme = cx.theme();
         let (bg, fg, border, muted, danger) =
             (theme.background, theme.foreground, theme.border, theme.muted_foreground, theme.danger);
         let terminal_title =
             terminal.as_ref().and_then(|t| t.read(cx).title().map(str::to_owned)).unwrap_or_else(|| "Terminal".into());
+        let right_column = terminal.is_some() || changes_list.is_some();
 
         h_flex().size_full().bg(bg).text_color(fg).child(self.sidebar(cx)).child(
             v_flex()
@@ -557,23 +792,23 @@ impl Render for Workspace {
                 .when_some(self.problem.clone(), |el, problem| {
                     el.child(div().px_4().py_2().text_sm().text_color(danger).child(problem))
                 })
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .child(div().flex_1().min_w_0().h_full().children(self.active_thread()))
-                        .when_some(terminal, |el, term| {
-                            el.child(
-                                v_flex()
-                                    .w(relative(0.42))
-                                    .h_full()
-                                    .border_l_1()
-                                    .border_color(border)
-                                    .child(div().px_3().py_1().text_xs().text_color(muted).child(terminal_title))
-                                    .child(div().flex_1().min_h_0().child(term)),
-                            )
-                        }),
-                ),
+                .child(h_flex().flex_1().min_h_0().child(div().flex_1().min_w_0().h_full().children(main)).when(
+                    right_column,
+                    |el| {
+                        el.child(
+                            v_flex()
+                                .w(relative(0.42))
+                                .h_full()
+                                .border_l_1()
+                                .border_color(border)
+                                .children(changes_list)
+                                .when_some(terminal, |el, term| {
+                                    el.child(div().px_3().py_1().text_xs().text_color(muted).child(terminal_title))
+                                        .child(div().flex_1().min_h_0().child(term))
+                                }),
+                        )
+                    },
+                )),
         )
     }
 }
@@ -601,6 +836,7 @@ mod tests {
             project: Some(project.clone()),
             paths: Some(paths.clone()),
             hide_terminal: true,
+            no_summaries: true,
             ..Default::default()
         };
         let (window, workspace) = cx.update(|cx| {
@@ -640,6 +876,43 @@ mod tests {
         let saved = State::load(&paths).unwrap();
         assert_eq!(saved.projects[0].threads.len(), 2);
         assert_eq!(saved.selected_thread, Some(first));
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_changed_file_opens_the_review_and_back_returns(cx: &mut TestAppContext) {
+        let (window, workspace, _, project) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git").arg("-C").arg(&project).args(args).output().unwrap().status.success()
+            )
+        };
+        run(&["init", "-q"]);
+        std::fs::write(project.join("notes.md"), "a new file\n").unwrap();
+
+        // Changes are read in the background; wait for them to arrive.
+        let changes = workspace.update(cx, |w, cx| w.project_changes(cx).unwrap());
+        cx.run_until_parked();
+        for _ in 0..200 {
+            if changes.read_with(cx, |c, _| !c.changes.files.is_empty()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+        assert_eq!(changes.read_with(cx, |c, _| c.changes.files[0].path.clone()), "notes.md");
+
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from("change-0"), cx);
+        });
+        assert!(workspace.read_with(cx, |w, _| w.reviewing));
+
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from("back-to-thread"), cx);
+        });
+        assert!(!workspace.read_with(cx, |w, _| w.reviewing));
     }
 
     #[gpui_kit::test]
