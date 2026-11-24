@@ -28,9 +28,6 @@ use crate::store::{Record, TranscriptWriter};
 /// How often a long turn's overview is refreshed while it runs.
 const OVERVIEW_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The most transcript text handed to a new session when a thread switches accounts.
-const HANDOFF_MAX_CHARS: usize = 30_000;
-
 /// Tells the workspace something it saves or shows has changed (title, session, status, ...).
 pub struct ThreadChanged;
 
@@ -268,6 +265,14 @@ pub struct ThreadView {
     replaying: bool,
     /// Context to prepend to the next prompt after an account switch.
     handoff: Option<String>,
+    /// While the handoff summary is being written: the accounts it's between. Bumped
+    /// `handoff_run` makes an older summary that arrives late be ignored.
+    summarizing: Option<(String, String)>,
+    handoff_run: u64,
+    /// A message sent while the summary was still being written; it goes out when it's ready.
+    queued: Option<(String, Vec<crate::agent::PromptImage>)>,
+    /// Set by replay when the last account switch was never followed by a message.
+    unsent_switch: Option<(String, String)>,
     /// Files the agent wrote or edited in this thread (paths as the tools gave them).
     pub touched: HashSet<String>,
     /// Goal, Now, Next and tasks, kept by a cheap model.
@@ -349,6 +354,10 @@ impl ThreadView {
             pending_text: String::new(),
             replaying: false,
             handoff: None,
+            summarizing: None,
+            handoff_run: 0,
+            queued: None,
+            unsent_switch: None,
             touched: HashSet::new(),
             overview: Overview::default(),
             overview_mark: 0,
@@ -383,6 +392,12 @@ impl ThreadView {
         // The saved session id wins over one seen in the transcript (an account switch clears it).
         this.session_id = setup.session_id;
         this.log = log;
+        // Switched accounts but never sent a message: prepare that handoff again.
+        if let Some((from, to)) = this.unsent_switch.take()
+            && this.session_id.is_none()
+        {
+            this.start_handoff(&from, &to, cx);
+        }
         this
     }
 
@@ -392,6 +407,7 @@ impl ThreadView {
         for record in records {
             match record {
                 Record::Prompt { text, images } => {
+                    self.unsent_switch = None;
                     let previews = images.iter().filter_map(|name| self.load_saved_image(name)).collect();
                     self.push_prompt_row(&text, previews, cx)
                 }
@@ -404,7 +420,8 @@ impl ThreadView {
                     }
                 }
                 Record::AccountSwitch { from, to } => {
-                    self.notice(NoticeKind::Info, format!("Switched from {from} to {to}."), cx)
+                    self.notice(NoticeKind::Info, format!("Switched from {from} to {to}."), cx);
+                    self.unsent_switch = Some((from, to));
                 }
                 Record::Overview { overview, mark } => {
                     self.overview = overview;
@@ -451,17 +468,16 @@ impl ThreadView {
             options.config_dir = config_dir;
         }
         if !self.plain.is_empty() {
-            self.handoff = Some(self.handoff_text(&from, name));
             self.agent = None;
             self._pump = None;
             self.session_id = None;
             self.status = Status::Idle;
             self.write(Record::AccountSwitch { from: from.clone(), to: name.to_string() });
+            let summarizing = self.start_handoff(&from, name, cx);
+            let context = if summarizing { "a summary of this conversation" } else { "this conversation so far" };
             self.notice(
                 NoticeKind::Info,
-                format!(
-                    "Switched from {from} to {name}. Your next message starts a new Claude session on {name}, with this conversation so far as context."
-                ),
+                format!("Switched from {from} to {name}. Your next message starts a new Claude session on {name}, with {context} as context."),
                 cx,
             );
         }
@@ -469,18 +485,66 @@ impl ThreadView {
         cx.notify();
     }
 
-    fn handoff_text(&self, from: &str, to: &str) -> String {
-        let mut transcript = self.plain.join("\n\n");
-        if transcript.len() > HANDOFF_MAX_CHARS {
-            let mut start = transcript.len() - HANDOFF_MAX_CHARS;
-            while !transcript.is_char_boundary(start) {
-                start += 1;
+    /// Prepare what the new session is told about the conversation so far. Short ones go word
+    /// for word at once; longer ones are summarized in the background, on the new account
+    /// (true). Scripted threads (demos, tests) always go word for word.
+    fn start_handoff(&mut self, from: &str, to: &str, cx: &mut Context<Self>) -> bool {
+        self.handoff_run += 1;
+        let options = match &self.backend {
+            Some(Backend::Claude(options)) if crate::handoff::needs_summary(&self.plain) => options.clone(),
+            _ => {
+                self.summarizing = None;
+                self.handoff = Some(crate::handoff::verbatim(from, to, &self.plain));
+                return false;
             }
-            transcript = format!("[earlier messages omitted]\n\n{}", &transcript[start..]);
+        };
+        self.handoff = None;
+        self.summarizing = Some((from.to_string(), to.to_string()));
+        let (older, _) = crate::handoff::split_recent(&self.plain);
+        let (older, overview, run) = (older.to_vec(), self.overview.clone(), self.handoff_run);
+        cx.spawn(async move |this, cx| {
+            let summary = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::handoff::summarize(&options.cwd, options.config_dir.as_deref(), &overview, &older)
+                })
+                .await;
+            let _ = this.update(cx, |t: &mut ThreadView, cx| t.finish_handoff(run, summary, cx));
+        })
+        .detach();
+        true
+    }
+
+    /// The summary is in (or failed: then the conversation goes word for word). A message
+    /// that was waiting for it goes out now.
+    fn finish_handoff(&mut self, run: u64, summary: anyhow::Result<String>, cx: &mut Context<Self>) {
+        if run != self.handoff_run {
+            return;
         }
-        format!(
-            "[Context from TJ: this conversation began in another Claude session (account: {from}) and continues here (account: {to}). Here is the conversation so far.]\n\n{transcript}\n\n[End of the earlier conversation. My new message follows.]"
-        )
+        let Some((from, to)) = self.summarizing.take() else { return };
+        self.handoff = Some(match summary {
+            Ok(summary) => {
+                let (_, recent) = crate::handoff::split_recent(&self.plain);
+                // The waiting message is already in `plain`; it goes after the context, not in it.
+                let recent = match &self.queued {
+                    Some(_) => &recent[..recent.len().saturating_sub(1)],
+                    None => recent,
+                };
+                crate::handoff::with_summary(&from, &to, &summary, &self.overview, recent)
+            }
+            Err(err) => {
+                eprintln!("tj: handoff summary failed, sending the conversation instead: {err:#}");
+                let plain = match &self.queued {
+                    Some(_) => &self.plain[..self.plain.len().saturating_sub(1)],
+                    None => &self.plain[..],
+                };
+                crate::handoff::verbatim(&from, &to, plain)
+            }
+        });
+        if let Some((text, images)) = self.queued.take() {
+            self.dispatch(&text, images, cx);
+        }
+        cx.notify();
     }
 
     /// The user's last `n` messages in this thread, oldest first (context for change summaries).
@@ -596,13 +660,28 @@ impl ThreadView {
         if self.title.is_none() {
             self.title = Some(if text.is_empty() { "Image".into() } else { title_from(text) });
         }
+        self.dispatch(text, images, cx);
+    }
+
+    /// Hand the message to the agent, after the handoff context if there is one. While the
+    /// handoff summary is still being written, the message waits for it.
+    fn dispatch(&mut self, text: &str, images: Vec<crate::agent::PromptImage>, cx: &mut Context<Self>) {
+        if self.summarizing.is_some() {
+            self.queued = Some((text.to_string(), images));
+            self.status = Status::Running;
+            cx.emit(ThreadChanged);
+            cx.notify();
+            return;
+        }
         let message = match &self.handoff {
             Some(context) => format!("{context}\n\n{text}"),
             None => text.to_string(),
         };
         if let Err(err) = self.ensure_agent(cx).and_then(|agent| agent.send_message(&message, &images)) {
             self.notice(NoticeKind::Error, format!("Could not send: {err:#}"), cx);
+            self.status = Status::Idle;
             cx.emit(ThreadChanged);
+            cx.notify();
             return;
         }
         self.handoff = None;
@@ -1084,6 +1163,13 @@ impl ThreadView {
     }
 
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
+        // Stop a message that is still waiting for the handoff summary: it is not sent.
+        if self.queued.take().is_some() {
+            self.status = Status::Idle;
+            self.notice(NoticeKind::Info, "Stopped. That message was not sent.", cx);
+            cx.emit(ThreadChanged);
+            return;
+        }
         if let Some(agent) = &self.agent
             && let Err(err) = agent.interrupt()
         {
@@ -2522,6 +2608,106 @@ mod tests {
         assert!(prompt.contains("Claude: It opens the window."));
         assert!(prompt.ends_with("And store.rs?"));
         assert!(!thread.read_with(cx, |t, _| t.has_pending_handoff()), "the handoff is sent once");
+    }
+
+    /// A thread with one exchange that has just switched to Work, with the summary still
+    /// being written (as for a long conversation on a real account).
+    fn switched_and_summarizing(cx: &mut TestAppContext) -> (Entity<ThreadView>, VisualTestContext) {
+        let (window, thread) = open(cx);
+        let mut cx = VisualTestContext::from_window(window, cx);
+        thread.update(&mut cx, |t, cx| {
+            t.send("What does main.rs do?", cx);
+            t.handle(AgentEvent::TextStarted, cx);
+            t.handle(AgentEvent::TextDelta("It opens the window.".into()), cx);
+            t.handle(AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, error: None }, cx);
+            t.set_account("work", "Work", None, cx);
+            t.handoff = None;
+            t.summarizing = Some(("Personal".into(), "Work".into()));
+        });
+        (thread, cx)
+    }
+
+    fn prompts(thread: &Entity<ThreadView>, cx: &mut VisualTestContext) -> Vec<String> {
+        calls(thread, cx)
+            .into_iter()
+            .filter_map(|c| match c {
+                ScriptedCall::Prompt(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    fn a_message_sent_during_the_summary_waits_for_it(cx: &mut TestAppContext) {
+        let (thread, mut cx) = switched_and_summarizing(cx);
+        let cx = &mut cx;
+        thread.update(cx, |t, cx| t.send("And store.rs?", cx));
+        assert_eq!(prompts(&thread, cx).len(), 1, "only the first message has gone out");
+        assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Running, "it shows as working");
+
+        thread.update(cx, |t, cx| {
+            let run = t.handoff_run;
+            t.finish_handoff(run, Ok("- main.rs opens the window".into()), cx)
+        });
+        let sent = prompts(&thread, cx).pop().unwrap();
+        assert!(sent.starts_with("[Context from TJ") && sent.contains("account: Work"), "{sent}");
+        assert!(sent.contains("Summary:\n- main.rs opens the window"));
+        assert!(sent.contains("Newest messages:"));
+        assert!(sent.ends_with("My new message follows.]\n\nAnd store.rs?"));
+        assert_eq!(sent.matches("And store.rs?").count(), 1, "the new message isn't also in the context");
+        assert!(!thread.read_with(cx, |t, _| t.has_pending_handoff()));
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_summary_falls_back_to_the_conversation(cx: &mut TestAppContext) {
+        let (thread, mut cx) = switched_and_summarizing(cx);
+        let cx = &mut cx;
+        thread.update(cx, |t, cx| {
+            let stale = t.handoff_run - 1;
+            t.finish_handoff(stale, Ok("from an older switch".into()), cx);
+            assert!(t.summarizing.is_some(), "a late summary from an older switch is ignored");
+            t.send("And store.rs?", cx);
+            let run = t.handoff_run;
+            t.finish_handoff(run, Err(anyhow::anyhow!("offline")), cx);
+        });
+        let sent = prompts(&thread, cx).pop().unwrap();
+        assert!(sent.contains("User: What does main.rs do?") && sent.contains("Claude: It opens the window."));
+        assert_eq!(sent.matches("And store.rs?").count(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn stop_cancels_a_message_waiting_for_the_summary(cx: &mut TestAppContext) {
+        let (thread, mut cx) = switched_and_summarizing(cx);
+        let cx = &mut cx;
+        thread.update(cx, |t, cx| {
+            t.send("And store.rs?", cx);
+            t.interrupt(cx);
+            let run = t.handoff_run;
+            t.finish_handoff(run, Ok("summary".into()), cx);
+        });
+        assert_eq!(prompts(&thread, cx).len(), 1, "the stopped message never went out");
+        assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Idle);
+        assert!(thread.read_with(cx, |t, _| t.has_pending_handoff()), "the handoff waits for the next message");
+    }
+
+    #[gpui_kit::test]
+    fn a_switch_without_a_message_is_handed_off_after_a_restart(cx: &mut TestAppContext) {
+        let path = std::env::temp_dir().join(format!("tj-handoff-{}.jsonl", crate::store::new_id()));
+        let setup = super::ThreadSetup { transcript: Some(path.clone()), ..Default::default() };
+        let (window, _thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let first = cx.update(|window, cx| {
+            cx.new(|cx| ThreadView::open(setup.clone(), Backend::Scripted(Vec::new()), window, cx))
+        });
+        first.update(cx, |t, cx| {
+            t.attach_scripted(ScriptedAgent::start(Vec::new()).0);
+            t.send("What does main.rs do?", cx);
+            t.set_account("work", "Work", None, cx);
+        });
+        let reopened =
+            cx.update(|window, cx| cx.new(|cx| ThreadView::open(setup, Backend::Scripted(Vec::new()), window, cx)));
+        assert!(reopened.read_with(cx, |t, _| t.has_pending_handoff()), "the handoff is prepared again");
+        let _ = std::fs::remove_file(path);
     }
 
     #[gpui_kit::test]

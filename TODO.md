@@ -8,7 +8,7 @@ What's missing or rough, roughly in priority order. ROADMAP.md has the direction
 - [x] **Subagent activity.** The Agent tool's row shows what its (background) subagent is doing, its tool calls, counts and report.
 - [x] **Model picker.** Model and effort from a dropdown next to Send, listed by `claude` for the account, switchable mid-session, with project defaults.
 - [x] **Attachments and `@file` mentions** in the prompt box: an `@` file picker with chips, and images pasted, dropped or picked.
-- [ ] **Account-switch handoff** sends the raw transcript (up to 30k characters); a summary would be shorter and cheaper.
+- [x] **Account-switch handoff** sends a summary for long conversations (word for word when short), and survives a restart.
 - [ ] **Other agent backends** (Codex, pi) through the `AgentSession` interface.
 
 ## Threads and projects

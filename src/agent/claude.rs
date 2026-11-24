@@ -626,6 +626,9 @@ pub fn oneshot(
         .args(["-p", "--model", model, "--output-format", "json", "--tools", "", "--no-session-persistence"])
         .args(["--strict-mcp-config", "--system-prompt", system_prompt])
         .args(["--json-schema", &schema.to_string()])
+        // The user's CLAUDE.md files are for their sessions, not for TJ's helper calls: they
+        // cost tokens on every call and leak into the answers (summaries quoted them).
+        .env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1")
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
