@@ -1,0 +1,13 @@
+[package]
+name = "tj"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = "0.26"
+anyhow = "1.0.105"
+gpui-kit = { version = "0.11.0", features = ["tree-sitter-languages"] }
+smol = "2"
+
+[dev-dependencies]
+gpui-kit = { version = "0.11.0", features = ["test-support"] }
