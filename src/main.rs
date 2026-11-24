@@ -11,6 +11,7 @@ mod keymap;
 mod omarchy;
 mod overview;
 mod panes;
+mod project_image;
 mod sample;
 mod settings;
 mod store;

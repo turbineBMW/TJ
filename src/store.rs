@@ -4,6 +4,7 @@
 //!   first run from the config directories found in the home folder.
 //! - `$XDG_DATA_HOME/tj/state.json`: projects, threads and what was selected.
 //! - `$XDG_DATA_HOME/tj/threads/<id>.jsonl`: one transcript per thread, replayed on open.
+//! - `$XDG_DATA_HOME/tj/project-images/`: copies of the pictures chosen for projects.
 //!
 //! Set `TJ_HOME` to keep all of it in one folder instead (tests and trial runs).
 
@@ -53,6 +54,11 @@ impl Paths {
     }
     pub fn transcript(&self, thread_id: &str) -> PathBuf {
         self.data_dir.join("threads").join(format!("{thread_id}.jsonl"))
+    }
+
+    /// Where copies of the pictures chosen for projects are kept.
+    pub fn project_images_dir(&self) -> PathBuf {
+        self.data_dir.join("project-images")
     }
 
     /// Delete what TJ keeps for a thread: its transcript and attached images.
@@ -232,6 +238,19 @@ pub struct Project {
     /// The project's panes and their tabs (conversations, terminals, the review).
     #[serde(default)]
     pub layout: Option<PaneLayout>,
+    /// The project's picture; when absent, an icon found in the project, else its initials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ProjectImage>,
+}
+
+/// The picture chosen for a project.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectImage {
+    /// Its initials, even if the project has an icon.
+    Initials,
+    /// An image file the user picked, copied into [`Paths::project_images_dir`].
+    File { path: PathBuf },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +356,7 @@ impl State {
             effort: None,
             threads: Vec::new(),
             layout: None,
+            image: None,
         });
         self.projects.last_mut().unwrap()
     }

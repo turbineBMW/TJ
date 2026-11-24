@@ -9,7 +9,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
-    menu::{ContextMenuExt as _, PopupMenuItem},
+    menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
     popover::Popover,
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     switch::Switch,
@@ -82,6 +82,8 @@ pub struct Workspace {
     renaming: Option<(String, Entity<InputState>)>,
     /// Projects whose archived threads are listed.
     show_archived: std::collections::HashSet<String>,
+    /// Per project: the icon found in its folder, once looked for (`None` inside: there isn't one).
+    found_icons: HashMap<String, Option<PathBuf>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -140,6 +142,7 @@ impl Workspace {
             models_loading: Default::default(),
             renaming: None,
             show_archived: Default::default(),
+            found_icons: HashMap::new(),
             no_summaries: launch.no_summaries,
             opacity_slider,
             glide_slider,
@@ -173,6 +176,7 @@ impl Workspace {
         if launch.review {
             this.open_review(None, window, cx);
         }
+        this.find_icons(cx);
         // Save each terminal's current directory when the window closes.
         let workspace = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
@@ -502,6 +506,8 @@ impl Workspace {
 
     fn remove_project(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.state.remove_project(project_id) else { return };
+        self.delete_image_copy(project.image.clone());
+        self.found_icons.remove(project_id);
         for meta in &project.threads {
             self.threads.remove(&meta.id);
             self.paths.delete_thread_files(&meta.id);
@@ -557,10 +563,144 @@ impl Workspace {
             let Some(path) = paths.into_iter().next() else { return };
             let _ = this.update_in(cx, |this: &mut Workspace, window, cx| {
                 let project = this.state.add_project(&path).id.clone();
+                this.find_icons(cx);
                 this.new_thread(&project, window, cx);
             });
         })
         .detach();
+    }
+
+    // ---------- project pictures ----------
+
+    /// Look, in the background, for an icon in each project not searched yet.
+    fn find_icons(&mut self, cx: &mut Context<Self>) {
+        for project in &self.state.projects {
+            if self.found_icons.contains_key(&project.id) {
+                continue;
+            }
+            // Mark it searched now, so it's searched once.
+            self.found_icons.insert(project.id.clone(), None);
+            let (id, path, name) = (project.id.clone(), project.path.clone(), project.name.clone());
+            cx.spawn(async move |this, cx| {
+                let icon =
+                    cx.background_executor().spawn(async move { crate::project_image::find_icon(&path, &name) }).await;
+                let _ = this.update(cx, |this: &mut Workspace, cx| {
+                    if icon.is_some() && this.found_icons.contains_key(&id) {
+                        this.found_icons.insert(id, icon);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// The picture to show for a project: the chosen one, else the icon found in it; `None` for
+    /// its initials.
+    fn project_picture(&self, project: &store::Project) -> Option<PathBuf> {
+        match &project.image {
+            Some(store::ProjectImage::Initials) => None,
+            Some(store::ProjectImage::File { path }) if path.is_file() => Some(path.clone()),
+            // A chosen picture that has gone missing falls back to the project's own icon.
+            _ => self.found_icons.get(&project.id).cloned().flatten(),
+        }
+    }
+
+    fn choose_project_image(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use as project image".into()),
+        });
+        let project_id = project_id.to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |this: &mut Workspace, cx| {
+                if let Err(err) = this.use_image_file(&project_id, &path) {
+                    this.problem =
+                        Some(format!("Could not use {} as the project image: {err:#}", path.display()).into());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Copy `source` into TJ's data folder (so the picture stays if the original moves) and use it.
+    fn use_image_file(&mut self, project_id: &str, source: &std::path::Path) -> anyhow::Result<()> {
+        anyhow::ensure!(crate::project_image::is_image(source), "it isn't an image TJ can show");
+        let dir = self.paths.project_images_dir();
+        std::fs::create_dir_all(&dir)?;
+        let ext = source.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_else(|| "png".into());
+        // A fresh name each time, so the image cache never shows the previous picture.
+        let copy = dir.join(format!("{project_id}-{}.{ext}", &store::new_id()[..8]));
+        std::fs::copy(source, &copy)?;
+        self.set_project_image(project_id, Some(store::ProjectImage::File { path: copy }));
+        Ok(())
+    }
+
+    /// Set (or, with `None`, reset to the found icon) a project's picture, deleting the copy of
+    /// the one it replaces.
+    fn set_project_image(&mut self, project_id: &str, image: Option<store::ProjectImage>) {
+        let Some(project) = self.state.project_mut(project_id) else { return };
+        let old = std::mem::replace(&mut project.image, image);
+        self.delete_image_copy(old);
+        self.problem = None;
+        self.save();
+    }
+
+    fn delete_image_copy(&self, image: Option<store::ProjectImage>) {
+        if let Some(store::ProjectImage::File { path }) = image
+            && path.starts_with(self.paths.project_images_dir())
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// The project's picture, or its initials on the accent colour, `size` pixels square.
+    fn project_avatar(&self, project: &store::Project, size: f32, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        let (accent, accent_fg) = (theme.primary, theme.primary_foreground);
+        let name = project.name.clone();
+        let badge = move || {
+            div()
+                .flex_none()
+                .size(px(size))
+                .rounded_sm()
+                .bg(accent)
+                .text_color(accent_fg)
+                .text_size(px((size * 0.5).round()))
+                .font_weight(FontWeight::BOLD)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(initials(&name))
+                .into_any_element()
+        };
+        match self.project_picture(project) {
+            Some(path) => img(path)
+                .flex_none()
+                .size(px(size))
+                .rounded_sm()
+                .object_fit(ObjectFit::Contain)
+                .with_fallback(badge)
+                .into_any_element(),
+            None => badge(),
+        }
+    }
+
+    /// What a project's right-click menu can offer about its picture.
+    fn image_choices(&self, project_id: &str, cx: &Context<Self>) -> ImageChoices {
+        let project = self.state.project(project_id);
+        ImageChoices {
+            workspace: cx.entity(),
+            project_id: project_id.to_string(),
+            showing: project.is_some_and(|p| self.project_picture(p).is_some()),
+            chosen: project.is_some_and(|p| p.image.is_some()),
+            found: self.found_icons.get(project_id).is_some_and(Option::is_some),
+        }
     }
 
     // ---------- accounts and modes ----------
@@ -1217,19 +1357,21 @@ impl Workspace {
             let showing_archived = self.show_archived.contains(&project.id);
             let archived_rows: Vec<_> =
                 if showing_archived { archived.iter().map(|t| thread_row(t, cx)).collect() } else { Vec::new() };
+            let image_choices = self.image_choices(&project.id, cx);
             let header_menu = {
                 let (workspace, id) = (workspace.clone(), project.id.clone());
-                move |menu: gpui_kit::component::menu::PopupMenu, _: &mut Window, _: &mut Context<_>| {
+                move |menu: PopupMenu, _: &mut Window, _: &mut Context<_>| {
                     let (w1, w2) = (workspace.clone(), workspace.clone());
                     let (i1, i2) = (id.clone(), id.clone());
-                    menu.item(
-                        PopupMenuItem::new("New thread")
-                            .on_click(move |_, window, cx| w1.update(cx, |w, cx| w.new_thread(&i1, window, cx))),
-                    )
-                    .separator()
-                    .item(PopupMenuItem::new("Remove from TJ…").on_click(move |_, window, cx| {
-                        w2.update(cx, |w, cx| w.confirm_remove_project(&i2, window, cx))
-                    }))
+                    let menu = menu
+                        .item(
+                            PopupMenuItem::new("New thread")
+                                .on_click(move |_, window, cx| w1.update(cx, |w, cx| w.new_thread(&i1, window, cx))),
+                        )
+                        .separator();
+                    image_choices.add_to(menu).separator().item(PopupMenuItem::new("Remove from TJ…").on_click(
+                        move |_, window, cx| w2.update(cx, |w, cx| w.confirm_remove_project(&i2, window, cx)),
+                    ))
                 }
             };
             let toggle_id = project.id.clone();
@@ -1242,10 +1384,15 @@ impl Workspace {
                             .px_4()
                             .pt_2()
                             .pb_1()
-                            .gap_1()
+                            .gap_2()
+                            .child(self.project_avatar(project, 18., cx))
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(muted)
@@ -1338,9 +1485,7 @@ impl Workspace {
     /// The top bar: `[badge] Project / Thread title`, like T3 Code, then the pane actions.
     fn content_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, warning, muted, accent, fg) =
-            (theme.border, theme.warning, theme.muted_foreground, theme.primary, theme.foreground);
-        let accent_fg = theme.primary_foreground;
+        let (border, warning, muted, fg) = (theme.border, theme.warning, theme.muted_foreground, theme.foreground);
         let thread = self.active_thread().map(|t| t.read(cx));
         let title = thread.and_then(|t| t.title.clone()).unwrap_or_else(|| "New thread".into());
         let status = match thread.map(|t| t.status) {
@@ -1349,6 +1494,14 @@ impl Workspace {
             _ => "",
         };
         let project_name = self.active_project().map(|p| p.name.clone());
+        let avatar = self.active_project().map(|p| {
+            let choices = self.image_choices(&p.id, cx);
+            div()
+                .id("header-project-image")
+                .flex_none()
+                .child(self.project_avatar(p, 20., cx))
+                .context_menu(move |menu, _, _| choices.add_to(menu))
+        });
         let has_panes = self.active_project().is_some_and(|p| self.panes.contains_key(&p.id));
 
         let pane_button = |id: &'static str, icon: IconName, tip: &'static str| {
@@ -1369,23 +1522,10 @@ impl Workspace {
             .px_3()
             .border_b_1()
             .border_color(border)
+            .children(avatar)
             .when_some(project_name, |el, name| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .size_5()
-                        .rounded_sm()
-                        .bg(accent)
-                        .text_color(accent_fg)
-                        .text_xs()
-                        .font_weight(FontWeight::BOLD)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(initials(&name)),
-                )
-                .child(div().flex_none().text_sm().text_color(muted).child(name))
-                .child(div().flex_none().text_sm().text_color(muted).child("/"))
+                el.child(div().flex_none().text_sm().text_color(muted).child(name))
+                    .child(div().flex_none().text_sm().text_color(muted).child("/"))
             })
             .child(
                 div()
@@ -1420,6 +1560,39 @@ impl Workspace {
                     window.remove_window();
                 }),
             ))
+    }
+}
+
+/// The picture items of a project's right-click menu.
+#[derive(Clone)]
+struct ImageChoices {
+    workspace: Entity<Workspace>,
+    project_id: String,
+    /// It shows a picture now (not its initials).
+    showing: bool,
+    /// The user chose its picture (or chose initials).
+    chosen: bool,
+    /// An icon was found in the project.
+    found: bool,
+}
+
+impl ImageChoices {
+    fn add_to(&self, menu: PopupMenu) -> PopupMenu {
+        let item = |label: &'static str, image: Option<Option<store::ProjectImage>>| {
+            let (workspace, id) = (self.workspace.clone(), self.project_id.clone());
+            PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                workspace.update(cx, |w, cx| match image.clone() {
+                    None => w.choose_project_image(&id, window, cx),
+                    Some(image) => {
+                        w.set_project_image(&id, image);
+                        cx.notify();
+                    }
+                })
+            })
+        };
+        menu.item(item("Choose image…", None))
+            .when(self.chosen && self.found, |menu| menu.item(item("Use the project's icon", Some(None))))
+            .when(self.showing, |menu| menu.item(item("Use initials", Some(Some(store::ProjectImage::Initials)))))
     }
 }
 
@@ -1721,6 +1894,53 @@ mod tests {
         assert!(project.exists(), "the project's own folder is untouched");
         assert_eq!(workspace.read_with(cx, |w, _| (w.active.clone(), w.panes.len(), w.threads.len())), (None, 0, 0));
         cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_project_shows_its_icon_or_a_chosen_image_or_initials(cx: &mut TestAppContext) {
+        use crate::store::ProjectImage;
+        let (window, workspace, paths, project) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let project_id = workspace.read_with(cx, |w, _| w.state.projects[0].id.clone());
+        let picture = |workspace: &Entity<Workspace>, cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |w, _| w.project_picture(&w.state.projects[0]))
+        };
+        assert_eq!(picture(&workspace, cx), None, "no icon in the folder: initials");
+
+        // An icon in the project is found in the background.
+        std::fs::create_dir_all(project.join("assets")).unwrap();
+        image::RgbaImage::new(256, 256).save(project.join("assets/logo.png")).unwrap();
+        workspace.update(cx, |w, cx| {
+            w.found_icons.clear();
+            w.find_icons(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(picture(&workspace, cx), Some(project.join("assets/logo.png")));
+
+        // A chosen image is copied into TJ's folder and saved.
+        let chosen = project.join("mine.png");
+        image::RgbaImage::new(64, 64).save(&chosen).unwrap();
+        workspace.update(cx, |w, _| w.use_image_file(&project_id, &chosen)).unwrap();
+        let copy = picture(&workspace, cx).unwrap();
+        assert!(copy.starts_with(paths.project_images_dir()) && copy.is_file());
+        assert_eq!(State::load(&paths).unwrap().projects[0].image, Some(ProjectImage::File { path: copy.clone() }));
+        assert!(workspace.update(cx, |w, _| w.use_image_file(&project_id, &project.join("nope.txt"))).is_err());
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // Initials replace it (and its copy goes); resetting goes back to the project's icon.
+        workspace.update(cx, |w, _| w.set_project_image(&project_id, Some(ProjectImage::Initials)));
+        assert_eq!(picture(&workspace, cx), None);
+        assert!(!copy.exists());
+        workspace.update(cx, |w, _| w.set_project_image(&project_id, None));
+        assert_eq!(picture(&workspace, cx), Some(project.join("assets/logo.png")));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // Removing the project deletes its copied image.
+        workspace.update(cx, |w, _| w.use_image_file(&project_id, &chosen)).unwrap();
+        let copy = picture(&workspace, cx).unwrap();
+        workspace.update_in(cx, |w, window, cx| w.remove_project(&project_id, window, cx));
+        assert!(!copy.exists());
+        assert!(chosen.exists(), "the original is never touched");
     }
 
     #[gpui_kit::test]
