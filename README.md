@@ -6,32 +6,57 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 
 ## Status
 
-TJ talks to a real Claude Code session in one thread, next to a terminal:
-
+- **Projects and threads.** A full-height sidebar lists your projects with their threads. Add a project with **+** at the top; start a thread with a project's **+**. Each thread keeps its Claude session running in the background, and a dot shows threads that are working (amber) or waiting for you.
+- **Accounts.** Each thread runs on an account: the thread's own choice, else the project's default, else the global default. The account menu in the header switches the thread for now, makes the account the project default, or starts `claude auth login` for it in the terminal. Switching a thread that has history starts a new Claude session on the other account, with the conversation so far as context (a session can't change accounts).
+- **Saved across restarts.** Projects, threads and transcripts are saved; reopening a thread shows its history and resumes its Claude conversation.
+- **GNOME-style window**: no title bar; drag either header to move it, double-click to maximize.
 - **Streaming replies** in markdown, with tool calls shown as cards you can expand to see their output.
 - **Approval cards** when Claude wants to do something risky: **Approve**, **Approve for session**, **Decline** (with optional feedback that's passed to Claude) or **Cancel turn**.
 - **Permission modes** for the thread: Ask, Accept edits, Auto, Plan and Full access.
 - **Usage and cost**: subscription usage windows (for example "7d 4%"), plus the cost of each turn and the whole thread.
 - **Stop** interrupts a running turn. If `claude` exits, the next message resumes the conversation.
 
-Projects, the thread sidebar, accounts, the task panel and the diff review are next; see [ROADMAP.md](ROADMAP.md).
+The task panel, the diff review, the transparent sidebar, Omarchy theming and terminal splits are next; see [ROADMAP.md](ROADMAP.md).
 
 ## Run
 
 ```bash
-cargo run                        # Claude in the current directory, with your default account
-cargo run -- --model haiku       # pick a model
+cargo run                                # reopen where you left off (the current folder on first run)
+cargo run -- --project ~/Projects/Vord   # open (and add) a project
+cargo run -- --model haiku               # pick a model
 ```
 
 The prompt box sends on Enter; Shift+Enter adds a line. Tab never moves focus. Click the terminal to focus it; Tab, Shift+Tab and Ctrl+C go to the shell, and Ctrl+Shift+V pastes.
 
 Test hooks:
 
-- `--prompt "text"` sends a prompt at launch.
+- `--prompt "text"` sends a prompt in a new thread at launch.
+- Demos and replays use a throwaway folder, so they never touch your saved projects.
 - `--replay tests/fixtures/claude/2.1.331-approve.jsonl` plays a recorded session through the real parser, without running a model.
-- `--demo stream|firehose|history` streams a canned reply (`history` adds 100 messages first).
+- `--demo stream|firehose` streams a canned reply.
 - `--type 'text\r'` sends text to the terminal.
 - `TJ_UI_FONT="Family"` overrides the UI font.
+- `TJ_HOME=/some/dir` keeps all of TJ's files in one folder (handy for trial runs).
+
+## Where things are kept
+
+- `~/.config/tj/accounts.toml`: your Claude accounts. Created on first run from the config directories TJ finds (`~/.claude`, plus any `~/.claude-<name>` or `~/.claude_<name>` with a login). Edit names or add accounts here:
+
+  ```toml
+  default = "personal"
+
+  [[account]]
+  id = "personal"
+  name = "Personal"          # no config_dir: Claude's default, ~/.claude
+
+  [[account]]
+  id = "work"
+  name = "Work"
+  config_dir = "~/.claude-work"
+  ```
+
+- `~/.local/share/tj/state.json`: projects, threads, defaults, and what was open.
+- `~/.local/share/tj/threads/<id>.jsonl`: each thread's transcript.
 
 ## How TJ talks to Claude
 

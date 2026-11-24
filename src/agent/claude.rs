@@ -601,6 +601,45 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[1mbold\x1b[0m path"), "bold path");
     }
 
+    /// Collect events until the turn ends; returns (session id, reply text).
+    fn run_turn(events: &smol::channel::Receiver<AgentEvent>) -> (Option<String>, String) {
+        let (mut session, mut text) = (None, String::new());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            match smol::block_on(events.recv()).expect("events") {
+                AgentEvent::SessionInfo { session_id, .. } => session = Some(session_id),
+                AgentEvent::TextDelta(t) => text.push_str(&t),
+                AgentEvent::TurnFinished { is_error, error, .. } => {
+                    assert!(!is_error, "{error:?}");
+                    break;
+                }
+                AgentEvent::Exited { stderr, .. } => panic!("claude exited: {stderr}"),
+                _ => {}
+            }
+        }
+        (session, text)
+    }
+
+    /// `--resume` continues the same conversation in a new process.
+    #[test]
+    #[ignore]
+    fn live_resume_continues_the_conversation() {
+        let dir = std::env::temp_dir().join(format!("tj-live-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut options = SessionOptions { cwd: dir.clone(), model: Some("haiku".into()), ..Default::default() };
+        let (first, events) = ClaudeSession::spawn(&options).unwrap();
+        first.send_prompt("Remember this word for later: tangerine. Reply with just OK.").unwrap();
+        let (session, _) = run_turn(&events);
+        drop(first);
+
+        options.resume = Some(session.expect("a session id"));
+        let (second, events) = ClaudeSession::spawn(&options).unwrap();
+        second.send_prompt("What word did I ask you to remember? Reply with just the word.").unwrap();
+        let (_, reply) = run_turn(&events);
+        assert!(reply.to_lowercase().contains("tangerine"), "{reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Runs the real `claude` (uses a little of the logged-in account's usage):
     /// `cargo test -- --ignored live_`
     #[test]
