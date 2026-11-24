@@ -8,7 +8,9 @@
 
 **Done (milestone 3c):** following the Omarchy theme live (window and terminal) and the transparent-sidebar setting.
 
-**Next:** terminal splits and tabs.
+**Done (milestone 3d):** panes and tabs with Vmux's shortcuts, where a tab is a conversation, a terminal or the review; the overview in its own right pane that appears when there's something to show. Saved and restored per project.
+
+**Everything from the original brief is now in.** Possible next steps: mouse selection and copy in the terminal, drag-to-resize splits, more agent backends (Codex or pi, through the `AgentSession` interface), and an `.desktop` file plus a package so TJ shows up in the launcher.
 
 These are steering decisions, not a schedule. Build toward them, but don't let them block the agent core.
 

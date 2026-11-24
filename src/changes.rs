@@ -365,6 +365,106 @@ impl ProjectChanges {
     }
 }
 
+/// The review of a project's changes, shown in a tab: every file's diff stacked, unified or
+/// side by side, with each file's summary under its header.
+pub struct ReviewView {
+    pub changes: Entity<ProjectChanges>,
+    no_summaries: bool,
+    _observe: Subscription,
+}
+
+impl ReviewView {
+    pub fn new(changes: Entity<ProjectChanges>, no_summaries: bool, cx: &mut Context<Self>) -> Self {
+        let observe = cx.observe(&changes, |_, _, cx| cx.notify());
+        Self { changes, no_summaries, _observe: observe }
+    }
+
+    pub fn file_count(&self, cx: &App) -> usize {
+        self.changes.read(cx).changes.files.len()
+    }
+}
+
+impl Render for ReviewView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::base::{h_flex, v_flex};
+        use gpui_kit::component::{
+            ActiveTheme as _, Selectable as _, Sizable as _,
+            button::{Button, ButtonVariants as _},
+            diff::{Diff, DiffAnnotation, DiffMode},
+        };
+        use gpui_kit::prelude::FluentBuilder as _;
+
+        let model = self.changes.read(cx);
+        let theme = cx.theme();
+        let (muted, border, danger, secondary, bg) =
+            (theme.muted_foreground, theme.border, theme.danger, theme.secondary, theme.background);
+        let summaries: HashMap<String, Option<String>> =
+            model.changes.files.iter().map(|f| (f.path.clone(), model.summary(f).map(str::to_owned))).collect();
+        let summarizing = model.summarizing;
+        let no_summaries = self.no_summaries;
+        let mode = model.diff.read(cx).mode();
+        let diff_state = model.diff.clone();
+        let annotations: Vec<DiffAnnotation> = model
+            .changes
+            .files
+            .iter()
+            .enumerate()
+            .map(|(ix, f)| DiffAnnotation::file(SharedString::from(format!("summary-{ix}")), f.path.clone()))
+            .collect();
+        let heading = format!(
+            "{} files changed · +{} −{}",
+            model.changes.files.len(),
+            model.changes.additions(),
+            model.changes.deletions()
+        );
+        let error = model.error.clone();
+        let empty = model.changes.files.is_empty();
+
+        let diff = Diff::new(&diff_state).syntax_highlight(true).annotations(annotations).render_annotation(
+            move |annotation, _window, _cx| {
+                let summary = summaries.get(annotation.path().as_ref()).cloned().flatten();
+                let text = match summary {
+                    Some(summary) => summary,
+                    None if no_summaries => String::new(),
+                    None if summarizing => "Summarizing…".into(),
+                    None => "No summary yet.".into(),
+                };
+                div().px_3().py_2().bg(secondary).text_sm().child(text)
+            },
+        );
+
+        v_flex()
+            .size_full()
+            .bg(bg)
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(heading))
+                    .when(summarizing, |el| el.child(div().text_xs().text_color(muted).child("Writing summaries…")))
+                    .child(div().flex_1())
+                    .children([DiffMode::Unified, DiffMode::Split].map(|m| {
+                        let state = diff_state.clone();
+                        Button::new(SharedString::from(format!("diff-mode-{m:?}")))
+                            .xsmall()
+                            .ghost()
+                            .selected(mode == m)
+                            .label(if m == DiffMode::Split { "Side by side" } else { "Unified" })
+                            .on_click(move |_, _, cx| state.update(cx, |d, cx| d.set_mode(m, cx)))
+                    })),
+            )
+            .when_some(error, |el, error| el.child(div().px_3().py_1().text_sm().text_color(danger).child(error)))
+            .child(if empty {
+                div().p_4().text_sm().text_color(muted).child("No uncommitted changes.").into_any_element()
+            } else {
+                div().flex_1().min_h_0().child(diff).into_any_element()
+            })
+    }
+}
+
 /// Paths (relative to `root`) of files the agent wrote or edited, from tool inputs.
 pub fn touched_relative(root: &Path, touched: &HashSet<String>) -> HashSet<String> {
     touched

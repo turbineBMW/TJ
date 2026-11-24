@@ -9,10 +9,20 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **Projects and threads.** A full-height sidebar lists your projects with their threads. Add a project with **+** at the top; start a thread with a project's **+**. Each thread keeps its Claude session running in the background, and a dot shows threads that are working (amber) or waiting for you.
 - **Accounts.** Each thread runs on an account: the thread's own choice, else the project's default, else the global default. The account menu in the header switches the thread for now, makes the account the project default, or starts `claude auth login` for it in the terminal. Switching a thread that has history starts a new Claude session on the other account, with the conversation so far as context (a session can't change accounts).
 - **Saved across restarts.** Projects, threads and transcripts are saved; reopening a thread shows its history and resumes its Claude conversation.
-- **Overview and usage**, like the pi session sidebar. The top of the right column shows the thread's **Goal**, **Now**, **Next** and **Tasks** (recent done ones struck through), rewritten by Haiku on the thread's account after each turn and every minute during long ones, from the newest part of the conversation. Claude's own task list (TodoWrite) feeds into it. The thread's title in the sidebar comes from it too. Underneath: context used against the model's window, subscription usage windows, cost (marked ≈ on a subscription, where it's an estimate) and the model. **↻** updates it now.
-- **Changes and review.** The right column lists the project's uncommitted changes (git's working tree against HEAD, new files included) with A/M/D/R, paths and line counts; a dot marks files the current thread edited. Click a file, or **Review**, to see every diff stacked (unified or side by side), scrolled to that file. Under each file's header is a short summary of what changed and why, written by Haiku on the thread's account with your recent requests as context; summaries are cached until the file changes again. The list refreshes as the agent works.
+- **Overview and usage**, like the pi session sidebar, in its own pane on the right that appears only when there's something to show (an overview or uncommitted changes). It shows the thread's **Goal**, **Now**, **Next** and **Tasks** (recent done ones struck through), rewritten by Haiku on the thread's account after each turn and every minute during long ones, from the newest part of the conversation. Claude's own task list (TodoWrite) feeds into it. The thread's title in the sidebar comes from it too. Underneath: context used against the model's window, subscription usage windows, cost (marked ≈ on a subscription, where it's an estimate) and the model. **↻** updates it now.
+- **Changes and review.** Under the overview, the project's uncommitted changes (git's working tree against HEAD, new files included) with A/M/D/R, paths and line counts; a dot marks files the current thread edited. Click a file, or **Review**, to open the review tab: every diff stacked (unified or side by side), scrolled to that file. Under each file's header is a short summary of what changed and why, written by Haiku on the thread's account with your recent requests as context; summaries are cached until the file changes again. The list refreshes as the agent works.
 - **Omarchy theme, live.** TJ takes its colours from the active Omarchy theme (`~/.local/state/omarchy/current/theme/colors.toml`, resolved with the same cascade as Bubo and Rustle, so legacy themes work too) and follows theme switches within two seconds. Light themes get a readable "ink" for text, as in Bubo. The terminal follows the theme's `alacritty.toml`, like your other terminals, so a light theme that pins its terminals dark stays dark there.
 - **Transparent sidebar**, as an app setting like the rest of the app family: ⚙ in the sidebar header has **Transparent sidebar** (off by default) and an **Opacity** slider (0.8 by default), plus **Follow Omarchy theme**. Settings are saved in `~/.config/tj/settings.toml`.
+- **Panes and tabs**, like Vmux. The main area is the project's panes, split right or down, and every pane has its own tabs. A tab is a **conversation**, a **terminal** or the **review**, so you can put a thread beside a shell, or two threads side by side. Picking a thread in the sidebar focuses its tab, or opens it in the focused pane. A new project starts with its conversation and a terminal. Closing a tab goes back to the one used before; closing a pane's last tab folds its split; a shell that exits closes its tab. The layout, each terminal's directory and which threads are open are saved per project. Vmux's shortcuts work anywhere in the main area:
+
+  | Keys | Action |
+  |---|---|
+  | `Ctrl+Shift+T` / `Ctrl+Shift+W` | New terminal tab / close tab |
+  | `Ctrl+Shift+E` / `Ctrl+Shift+O` | Split right / down |
+  | `Ctrl+Alt+←/→/↑/↓` | Focus the pane in that direction |
+  | `Ctrl+Shift+A` | Focus the next pane |
+  | `Ctrl+Shift+=` / `Ctrl+Shift+-` | Grow / shrink the pane |
+  | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |
 - **GNOME-style window**: no title bar; drag either header to move it, double-click to maximize.
 - **Streaming replies** in markdown, with tool calls shown as cards you can expand to see their output.
 - **Approval cards** when Claude wants to do something risky: **Approve**, **Approve for session**, **Decline** (with optional feedback that's passed to Claude) or **Cancel turn**.
@@ -20,7 +30,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **Usage and cost**: subscription usage windows (for example "7d 4%"), plus the cost of each turn and the whole thread.
 - **Stop** interrupts a running turn. If `claude` exits, the next message resumes the conversation.
 
-Terminal splits and tabs are next; see [ROADMAP.md](ROADMAP.md).
+Next ideas are in [ROADMAP.md](ROADMAP.md); see [ROADMAP.md](ROADMAP.md).
 
 ## Run
 
