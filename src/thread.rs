@@ -11,6 +11,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    menu::{DropdownMenu as _, PopupMenuItem},
     message_scroller::{MessageScroller, MessageScrollerState},
     text::{TextView, TextViewState},
 };
@@ -34,6 +35,36 @@ const HANDOFF_MAX_CHARS: usize = 30_000;
 pub struct ThreadChanged;
 
 impl EventEmitter<ThreadChanged> for ThreadView {}
+
+/// Something the composer's menus ask the workspace to do.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ThreadAction {
+    SwitchAccount(String),
+    /// Make the thread's account the default for new threads in its project.
+    MakeAccountDefault,
+    /// Make the thread's mode the default for new threads in its project.
+    MakeModeDefault,
+    /// Start `claude auth login` for the thread's account in a terminal.
+    LogIn,
+}
+
+impl EventEmitter<ThreadAction> for ThreadView {}
+
+/// What the composer's menus offer, provided by the workspace.
+#[derive(Clone, Default)]
+pub struct MenuContext {
+    /// (id, name) of every account.
+    pub accounts: Vec<(String, String)>,
+    pub project_name: String,
+    pub project_account: String,
+    pub project_mode: PermissionMode,
+    /// The project folder for display (`~/Projects/TJ`), and its git branch.
+    pub project_dir: String,
+    pub branch: Option<String>,
+}
+
+/// The widest the conversation and composer get, so lines stay readable in a wide window.
+const MAX_CONVERSATION_WIDTH: f32 = 860.0;
 
 /// Who the thread is and where it keeps its transcript.
 #[derive(Clone, Default)]
@@ -126,6 +157,8 @@ pub struct ThreadView {
     /// Tokens in the latest request, and the model's context window.
     pub context_tokens: Option<u64>,
     pub context_window: Option<u64>,
+    /// What the account and mode menus offer.
+    pub menus: MenuContext,
     scroller: Entity<MessageScrollerState>,
     prompt: Entity<TextareaState>,
     backend: Option<Backend>,
@@ -190,6 +223,7 @@ impl ThreadView {
             _overview_tick: None,
             context_tokens: None,
             context_window: None,
+            menus: MenuContext::default(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             prompt,
             backend: Some(backend),
@@ -311,6 +345,11 @@ impl ThreadView {
             self.plain.iter().rev().filter_map(|line| line.strip_prefix("User: ")).take(n).map(str::to_owned).collect();
         requests.reverse();
         requests
+    }
+
+    /// A thread that hasn't started yet shows the intro instead of an empty conversation.
+    pub fn is_fresh(&self) -> bool {
+        self.rows.is_empty()
     }
 
     #[cfg(test)]
@@ -960,37 +999,215 @@ impl ThreadView {
 
 impl Render for ThreadView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_view(cx)
+    }
+}
+
+impl ThreadView {
+    fn render_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let (bg, border) = (theme.background, theme.border);
+        let (bg, border, muted) = (theme.background, theme.border, theme.muted_foreground);
         let this = cx.entity();
         let running = self.status != Status::Idle;
 
         let transcript = MessageScroller::new("transcript", self.scroller.clone(), move |ix, window, cx| {
             this.update(cx, |thread, cx| {
-                if ix < thread.rows.len() { thread.render_row(ix, window, cx) } else { div().into_any_element() }
+                let row =
+                    if ix < thread.rows.len() { thread.render_row(ix, window, cx) } else { div().into_any_element() };
+                // Rows stay centred and no wider than a comfortable reading width.
+                h_flex().w_full().justify_center().child(div().w_full().max_w(px(MAX_CONVERSATION_WIDTH)).child(row))
             })
         })
         .scrollbar(true)
         .jump_button(true)
         .with_bottom_fade(bg);
 
-        v_flex().size_full().bg(bg).child(div().flex_1().min_h_0().child(transcript)).child(
+        let menus = self.menus.clone();
+        let (account_id, account_name, mode) = (self.account_id.clone(), self.account_name.clone(), self.mode);
+        let thread = cx.entity();
+
+        let account_menu = Button::new("account-menu")
+            .ghost()
+            .xsmall()
+            .label(format!("Claude · {account_name}"))
+            .icon(gpui_kit::assets::IconName::ChevronDown)
+            .dropdown_menu({
+                let (menus, thread, account_id, account_name) =
+                    (menus.clone(), thread.clone(), account_id.clone(), account_name.clone());
+                move |menu, _window, _cx| {
+                    let mut menu = menu.label("Account");
+                    for (id, name) in &menus.accounts {
+                        let (thread, id) = (thread.clone(), id.clone());
+                        menu = menu.item(PopupMenuItem::new(name.clone()).checked(id == account_id).on_click(
+                            move |_, _, cx| thread.update(cx, |_, cx| cx.emit(ThreadAction::SwitchAccount(id.clone()))),
+                        ));
+                    }
+                    let (t1, t2) = (thread.clone(), thread.clone());
+                    menu.separator()
+                        .item(
+                            PopupMenuItem::new(format!("Use {account_name} for new threads in {}", menus.project_name))
+                                .checked(account_id == menus.project_account)
+                                .on_click(move |_, _, cx| {
+                                    t1.update(cx, |_, cx| cx.emit(ThreadAction::MakeAccountDefault))
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(format!("Log in to {account_name}…"))
+                                .on_click(move |_, _, cx| t2.update(cx, |_, cx| cx.emit(ThreadAction::LogIn))),
+                        )
+                }
+            });
+
+        let mode_menu = Button::new("mode-menu")
+            .ghost()
+            .xsmall()
+            .label(mode.label())
+            .icon(gpui_kit::assets::IconName::ChevronDown)
+            .dropdown_menu({
+                let (menus, thread) = (menus.clone(), thread.clone());
+                move |menu, _window, _cx| {
+                    let mut menu = menu.label("Permission mode");
+                    for m in PermissionMode::ALL {
+                        let thread = thread.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(m.label())
+                                .checked(m == mode)
+                                .on_click(move |_, _, cx| thread.update(cx, |t, cx| t.set_mode(m, cx))),
+                        );
+                    }
+                    let thread = thread.clone();
+                    menu.separator().item(
+                        PopupMenuItem::new(format!("Make {} the default for {}", mode.label(), menus.project_name))
+                            .checked(mode == menus.project_mode)
+                            .on_click(move |_, _, cx| {
+                                thread.update(cx, |_, cx| cx.emit(ThreadAction::MakeModeDefault))
+                            }),
+                    )
+                }
+            });
+
+        let send = if running {
+            Button::new("stop").small().label("Stop").on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
+        } else {
+            Button::new("send")
+                .primary()
+                .small()
+                .label("Send")
+                .disabled(self.agent.is_none() && self.backend.is_none())
+                .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+        };
+
+        if self.is_fresh() {
+            return self.render_intro(account_menu, mode_menu, cx).into_any_element();
+        }
+
+        v_flex()
+            .size_full()
+            .bg(bg)
+            .child(div().flex_1().min_h_0().child(transcript))
+            .child(
+                h_flex().w_full().justify_center().border_t_1().border_color(border).child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(MAX_CONVERSATION_WIDTH))
+                        .gap_1()
+                        .px_3()
+                        .pt_3()
+                        .pb_2()
+                        .child(Textarea::new(&self.prompt))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .text_color(muted)
+                                .child(account_menu)
+                                .child(mode_menu)
+                                .child(div().flex_1())
+                                .child(send),
+                        ),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// Before the first message: a heading, a large prompt card, and where the session will run.
+    /// Like T3 Code's new-session screen.
+    fn render_intro(
+        &self,
+        account_menu: impl IntoElement,
+        mode_menu: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let (bg, border, muted, fg, card) =
+            (theme.background, theme.border, theme.muted_foreground, theme.foreground, theme.secondary);
+        let (accent, accent_fg) = (theme.primary, theme.primary_foreground);
+        let project = if self.menus.project_name.is_empty() {
+            "this project".to_string()
+        } else {
+            self.menus.project_name.clone()
+        };
+        let can_send = self.agent.is_some() || self.backend.is_some();
+        let send = div()
+            .id("intro-send")
+            .flex_none()
+            .size_8()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(if can_send { accent } else { muted })
+            .text_color(accent_fg)
+            .cursor_pointer()
+            .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::ArrowUp).small())
+            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)));
+        let footnote = |icon: gpui_kit::assets::IconName, text: String| {
             h_flex()
-                .items_end()
+                .gap_1()
+                .text_xs()
+                .text_color(muted)
+                .child(gpui_kit::component::Icon::new(icon).xsmall())
+                .child(text)
+        };
+
+        // A little above centre, like T3 Code's start screen.
+        v_flex().size_full().bg(bg).items_center().justify_center().px_6().pb(px(140.)).child(
+            v_flex()
+                .w_full()
+                .max_w(px(MAX_CONVERSATION_WIDTH - 80.0))
                 .gap_2()
-                .p_3()
-                .border_t_1()
-                .border_color(border)
-                .child(div().flex_1().child(Textarea::new(&self.prompt)))
-                .child(if running {
-                    Button::new("stop").label("Stop").on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
-                } else {
-                    Button::new("send")
-                        .primary()
-                        .label("Send")
-                        .disabled(self.agent.is_none() && self.backend.is_none())
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
-                }),
+                .child(
+                    div()
+                        .w_full()
+                        .pb_4()
+                        .flex()
+                        .justify_center()
+                        .text_3xl()
+                        .text_color(fg)
+                        .child(format!("What should we build in {project}?")),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .p_3()
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(border)
+                        .bg(card)
+                        .child(div().min_h(px(64.)).child(Textarea::new(&self.prompt).appearance(false)))
+                        .child(h_flex().gap_1().child(account_menu).child(mode_menu).child(div().flex_1()).child(send)),
+                )
+                .child(
+                    h_flex()
+                        .px_2()
+                        .gap_4()
+                        .child(footnote(gpui_kit::assets::IconName::Folder, self.menus.project_dir.clone()))
+                        .child(div().flex_1())
+                        .when_some(self.menus.branch.clone(), |el, branch| {
+                            el.child(footnote(gpui_kit::assets::IconName::GitBranch, branch))
+                        })
+                        .child(footnote(gpui_kit::assets::IconName::Shield, self.mode.label().to_string())),
+                ),
         )
     }
 }

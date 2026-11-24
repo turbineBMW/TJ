@@ -6,21 +6,22 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
-    ActiveTheme as _, Selectable as _, Sizable as _,
+    ActiveTheme as _, Sizable as _,
     button::{Button, ButtonVariants as _},
-    menu::{DropdownMenu as _, PopupMenuItem},
     popover::Popover,
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     switch::Switch,
 };
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
-use crate::agent::{AgentEvent, PermissionMode, claude::SessionOptions};
+use crate::agent::{AgentEvent, claude::SessionOptions};
 use crate::changes::{ChangeKind, ProjectChanges, ReviewView, Summarizer};
 use crate::panes::{PaneEvent, Panes, Start};
 use crate::settings::Settings;
+use crate::store::SplitDirection;
 use crate::store::{self, Accounts, Paths, State};
-use crate::thread::{self, Backend, Status, ThreadChanged, ThreadSetup, ThreadView};
+use crate::thread::{self, Backend, MenuContext, Status, ThreadAction, ThreadChanged, ThreadSetup, ThreadView};
+use gpui_kit::assets::IconName;
 
 const SIDEBAR_WIDTH: f32 = 264.0;
 const HEADER_HEIGHT: f32 = 46.0;
@@ -209,9 +210,46 @@ impl Workspace {
                 }
                 cx.notify();
             }));
+            let id = thread_id.to_string();
+            self._subscriptions.push(cx.subscribe_in(
+                &thread,
+                window,
+                move |this, _, action: &ThreadAction, window, cx| {
+                    // The thread whose menu was used becomes the one the actions apply to.
+                    this.active = Some(id.clone());
+                    match action {
+                        ThreadAction::SwitchAccount(account) => this.switch_account(account, cx),
+                        ThreadAction::MakeAccountDefault => this.make_project_default_account(cx),
+                        ThreadAction::MakeModeDefault => this.make_project_default_mode(cx),
+                        ThreadAction::LogIn => this.log_in(window, cx),
+                    }
+                },
+            ));
             self.threads.insert(thread_id.to_string(), thread);
+            self.refresh_menus(cx);
         }
         self.threads.get(thread_id).cloned()
+    }
+
+    /// Tell every open thread what its account and mode menus offer (accounts, project defaults).
+    fn refresh_menus(&mut self, cx: &mut Context<Self>) {
+        let accounts: Vec<(String, String)> =
+            self.accounts.accounts.iter().map(|a| (a.id.clone(), a.name.clone())).collect();
+        for (id, thread) in &self.threads {
+            let Some((project, _)) = self.state.thread(id) else { continue };
+            let menus = MenuContext {
+                accounts: accounts.clone(),
+                project_name: project.name.clone(),
+                project_account: self.accounts.resolve(None, project.account.as_deref()).id.clone(),
+                project_mode: project.mode.unwrap_or_default(),
+                project_dir: display_path(&project.path, &self.home),
+                branch: git_branch(&project.path),
+            };
+            thread.update(cx, |t, cx| {
+                t.menus = menus;
+                cx.notify();
+            });
+        }
     }
 
     /// Show a conversation in its project's panes (focusing its tab, or opening one).
@@ -295,6 +333,7 @@ impl Workspace {
         if let Some(id) = self.active.clone() {
             self.sync_thread(&id, cx);
         }
+        self.refresh_menus(cx);
         cx.notify();
     }
 
@@ -308,6 +347,7 @@ impl Workspace {
         if let Some(id) = self.active.clone() {
             self.sync_thread(&id, cx);
         }
+        self.refresh_menus(cx);
         cx.notify();
     }
 
@@ -360,7 +400,7 @@ impl Workspace {
         let theme_name = crate::omarchy::theme_name(&self.home);
         Popover::new("settings")
             .anchor(Anchor::TopLeft)
-            .trigger(Button::new("settings-button").ghost().small().label("⚙").tooltip("Settings"))
+            .trigger(Button::new("settings-button").ghost().small().icon(IconName::Settings).tooltip("Settings"))
             .content(move |_, _window, cx| {
                 let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
                 let muted = cx.theme().muted_foreground;
@@ -475,7 +515,7 @@ impl Workspace {
         let thread = self.active_thread()?;
         let t = thread.read(cx);
         let theme = cx.theme();
-        let (muted, border, accent, fg) = (theme.muted_foreground, theme.border, theme.primary, theme.foreground);
+        let (muted, accent, fg) = (theme.muted_foreground, theme.primary, theme.foreground);
         let ov = &t.overview;
         if ov.is_empty() {
             return None;
@@ -487,32 +527,6 @@ impl Workspace {
                 v_flex().gap_0p5().child(label(name)).child(div().text_sm().text_color(color).child(value))
             })
         };
-
-        let mut stats = Vec::new();
-        if let (Some(tokens), Some(window)) = (t.context_tokens, t.context_window) {
-            let percent = tokens as f64 / window.max(1) as f64 * 100.0;
-            stats.push(format!("ctx {} / {} · {percent:.0}%", compact(tokens), compact(window)));
-        }
-        for window in &t.usage {
-            let name = match window.id.as_str() {
-                "five_hour" => "5h",
-                "seven_day" => "7d",
-                other => other,
-            };
-            stats.push(format!("{name} {:.0}%", window.utilization * 100.0));
-        }
-        if t.cost_usd > 0.0 {
-            // On a subscription this is Claude's estimate, not a charge.
-            let approx = if t.usage.is_empty() { "" } else { "≈" };
-            stats.push(if t.cost_usd < 1.0 {
-                format!("{approx}${:.3}", t.cost_usd)
-            } else {
-                format!("{approx}${:.2}", t.cost_usd)
-            });
-        }
-        if let Some(model) = &t.model {
-            stats.push(thread::short_model(model));
-        }
 
         let body = if ov.is_empty() {
             div()
@@ -568,14 +582,12 @@ impl Workspace {
         Some(
             v_flex()
                 .id("overview")
-                .flex_none()
-                .max_h(relative(0.5))
+                .flex_1()
+                .min_h_0()
                 .overflow_y_scroll()
                 .gap_2()
                 .px_3()
                 .py_2()
-                .border_b_1()
-                .border_color(border)
                 .child(
                     h_flex()
                         .gap_2()
@@ -604,9 +616,56 @@ impl Workspace {
                         ),
                 )
                 .child(body)
-                .when(!stats.is_empty(), |el| {
-                    el.child(div().pt_1().text_xs().text_color(muted).child(stats.join("  ·  ")))
-                })
+                .into_any_element(),
+        )
+    }
+
+    /// The agent's numbers, pinned to the bottom of the overview pane: context, usage windows,
+    /// cost and model.
+    fn metrics(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.active_thread()?;
+        let t = thread.read(cx);
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.border);
+        let mut stats = Vec::new();
+        if let (Some(tokens), Some(window)) = (t.context_tokens, t.context_window) {
+            let percent = tokens as f64 / window.max(1) as f64 * 100.0;
+            stats.push(format!("ctx {} / {} · {percent:.0}%", compact(tokens), compact(window)));
+        }
+        for window in &t.usage {
+            let name = match window.id.as_str() {
+                "five_hour" => "5h",
+                "seven_day" => "7d",
+                other => other,
+            };
+            stats.push(format!("{name} {:.0}%", window.utilization * 100.0));
+        }
+        if t.cost_usd > 0.0 {
+            // On a subscription this is Claude's estimate, not a charge.
+            let approx = if t.usage.is_empty() { "" } else { "≈" };
+            stats.push(if t.cost_usd < 1.0 {
+                format!("{approx}${:.3}", t.cost_usd)
+            } else {
+                format!("{approx}${:.2}", t.cost_usd)
+            });
+        }
+        if let Some(model) = &t.model {
+            stats.push(thread::short_model(model));
+        }
+
+        if stats.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .flex_none()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(border)
+                .text_xs()
+                .text_color(muted)
+                .child(stats.join("  ·  "))
                 .into_any_element(),
         )
     }
@@ -670,8 +729,8 @@ impl Workspace {
         Some(
             v_flex()
                 .flex_none()
-                .max_h(relative(0.45))
-                .border_b_1()
+                .max_h(relative(0.4))
+                .border_t_1()
                 .border_color(border)
                 .child(
                     h_flex()
@@ -733,7 +792,7 @@ impl Workspace {
                 project.layout.as_ref(),
                 &threads,
                 review,
-                Start { thread: start, terminal: true },
+                Start { thread: start, terminal: false },
                 shell,
                 window,
                 cx,
@@ -866,71 +925,65 @@ impl Workspace {
             .border_r_1()
             .border_color(theme.sidebar_border)
             .child(
-                h_flex()
+                // "TJ" sits in the middle of the header; the controls and drag areas lie over it.
+                div()
+                    .relative()
                     .h(px(HEADER_HEIGHT))
                     .flex_none()
-                    .px_4()
-                    .gap_2()
-                    .child(div().font_weight(FontWeight::BOLD).text_color(fg).child("TJ"))
-                    .child(drag_area())
-                    .child(settings)
                     .child(
-                        Button::new("add-project")
-                            .ghost()
-                            .small()
-                            .label("+")
-                            .tooltip("Add project")
-                            .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
+                        h_flex()
+                            .absolute()
+                            .inset_0()
+                            .justify_center()
+                            .child(div().font_weight(FontWeight::BOLD).text_color(fg).child("TJ")),
+                    )
+                    .child(
+                        h_flex()
+                            .absolute()
+                            .inset_0()
+                            .px_2()
+                            .gap_1()
+                            .child(
+                                Button::new("add-project")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::FolderPlus)
+                                    .tooltip("Add project")
+                                    .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
+                            )
+                            .child(drag_area())
+                            .child(settings),
                     ),
             )
             .child(div().id("projects").flex_1().min_h_0().overflow_y_scroll().children(projects))
     }
 
+    /// The top bar: `[badge] Project / Thread title`, like T3 Code, then the pane actions.
     fn content_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, warning) = (theme.border, theme.warning);
-        let Some(thread) = self.active_thread() else {
-            return h_flex().h(px(HEADER_HEIGHT)).flex_none().border_b_1().border_color(border).child(drag_area());
+        let (border, warning, muted, accent, fg) =
+            (theme.border, theme.warning, theme.muted_foreground, theme.primary, theme.foreground);
+        let accent_fg = theme.primary_foreground;
+        let thread = self.active_thread().map(|t| t.read(cx));
+        let title = thread.and_then(|t| t.title.clone()).unwrap_or_else(|| "New thread".into());
+        let status = match thread.map(|t| t.status) {
+            Some(Status::Running) => "Working…",
+            Some(Status::AwaitingApproval) => "Waiting for you",
+            _ => "",
         };
-        let t = thread.read(cx);
-        let (mode, account_id, account_name) = (t.mode, t.account_id.clone(), t.account_name.clone());
-        let title = t.title.clone().unwrap_or_else(|| "New thread".into());
-        let status = match t.status {
-            Status::Idle => "",
-            Status::Running => "Working…",
-            Status::AwaitingApproval => "Waiting for you",
-        };
-        let project = self.active_project();
-        let project_name = project.map(|p| p.name.clone()).unwrap_or_default();
-        let project_account = self.accounts.resolve(None, project.and_then(|p| p.account.as_deref())).id.clone();
-        let project_mode = project.and_then(|p| p.mode).unwrap_or_default();
-        let accounts = self.accounts.accounts.clone();
-        let this = cx.entity();
+        let project_name = self.active_project().map(|p| p.name.clone());
+        let has_panes = self.active_project().is_some_and(|p| self.panes.contains_key(&p.id));
 
-        let account_menu = Button::new("account").small().outline().label(format!("{account_name} ▾")).dropdown_menu(
-            move |menu, _window, _cx| {
-                let mut menu = menu;
-                for account in &accounts {
-                    let (this, id) = (this.clone(), account.id.clone());
-                    menu = menu.item(
-                        PopupMenuItem::new(account.name.clone())
-                            .checked(account.id == account_id)
-                            .on_click(move |_, _, cx| this.update(cx, |w, cx| w.switch_account(&id, cx))),
-                    );
+        let pane_button = |id: &'static str, icon: IconName, tip: &'static str| {
+            Button::new(id).ghost().small().icon(icon).tooltip(tip)
+        };
+        let with_panes = |f: fn(&mut Panes, &mut Window, &mut Context<Panes>)| {
+            cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
+                if let Some(panes) = this.active_project().and_then(|p| this.panes.get(&p.id)).cloned() {
+                    panes.update(cx, |p, cx| f(p, window, cx));
                 }
-                let (this2, this3) = (this.clone(), this.clone());
-                menu.separator()
-                    .item(
-                        PopupMenuItem::new(format!("Use {account_name} for new threads in {project_name}"))
-                            .checked(account_id == project_account)
-                            .on_click(move |_, _, cx| this2.update(cx, |w, cx| w.make_project_default_account(cx))),
-                    )
-                    .item(
-                        PopupMenuItem::new(format!("Log in to {account_name}…"))
-                            .on_click(move |_, window, cx| this3.update(cx, |w, cx| w.log_in(window, cx))),
-                    )
-            },
-        );
+            })
+        };
 
         h_flex()
             .h(px(HEADER_HEIGHT))
@@ -939,49 +992,57 @@ impl Workspace {
             .px_3()
             .border_b_1()
             .border_color(border)
+            .when_some(project_name, |el, name| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .size_5()
+                        .rounded_sm()
+                        .bg(accent)
+                        .text_color(accent_fg)
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(initials(&name)),
+                )
+                .child(div().flex_none().text_sm().text_color(muted).child(name))
+                .child(div().flex_none().text_sm().text_color(muted).child("/"))
+            })
             .child(
                 div()
-                    .max_w(px(320.))
+                    .min_w_0()
+                    .max_w(px(420.))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_sm()
+                    .text_color(fg)
                     .child(title),
             )
-            .child(account_menu)
-            .child(h_flex().gap_0p5().children(PermissionMode::ALL.map(|m| {
-                Button::new(SharedString::from(format!("mode-{}", m.claude_name())))
-                    .xsmall()
-                    .ghost()
-                    .selected(m == mode)
-                    .label(m.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(thread) = this.active_thread() {
-                            thread.update(cx, |t, cx| t.set_mode(m, cx));
-                        }
-                        if let Some(id) = this.active.clone() {
-                            this.sync_thread(&id, cx);
-                        }
-                    }))
-            })))
-            .when(mode != project_mode, |el| {
-                el.child(
-                    Button::new("mode-default")
-                        .xsmall()
-                        .ghost()
-                        .label("Make default")
-                        .tooltip("Use this mode for new threads in this project")
-                        .on_click(cx.listener(|this, _, _, cx| this.make_project_default_mode(cx))),
-                )
-            })
             .child(drag_area())
             .child(div().text_sm().text_color(warning).child(status))
-            .child(Button::new("close-window").xsmall().ghost().label("✕").tooltip("Close").on_click(cx.listener(
-                |this, _, window, cx| {
+            .when(has_panes, |el| {
+                el.child(
+                    pane_button("header-new-terminal", IconName::SquareTerminal, "New terminal tab (Ctrl+Shift+T)")
+                        .on_click(with_panes(|p, window, cx| p.new_terminal(window, cx))),
+                )
+                .child(
+                    pane_button("header-split-right", IconName::Columns2, "Split right (Ctrl+Shift+E)")
+                        .on_click(with_panes(|p, window, cx| p.split(SplitDirection::Right, window, cx))),
+                )
+                .child(
+                    pane_button("header-split-down", IconName::Rows2, "Split down (Ctrl+Shift+O)")
+                        .on_click(with_panes(|p, window, cx| p.split(SplitDirection::Down, window, cx))),
+                )
+            })
+            .child(Button::new("close-window").ghost().small().icon(IconName::X).tooltip("Close").on_click(
+                cx.listener(|this, _, window, cx| {
                     this.save_layouts(cx);
                     window.remove_window();
-                },
-            )))
+                }),
+            ))
     }
 }
 
@@ -994,6 +1055,52 @@ fn drag_area() -> impl IntoElement {
             window.start_window_move();
         }
     })
+}
+
+/// `/home/me/Projects/TJ` -> `~/Projects/TJ`.
+fn display_path(path: &std::path::Path, home: &std::path::Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// The checked-out branch, read from `.git/HEAD` (a worktree's `.git` file points at its own
+/// HEAD). A detached HEAD shows its short commit; outside git, `None`.
+fn git_branch(project: &std::path::Path) -> Option<String> {
+    let dot_git = project.join(".git");
+    let head_file = if dot_git.is_file() {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let dir = pointer.trim().strip_prefix("gitdir:")?.trim();
+        let dir = std::path::Path::new(dir);
+        let dir = if dir.is_absolute() { dir.to_path_buf() } else { project.join(dir) };
+        dir.join("HEAD")
+    } else {
+        dot_git.join("HEAD")
+    };
+    let head = std::fs::read_to_string(head_file).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: refs/heads/") {
+        Some(branch) => Some(branch.to_string()),
+        None => (head.len() >= 7).then(|| head[..7].to_string()),
+    }
+}
+
+/// "SeaBreeze" -> "SB", "my project" -> "MP", "tj" -> "TJ".
+fn initials(name: &str) -> String {
+    let words: Vec<&str> = name.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let letters: String = match words.as_slice() {
+        [one] => {
+            // Within one word, take its first letter and its next capital ("SeaBreeze" -> "SB").
+            let mut chars = one.chars();
+            let first = chars.next().into_iter();
+            let capital = chars.find(|c| c.is_uppercase());
+            first.chain(capital.or_else(|| one.chars().nth(1))).collect()
+        }
+        many => many.iter().take(2).filter_map(|w| w.chars().next()).collect(),
+    };
+    letters.to_uppercase()
 }
 
 /// 12_345 -> "12k", 1_000_000 -> "1M".
@@ -1014,10 +1121,13 @@ impl Render for Workspace {
         let panes = self.active_project().and_then(|p| self.panes.get(&p.id)).cloned();
         let overview_panel = self.overview_panel(cx);
         let changes_list = self.changes_list(cx);
+        let metrics = self.metrics(cx);
         let theme = cx.theme();
         let (bg, fg, border, danger) = (theme.background, theme.foreground, theme.border, theme.danger);
-        // The overview pane only appears when it has something to show.
-        let right_pane = overview_panel.is_some() || changes_list.is_some();
+        // The overview pane only appears when it has something to show, and stays out of the
+        // way while the active thread is still on its intro.
+        let fresh = self.active_thread().is_some_and(|t| t.read(cx).is_fresh());
+        let right_pane = !fresh && (overview_panel.is_some() || changes_list.is_some());
 
         // The window itself is transparent: only the content area paints an opaque background,
         // so the sidebar can be see-through.
@@ -1035,16 +1145,17 @@ impl Render for Workspace {
                     right_pane,
                     |el| {
                         el.child(
+                            // Summary and tasks take the space; changed files sit above the agent's
+                            // numbers, which are pinned to the bottom.
                             v_flex()
-                                .id("overview-pane")
                                 .w(px(OVERVIEW_WIDTH))
                                 .flex_none()
                                 .h_full()
-                                .overflow_y_scroll()
                                 .border_l_1()
                                 .border_color(border)
-                                .children(overview_panel)
-                                .children(changes_list),
+                                .child(v_flex().flex_1().min_h_0().children(overview_panel))
+                                .children(changes_list)
+                                .children(metrics),
                         )
                     },
                 )),
@@ -1141,6 +1252,14 @@ mod tests {
         }
         assert_eq!(changes.read_with(cx, |c, _| c.changes.files[0].path.clone()), "notes.md");
 
+        // While the thread is on its intro, the overview pane (and its file list) stays hidden.
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from("change-0")).is_none());
+        });
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        thread.update(cx, |t, cx| t.handle(crate::agent::AgentEvent::TextDelta("Started.".into()), cx));
+
         cx.update(|window, cx| {
             window.render_frame(cx);
             window.click(SharedString::from("change-0"), cx);
@@ -1175,6 +1294,88 @@ mod tests {
         assert!(settings.transparent_sidebar);
         assert_eq!(settings.sidebar_alpha(), 0.8);
         assert_eq!(crate::settings::Settings::load(&paths), settings, "the change was saved");
+    }
+
+    #[gpui_kit::test]
+    fn composer_menu_actions_switch_the_account_and_set_project_defaults(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        // The test machine may have one account; add a second so there's something to switch to.
+        workspace.update(cx, |w, cx| {
+            w.accounts.accounts.push(crate::store::Account {
+                id: "work".into(),
+                name: "Work".into(),
+                config_dir: Some("/tmp/tj-work".into()),
+            });
+            w.refresh_menus(cx);
+        });
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        assert!(thread.read_with(cx, |t, _| t.menus.accounts.iter().any(|(id, _)| id == "work")));
+
+        thread.update(cx, |_, cx| cx.emit(crate::thread::ThreadAction::SwitchAccount("work".into())));
+        cx.run_until_parked();
+        assert_eq!(thread.read_with(cx, |t, _| t.account_id.clone()), "work");
+
+        thread.update(cx, |t, cx| t.set_mode(crate::agent::PermissionMode::AcceptEdits, cx));
+        thread.update(cx, |_, cx| cx.emit(crate::thread::ThreadAction::MakeModeDefault));
+        thread.update(cx, |_, cx| cx.emit(crate::thread::ThreadAction::MakeAccountDefault));
+        cx.run_until_parked();
+        let saved = State::load(&paths).unwrap();
+        assert_eq!(saved.projects[0].mode, Some(crate::agent::PermissionMode::AcceptEdits));
+        assert_eq!(saved.projects[0].account.as_deref(), Some("work"));
+        let menus = thread.read_with(cx, |t, _| t.menus.clone());
+        assert_eq!(menus.project_account, "work", "the menus learn the new defaults");
+        assert_eq!(menus.project_mode, crate::agent::PermissionMode::AcceptEdits);
+    }
+
+    #[gpui_kit::test]
+    fn the_top_bar_splits_the_focused_pane_and_tabs_appear_only_when_needed(cx: &mut TestAppContext) {
+        let (window, workspace, _, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![1], "a new project starts with just its conversation");
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from("tab-1-0")).is_none(), "no tab strip for a single tab");
+            window.click(SharedString::from("header-new-terminal"), cx);
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from("tab-1-1")).is_some(), "a second tab shows the strip");
+            window.click(SharedString::from("header-split-right"), cx);
+        });
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2, 1]);
+    }
+
+    #[test]
+    fn branch_and_display_path() {
+        let root = std::env::temp_dir().join(format!("tj-branch-{}", new_id()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/feat/intro\n").unwrap();
+        assert_eq!(super::git_branch(&root).as_deref(), Some("feat/intro"));
+        std::fs::write(root.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(super::git_branch(&root).as_deref(), Some("0123456"), "detached shows the short commit");
+
+        let worktree = root.join("wt");
+        std::fs::create_dir_all(root.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(root.join(".git/worktrees/wt/HEAD"), "ref: refs/heads/side\n").unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", root.join(".git/worktrees/wt").display()))
+            .unwrap();
+        assert_eq!(super::git_branch(&worktree).as_deref(), Some("side"));
+        assert_eq!(super::git_branch(&std::env::temp_dir().join("tj-no-git-here")), None);
+
+        let home = std::path::Path::new("/home/me");
+        assert_eq!(super::display_path(std::path::Path::new("/home/me/Projects/TJ"), home), "~/Projects/TJ");
+        assert_eq!(super::display_path(home, home), "~");
+        assert_eq!(super::display_path(std::path::Path::new("/srv/x"), home), "/srv/x");
+    }
+
+    #[test]
+    fn project_initials() {
+        assert_eq!(super::initials("SeaBreeze"), "SB");
+        assert_eq!(super::initials("my project"), "MP");
+        assert_eq!(super::initials("tj"), "TJ");
+        assert_eq!(super::initials("nautilus-omarchy"), "NO");
+        assert_eq!(super::initials("Vmux"), "VM");
     }
 
     #[gpui_kit::test]
