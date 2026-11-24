@@ -7,7 +7,7 @@ What's missing or rough, roughly in priority order. ROADMAP.md has the direction
 - [x] **Claude's questions and plans.** AskUserQuestion has its own card (pick options, multi-select, or type an answer); ExitPlanMode shows the plan with Start, accepting edits / Start, asking first / Keep planning.
 - [x] **Subagent activity.** The Agent tool's row shows what its (background) subagent is doing, its tool calls, counts and report.
 - [x] **Model picker.** Model and effort from a dropdown next to Send, listed by `claude` for the account, switchable mid-session, with project defaults.
-- [ ] **Attachments and `@file` mentions** in the prompt box.
+- [x] **Attachments and `@file` mentions** in the prompt box: an `@` file picker with chips, and images pasted, dropped or picked.
 - [ ] **Account-switch handoff** sends the raw transcript (up to 30k characters); a summary would be shorter and cheaper.
 - [ ] **Other agent backends** (Codex, pi) through the `AgentSession` interface.
 

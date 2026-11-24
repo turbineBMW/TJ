@@ -231,9 +231,23 @@ impl ModelChoice {
     }
 }
 
+/// An image sent with a prompt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptImage {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    pub data: std::sync::Arc<Vec<u8>>,
+}
+
 /// Commands from the UI to a running session.
 pub trait AgentSession {
-    fn send_prompt(&self, text: &str) -> anyhow::Result<()>;
+    /// The next user message: text, and images to go with it.
+    fn send_message(&self, text: &str, images: &[PromptImage]) -> anyhow::Result<()>;
+    /// Text only (the live tests use it).
+    #[cfg(test)]
+    fn send_prompt(&self, text: &str) -> anyhow::Result<()> {
+        self.send_message(text, &[])
+    }
     fn respond(&self, request: &PermissionRequest, decision: Decision) -> anyhow::Result<()>;
     fn interrupt(&self) -> anyhow::Result<()>;
     fn set_permission_mode(&self, mode: PermissionMode) -> anyhow::Result<()>;
@@ -252,7 +266,12 @@ pub struct ScriptedAgent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScriptedCall {
     Prompt(String),
-    Respond { request_id: String, decision: Decision },
+    /// The media types of images sent with the next prompt.
+    Images(Vec<String>),
+    Respond {
+        request_id: String,
+        decision: Decision,
+    },
     Interrupt,
     SetPermissionMode(PermissionMode),
     SetModel(Option<String>),
@@ -283,7 +302,10 @@ impl ScriptedAgent {
 }
 
 impl AgentSession for ScriptedAgent {
-    fn send_prompt(&self, text: &str) -> anyhow::Result<()> {
+    fn send_message(&self, text: &str, images: &[PromptImage]) -> anyhow::Result<()> {
+        if !images.is_empty() {
+            self.record(ScriptedCall::Images(images.iter().map(|i| i.media_type.clone()).collect()))?;
+        }
         self.record(ScriptedCall::Prompt(text.to_string()))
     }
     fn respond(&self, request: &PermissionRequest, decision: Decision) -> anyhow::Result<()> {

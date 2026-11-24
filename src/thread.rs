@@ -233,12 +233,25 @@ impl QuestionCard {
 // of rows at most, and boxing it would complicate every match on the cards.
 #[allow(clippy::large_enum_variant)]
 enum Row {
-    User(Entity<TextViewState>),
+    /// What the user sent, and the images that went with it.
+    User(Entity<TextViewState>, Vec<Arc<gpui_kit::Image>>),
     Assistant(Entity<TextViewState>),
     Tool(ToolRow),
     Approval(ApprovalRow),
     Notice(NoticeKind, SharedString),
     Footer(SharedString),
+}
+
+/// An image waiting in the prompt box for the next message.
+struct Attachment {
+    image: crate::agent::PromptImage,
+    preview: Arc<gpui_kit::Image>,
+}
+
+/// The `@file` picker, open while a mention is being typed.
+struct MentionPicker {
+    matches: Vec<String>,
+    selected: usize,
 }
 
 pub struct ThreadView {
@@ -274,6 +287,14 @@ pub struct ThreadView {
     pub effort: Option<String>,
     scroller: Entity<MessageScrollerState>,
     prompt: Entity<TextareaState>,
+    /// Where attached images are saved, next to the transcript (none for demos and tests).
+    files_dir: Option<PathBuf>,
+    /// Images that go with the next message.
+    attachments: Vec<Attachment>,
+    mention: Option<MentionPicker>,
+    /// The project's files, for the picker; listed again each time a mention starts.
+    project_files: Option<Arc<Vec<String>>>,
+    listing_files: bool,
     backend: Option<Backend>,
     agent: Option<Box<dyn AgentSession>>,
     _pump: Option<Task<()>>,
@@ -307,11 +328,11 @@ impl ThreadView {
                 .submit_on_enter(true)
                 .placeholder("Ask Claude…  (Enter sends, Shift+Enter adds a line)")
         });
-        cx.subscribe_in(&prompt, window, |this, _, event: &InputEvent, window, cx| {
+        cx.subscribe_in(&prompt, window, |this, _, event: &InputEvent, window, cx| match event {
             // Shift+Enter has already inserted a newline; only a plain or Ctrl+Enter sends.
-            if let InputEvent::PressEnter { shift: false, .. } = event {
-                this.submit(window, cx);
-            }
+            InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
+            InputEvent::Change => this.update_mention(cx),
+            _ => {}
         })
         .detach();
 
@@ -341,6 +362,11 @@ impl ThreadView {
             effort: setup.effort.clone(),
             scroller: cx.new(|cx| MessageScrollerState::new(0, cx)),
             prompt,
+            files_dir: setup.transcript.as_deref().map(crate::composer::files_dir),
+            attachments: Vec::new(),
+            mention: None,
+            project_files: None,
+            listing_files: false,
             backend: Some(backend),
             agent: None,
             _pump: None,
@@ -365,7 +391,10 @@ impl ThreadView {
         self.replaying = true;
         for record in records {
             match record {
-                Record::Prompt { text } => self.push_prompt_row(&text, cx),
+                Record::Prompt { text, images } => {
+                    let previews = images.iter().filter_map(|name| self.load_saved_image(name)).collect();
+                    self.push_prompt_row(&text, previews, cx)
+                }
                 Record::Event { event } => self.handle(event, cx),
                 Record::Decision { request_id, outcome } => {
                     if let Some(Row::Approval(row)) =
@@ -542,28 +571,36 @@ impl ThreadView {
 
     // ---------- commands ----------
 
-    /// Send what's in the prompt box.
+    /// Send what's in the prompt box, with any attached images.
     pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.prompt.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
+        let attachments = std::mem::take(&mut self.attachments);
+        self.mention = None;
         self.prompt.update(cx, |p, cx| p.set_value("", window, cx));
-        self.send(&text, cx);
+        self.send_with(&text, attachments, cx);
     }
 
     /// Send `text` as the next user message.
     pub fn send(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.push_prompt_row(text, cx);
-        self.write(Record::Prompt { text: text.to_string() });
+        self.send_with(text, Vec::new(), cx);
+    }
+
+    fn send_with(&mut self, text: &str, attachments: Vec<Attachment>, cx: &mut Context<Self>) {
+        let saved = self.save_images(&attachments);
+        let (images, previews): (Vec<_>, Vec<_>) = attachments.into_iter().map(|a| (a.image, a.preview)).unzip();
+        self.push_prompt_row(text, previews, cx);
+        self.write(Record::Prompt { text: text.to_string(), images: saved });
         if self.title.is_none() {
-            self.title = Some(title_from(text));
+            self.title = Some(if text.is_empty() { "Image".into() } else { title_from(text) });
         }
         let message = match &self.handoff {
             Some(context) => format!("{context}\n\n{text}"),
             None => text.to_string(),
         };
-        if let Err(err) = self.ensure_agent(cx).and_then(|agent| agent.send_prompt(&message)) {
+        if let Err(err) = self.ensure_agent(cx).and_then(|agent| agent.send_message(&message, &images)) {
             self.notice(NoticeKind::Error, format!("Could not send: {err:#}"), cx);
             cx.emit(ThreadChanged);
             return;
@@ -573,6 +610,391 @@ impl ThreadView {
         self.start_overview_ticker(cx);
         cx.emit(ThreadChanged);
         cx.notify();
+    }
+
+    // ---------- attachments and mentions ----------
+
+    /// Where the agent runs, which is where mentions are relative to.
+    fn project_dir(&self) -> PathBuf {
+        match &self.backend {
+            Some(Backend::Claude(options)) => options.cwd.clone(),
+            _ => default_cwd(),
+        }
+    }
+
+    /// Open, update or close the `@file` picker after the prompt text changed.
+    fn update_mention(&mut self, cx: &mut Context<Self>) {
+        // List the files as soon as anything is typed, so they're ready when an @ comes.
+        if self.project_files.is_none() && !self.listing_files {
+            self.list_project_files(cx);
+        }
+        let Some((_, query)) = self.mention_query(cx) else {
+            if self.mention.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        if self.mention.is_none() && !self.listing_files {
+            self.list_project_files(cx);
+        }
+        let matches = self
+            .project_files
+            .as_ref()
+            .map(|files| crate::composer::rank(files, &query, crate::composer::SHOWN))
+            .unwrap_or_default();
+        self.mention = Some(MentionPicker { matches, selected: 0 });
+        cx.notify();
+    }
+
+    /// The `@query` before the cursor, if one is being typed.
+    fn mention_query(&self, cx: &App) -> Option<(std::ops::Range<usize>, String)> {
+        let prompt = self.prompt.read(cx);
+        let tokens: Vec<_> = prompt.tokens().iter().map(|t| t.range()).collect();
+        crate::composer::query_at(&prompt.value(), prompt.cursor(), &tokens)
+    }
+
+    /// List the project's files in the background, then refresh the picker's matches.
+    fn list_project_files(&mut self, cx: &mut Context<Self>) {
+        let dir = self.project_dir();
+        self.listing_files = true;
+        cx.spawn(async move |this, cx| {
+            let files = cx.background_executor().spawn(async move { crate::composer::list_files(&dir) }).await;
+            let _ = this.update(cx, |this: &mut ThreadView, cx| {
+                this.listing_files = false;
+                this.project_files = Some(Arc::new(files));
+                if this.mention.is_some() {
+                    this.update_mention(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn move_mention(&mut self, by: isize, cx: &mut Context<Self>) -> bool {
+        let Some(picker) = &mut self.mention else { return false };
+        if picker.matches.is_empty() {
+            return false;
+        }
+        let len = picker.matches.len() as isize;
+        picker.selected = (picker.selected as isize + by).rem_euclid(len) as usize;
+        cx.notify();
+        true
+    }
+
+    /// Put the picked file in place of the `@query`. False when there was nothing to pick.
+    /// While the files are still being listed (the first mention), the key is held (true):
+    /// sending a half-typed mention would be the wrong guess.
+    fn accept_mention(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.mention.is_some() && self.project_files.is_none() {
+            return true;
+        }
+        let Some(path) = self.mention.as_ref().and_then(|p| p.matches.get(p.selected).cloned()) else {
+            return false;
+        };
+        let Some((range, _)) = self.mention_query(cx) else {
+            self.mention = None;
+            return false;
+        };
+        self.insert_mention(Some(range), &path, window, cx);
+        self.mention = None;
+        cx.notify();
+        true
+    }
+
+    /// Insert `@path` as one token (shown as a chip, deleted as one), then a space. Replaces
+    /// `range`, or the selection.
+    fn insert_mention(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = crate::composer::mention_text(path);
+        let token =
+            gpui_kit::component::input::InlineToken::new(path.to_string(), text.clone()).with_label(path.to_string());
+        self.prompt.update(cx, |prompt, cx| {
+            let placed = match range {
+                Some(range) => prompt.replace_range_with_token(range, token, window, cx),
+                None => prompt.replace_with_token(token, window, cx),
+            };
+            if placed.is_err() {
+                prompt.insert(text, window, cx);
+            }
+            prompt.insert(" ", window, cx);
+        });
+    }
+
+    /// Ask for files to attach (images) or mention (anything else).
+    fn pick_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picked.await {
+                let _ = this.update_in(cx, |this, window, cx| this.add_files(paths, window, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Dropped or picked files: images are attached, other files are mentioned.
+    fn add_files(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project_dir();
+        for path in paths {
+            if crate::composer::is_image(&path) {
+                match std::fs::read(&path) {
+                    Ok(bytes) => self.attach_image(bytes, cx),
+                    Err(err) => self.notice(NoticeKind::Error, format!("Could not read {}: {err}", path.display()), cx),
+                }
+            } else {
+                let mention = crate::composer::mention_path(&path, &project);
+                self.insert_mention(None, &mention, window, cx);
+            }
+        }
+        self.prompt.update(cx, |p, cx| p.focus(window, cx));
+    }
+
+    /// Prepare an image in the background (large ones are scaled down), then attach it.
+    fn attach_image(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let prepared = cx.background_executor().spawn(async move { crate::composer::prepare_image(bytes) }).await;
+            let _ = this.update(cx, |this: &mut ThreadView, cx| match prepared {
+                Ok(image) => {
+                    let preview =
+                        Arc::new(gpui_kit::Image::from_bytes(image_format(&image.media_type), image.data.to_vec()));
+                    this.attachments.push(Attachment { image, preview });
+                    cx.notify();
+                }
+                Err(err) => this.notice(NoticeKind::Error, format!("Could not attach the image: {err:#}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Ctrl+V with an image on the clipboard attaches it. The text box ignores clipboards
+    /// without text, so this only has to take the images. On Wayland the clipboard is read
+    /// asynchronously, so the text box pastes any text by itself, and this attaches any
+    /// images once they arrive.
+    fn paste_images(&mut self, cx: &mut Context<Self>) -> bool {
+        fn images(item: &gpui_kit::ClipboardItem) -> Vec<Vec<u8>> {
+            if item.text().is_some() {
+                return Vec::new();
+            }
+            item.entries()
+                .iter()
+                .filter_map(|e| match e {
+                    gpui_kit::ClipboardEntry::Image(image) => Some(image.bytes().to_vec()),
+                    _ => None,
+                })
+                .collect()
+        }
+        if let Some(item) = cx.read_from_clipboard() {
+            let found = images(&item);
+            let any = !found.is_empty();
+            for bytes in found {
+                self.attach_image(bytes, cx);
+            }
+            return any;
+        }
+        let read = cx.read_from_clipboard_async();
+        cx.spawn(async move |this, cx| {
+            if let Ok(Some(item)) = read.await {
+                let _ = this.update(cx, |this: &mut ThreadView, cx| {
+                    for bytes in images(&item) {
+                        this.attach_image(bytes, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+        false
+    }
+
+    fn remove_attachment(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.attachments.len() {
+            self.attachments.remove(ix);
+            cx.notify();
+        }
+    }
+
+    /// Save attached images next to the transcript, so a reopened thread still shows them.
+    /// Gives the saved file names (none when the thread isn't saved).
+    fn save_images(&self, attachments: &[Attachment]) -> Vec<String> {
+        let Some(dir) = &self.files_dir else { return Vec::new() };
+        if attachments.is_empty() || std::fs::create_dir_all(dir).is_err() {
+            return Vec::new();
+        }
+        attachments
+            .iter()
+            .filter_map(|a| {
+                let name = format!("{}.{}", uuid::Uuid::new_v4(), crate::composer::extension(&a.image.media_type));
+                std::fs::write(dir.join(&name), a.image.data.as_slice()).ok().map(|_| name)
+            })
+            .collect()
+    }
+
+    fn load_saved_image(&self, name: &str) -> Option<Arc<gpui_kit::Image>> {
+        let bytes = std::fs::read(self.files_dir.as_ref()?.join(name)).ok()?;
+        let format = image_format(&format!("image/{}", name.rsplit('.').next().unwrap_or("png")));
+        Some(Arc::new(gpui_kit::Image::from_bytes(format, bytes)))
+    }
+
+    /// The prompt box, with picked mentions shown as chips.
+    fn prompt_box(&self, appearance: bool, cx: &App) -> Textarea {
+        // A tint of the primary colour: the accent can match the card in light themes.
+        let (chip, chip_fg) = (cx.theme().primary.opacity(0.16), cx.theme().foreground);
+        Textarea::new(&self.prompt).appearance(appearance).token(move |token, _, _| {
+            h_flex()
+                .gap_1()
+                .px_1()
+                .rounded_sm()
+                .bg(chip)
+                .text_color(chip_fg)
+                .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::File).xsmall())
+                .child(token.token().label().clone())
+        })
+    }
+
+    /// The composer's outer box: it takes the picker's keys while it's open, pasted images,
+    /// and dropped files, and shows the picker above itself.
+    fn composer_frame(&self, cx: &mut Context<Self>) -> Div {
+        use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Paste};
+        let primary = cx.theme().primary;
+        v_flex()
+            .relative()
+            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                if this.move_mention(-1, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                if this.move_mention(1, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, enter: &Enter, window, cx| {
+                if !enter.shift && this.accept_mention(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            // Tab picks a mention too; otherwise it stays in the prompt box (it never moves focus).
+            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                if this.accept_mention(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+                if this.mention.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Paste, _, cx| {
+                if this.paste_images(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, window, cx| {
+                this.add_files(paths.paths().to_vec(), window, cx)
+            }))
+            .drag_over::<gpui_kit::ExternalPaths>(move |style, _, _, _| style.border_color(primary))
+            .children(self.render_mention_picker(cx))
+    }
+
+    /// Thumbnails of the images that go with the next message, each with a remove button.
+    fn render_attachments(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.attachments.is_empty() {
+            return None;
+        }
+        let (border, bg) = (cx.theme().border, cx.theme().background);
+        Some(
+            h_flex()
+                .flex_wrap()
+                .gap_2()
+                .children(self.attachments.iter().enumerate().map(|(ix, a)| {
+                    div()
+                        .relative()
+                        .size_16()
+                        .rounded_md()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(border)
+                        .child(gpui_kit::img(a.preview.clone()).size_full().object_fit(gpui_kit::ObjectFit::Cover))
+                        .child(
+                            div()
+                                .id(("remove-attachment", ix))
+                                .test_support()
+                                .absolute()
+                                .top_0p5()
+                                .right_0p5()
+                                .size_4()
+                                .rounded_full()
+                                .bg(bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::X).xsmall())
+                                .on_click(cx.listener(move |this, _, _, cx| this.remove_attachment(ix, cx))),
+                        )
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The `@file` picker, floating just above the composer.
+    fn render_mention_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let picker = self.mention.as_ref()?;
+        let theme = cx.theme();
+        let (popover, border, muted, selected_bg) = (theme.popover, theme.border, theme.muted_foreground, theme.accent);
+        let empty = match &self.project_files {
+            None => Some("Listing files…"),
+            Some(_) if picker.matches.is_empty() => Some("No matching files"),
+            Some(_) => None,
+        };
+        let list = v_flex()
+            .absolute()
+            .bottom_full()
+            .left_0()
+            .right_0()
+            .mb_1()
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(popover)
+            .shadow_md()
+            .when_some(empty, |el, text| el.child(div().px_2().py_1().text_sm().text_color(muted).child(text)))
+            .children(picker.matches.iter().enumerate().map(|(ix, path)| {
+                let (dir, name) = match path.rsplit_once('/') {
+                    Some((dir, name)) => (dir.to_string(), name.to_string()),
+                    None => (String::new(), path.clone()),
+                };
+                h_flex()
+                    .id(("mention", ix))
+                    .test_support()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(ix == picker.selected, |el| el.bg(selected_bg))
+                    .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::File).xsmall())
+                    .child(name)
+                    .child(div().text_xs().text_color(muted).truncate().child(dir))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(picker) = &mut this.mention {
+                            picker.selected = ix;
+                        }
+                        this.accept_mention(window, cx);
+                    }))
+            }));
+        Some(gpui_kit::deferred(list).with_priority(1).into_any_element())
     }
 
     /// While a turn runs, refresh the overview every [`OVERVIEW_EVERY`].
@@ -649,9 +1071,14 @@ impl ThreadView {
         cx.notify();
     }
 
-    fn push_prompt_row(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.push_text_row(true, text, cx);
-        self.plain.push(format!("User: {text}"));
+    fn push_prompt_row(&mut self, text: &str, images: Vec<Arc<gpui_kit::Image>>, cx: &mut Context<Self>) {
+        let count = images.len();
+        let body = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
+        self.push_row(Row::User(body, images), cx);
+        self.plain.push(match count {
+            0 => format!("User: {text}"),
+            n => format!("User: {text} [{n} image{}]", if n == 1 { "" } else { "s" }),
+        });
         self.plain_current = None;
         self.current_text = None;
     }
@@ -1106,7 +1533,7 @@ impl ThreadView {
 
     fn push_text_row(&mut self, user: bool, text: &str, cx: &mut Context<Self>) -> usize {
         let body = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
-        self.push_row(if user { Row::User(body) } else { Row::Assistant(body) }, cx)
+        self.push_row(if user { Row::User(body, Vec::new()) } else { Row::Assistant(body) }, cx)
     }
 
     fn notice(&mut self, kind: NoticeKind, text: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -1168,18 +1595,26 @@ impl ThreadView {
         let pad = |el: Div| el.w_full().px_4().py_1p5();
 
         match &self.rows[ix] {
-            Row::User(body) => h_flex()
+            Row::User(body, images) => h_flex()
                 .w_full()
                 .px_4()
                 .py_2()
                 .justify_end()
                 .child(
-                    div()
+                    v_flex()
                         .max_w(relative(0.8))
+                        .gap_2()
                         .px_3()
                         .py_2()
                         .rounded_lg()
                         .bg(secondary)
+                        .when(!images.is_empty(), |el| {
+                            el.child(h_flex().flex_wrap().gap_2().children(images.iter().map(|image| {
+                                // A fixed height lets the width follow the picture, so tall ones
+                                // don't sit in a wide box.
+                                gpui_kit::img(image.clone()).h(px(160.)).max_w(px(280.)).rounded_md()
+                            })))
+                        })
                         .child(TextView::new(body).selectable(true)),
                 )
                 .into_any_element(),
@@ -1700,8 +2135,15 @@ impl ThreadView {
                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
         };
 
+        let attach = Button::new("attach")
+            .ghost()
+            .xsmall()
+            .icon(gpui_kit::assets::IconName::Paperclip)
+            .tooltip("Attach images or files (or paste or drop them here)")
+            .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)));
+
         if self.is_fresh() {
-            return self.render_intro(account_menu, mode_menu, model_menu, cx).into_any_element();
+            return self.render_intro(attach, account_menu, mode_menu, model_menu, cx).into_any_element();
         }
 
         v_flex()
@@ -1710,18 +2152,20 @@ impl ThreadView {
             .child(div().flex_1().min_h_0().child(transcript))
             .child(
                 h_flex().w_full().justify_center().border_t_1().border_color(border).child(
-                    v_flex()
+                    self.composer_frame(cx)
                         .w_full()
                         .max_w(px(MAX_CONVERSATION_WIDTH))
                         .gap_1()
                         .px_3()
                         .pt_3()
                         .pb_2()
-                        .child(Textarea::new(&self.prompt))
+                        .children(self.render_attachments(cx))
+                        .child(self.prompt_box(true, cx))
                         .child(
                             h_flex()
                                 .gap_1()
                                 .text_color(muted)
+                                .child(attach)
                                 .child(account_menu)
                                 .child(mode_menu)
                                 .child(div().flex_1())
@@ -1737,6 +2181,7 @@ impl ThreadView {
     /// Like T3 Code's new-session screen.
     fn render_intro(
         &self,
+        attach: impl IntoElement,
         account_menu: impl IntoElement,
         mode_menu: impl IntoElement,
         model_menu: impl IntoElement,
@@ -1791,7 +2236,7 @@ impl ThreadView {
                         .child(format!("What should we build in {project}?")),
                 )
                 .child(
-                    v_flex()
+                    self.composer_frame(cx)
                         .w_full()
                         .gap_2()
                         .p_3()
@@ -1799,10 +2244,12 @@ impl ThreadView {
                         .border_1()
                         .border_color(border)
                         .bg(card)
-                        .child(div().min_h(px(64.)).child(Textarea::new(&self.prompt).appearance(false)))
+                        .children(self.render_attachments(cx))
+                        .child(div().min_h(px(64.)).child(self.prompt_box(false, cx)))
                         .child(
                             h_flex()
                                 .gap_1()
+                                .child(attach)
                                 .child(account_menu)
                                 .child(mode_menu)
                                 .child(div().flex_1())
@@ -1822,6 +2269,16 @@ impl ThreadView {
                         .child(footnote(gpui_kit::assets::IconName::Shield, self.mode.label().to_string())),
                 ),
         )
+    }
+}
+
+/// gpui's image format for a media type (`image/png` ...); PNG when unknown.
+fn image_format(media_type: &str) -> gpui_kit::ImageFormat {
+    match media_type {
+        "image/jpeg" | "image/jpg" => gpui_kit::ImageFormat::Jpeg,
+        "image/gif" => gpui_kit::ImageFormat::Gif,
+        "image/webp" => gpui_kit::ImageFormat::Webp,
+        _ => gpui_kit::ImageFormat::Png,
     }
 }
 
@@ -1909,7 +2366,7 @@ pub fn default_cwd() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, Status, ThreadView};
+    use super::{Backend, Row, Status, ThreadView};
     use crate::agent::{AgentEvent, Decision, ScriptedAgent, ScriptedCall, claude};
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
@@ -2434,5 +2891,134 @@ mod tests {
             focus.is_focused(window)
         });
         assert!(focused, "Tab moved focus out of the prompt box");
+    }
+
+    /// Focus the prompt box and type into it.
+    fn type_into_prompt(thread: &Entity<ThreadView>, text: &str, cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            let focus = thread.read(cx).prompt_focus(cx);
+            window.focus(&focus, cx);
+        });
+        cx.simulate_input(text);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    fn prompt_text(thread: &Entity<ThreadView>, cx: &mut VisualTestContext) -> String {
+        thread.read_with(cx, |t, cx| t.prompt.read(cx).value().to_string())
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::RgbImage::from_pixel(w, h, image::Rgb([200, 80, 40]))
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    #[gpui_kit::test]
+    fn at_opens_a_file_picker_and_enter_picks_instead_of_sending(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        // Tests run in the crate, so the picker lists TJ's own files.
+        type_into_prompt(&thread, "look at @thread.r", cx);
+        let first = thread.read_with(cx, |t, _| t.mention.as_ref().and_then(|m| m.matches.first().cloned()));
+        assert_eq!(first.as_deref(), Some("src/thread.rs"));
+
+        cx.simulate_keystrokes("enter");
+        assert_eq!(prompt_text(&thread, cx), "look at @src/thread.rs ");
+        assert!(thread.read_with(cx, |t, _| t.mention.is_none()), "picking closes the picker");
+        assert!(!calls(&thread, cx).iter().any(|c| matches!(c, ScriptedCall::Prompt(_))), "Enter picked, not sent");
+        let tokens = thread.read_with(cx, |t, cx| t.prompt.read(cx).tokens().len());
+        assert_eq!(tokens, 1, "the mention is one token");
+
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("enter");
+        assert!(calls(&thread, cx).contains(&ScriptedCall::Prompt("look at @src/thread.rs".into())));
+    }
+
+    #[gpui_kit::test]
+    fn enter_waits_while_the_first_file_list_loads(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            let focus = thread.read(cx).prompt_focus(cx);
+            window.focus(&focus, cx);
+        });
+        cx.simulate_input("@thread.r");
+        // As if Enter came before the background listing finished (tests finish it at once).
+        thread.update(cx, |t, _| {
+            t.project_files = None;
+            t.listing_files = true;
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("enter");
+        assert!(!calls(&thread, cx).iter().any(|c| matches!(c, ScriptedCall::Prompt(_))), "nothing was sent");
+        assert_eq!(prompt_text(&thread, cx), "@thread.r");
+        thread.update(cx, |t, cx| t.list_project_files(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(prompt_text(&thread, cx), "@src/thread.rs ");
+    }
+
+    #[gpui_kit::test]
+    fn tab_picks_a_mention_and_escape_closes_the_picker(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        type_into_prompt(&thread, "@cargo", cx);
+        cx.simulate_keystrokes("down up tab");
+        assert_eq!(prompt_text(&thread, cx), "@Cargo.lock ");
+
+        type_into_prompt(&thread, "and @READ", cx);
+        assert!(thread.read_with(cx, |t, _| t.mention.is_some()));
+        cx.simulate_keystrokes("escape");
+        assert!(thread.read_with(cx, |t, _| t.mention.is_none()));
+        assert_eq!(prompt_text(&thread, cx), "@Cargo.lock and @READ", "Escape keeps what was typed");
+    }
+
+    #[gpui_kit::test]
+    fn a_pasted_image_goes_with_the_next_message_and_survives_a_reopen(cx: &mut TestAppContext) {
+        let path = std::env::temp_dir().join(format!("tj-image-{}.jsonl", crate::store::new_id()));
+        let setup = super::ThreadSetup { transcript: Some(path.clone()), ..Default::default() };
+        let (window, _thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let thread = cx.update(|window, cx| {
+            cx.new(|cx| ThreadView::open(setup.clone(), Backend::Scripted(Vec::new()), window, cx))
+        });
+        thread.update(cx, |t, _| t.attach_scripted(ScriptedAgent::start(Vec::new()).0));
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem {
+                entries: vec![gpui_kit::ClipboardEntry::Image(gpui_kit::Image::from_bytes(
+                    gpui_kit::ImageFormat::Png,
+                    png(8, 6),
+                ))],
+            });
+        });
+        thread.update_in(cx, |t, _, cx| {
+            assert!(t.paste_images(cx), "an image-only clipboard is taken");
+        });
+        cx.run_until_parked();
+        assert_eq!(thread.read_with(cx, |t, _| t.attachments.len()), 1);
+
+        thread.update_in(cx, |t, window, cx| t.submit(window, cx));
+        assert_eq!(
+            calls(&thread, cx),
+            vec![ScriptedCall::Images(vec!["image/png".into()]), ScriptedCall::Prompt(String::new())]
+        );
+        let shown = |t: &ThreadView| match t.rows.last() {
+            Some(Row::User(_, images)) => images.len(),
+            _ => 0,
+        };
+        assert_eq!(thread.read_with(cx, |t, _| (shown(t), t.attachments.len())), (1, 0));
+        assert_eq!(thread.read_with(cx, |t, _| t.title.clone()).as_deref(), Some("Image"));
+
+        let reopened =
+            cx.update(|window, cx| cx.new(|cx| ThreadView::open(setup, Backend::Scripted(Vec::new()), window, cx)));
+        assert_eq!(reopened.read_with(cx, |t, _| shown(t)), 1, "the saved image is shown again");
+        let _ = std::fs::remove_dir_all(crate::composer::files_dir(&path));
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -390,6 +390,9 @@ mod mode_name {
 pub enum Record {
     Prompt {
         text: String,
+        /// Attached images, as file names in the thread's `<id>.files/` folder.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     Event {
         event: AgentEvent,
@@ -523,12 +526,15 @@ mod tests {
         let dir = temp_dir("transcript");
         let path = dir.join("t.jsonl");
         let mut writer = TranscriptWriter::open(&path).unwrap();
-        writer.append(&Record::Prompt { text: "hi".into() }).unwrap();
+        writer.append(&Record::Prompt { text: "hi".into(), images: vec![] }).unwrap();
         writer.append(&Record::Event { event: AgentEvent::TextDelta("hello".into()) }).unwrap();
         fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"kind\":\"torn").unwrap();
         assert_eq!(
             read_transcript(&path),
-            vec![Record::Prompt { text: "hi".into() }, Record::Event { event: AgentEvent::TextDelta("hello".into()) }]
+            vec![
+                Record::Prompt { text: "hi".into(), images: vec![] },
+                Record::Event { event: AgentEvent::TextDelta("hello".into()) }
+            ]
         );
     }
 }
