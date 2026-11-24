@@ -163,11 +163,11 @@ impl ClaudeSession {
 }
 
 impl AgentSession for ClaudeSession {
-    fn send_prompt(&self, text: &str) -> anyhow::Result<()> {
+    fn send_message(&self, text: &str, images: &[super::PromptImage]) -> anyhow::Result<()> {
         self.write(&json!({
             "type": "user",
             "parent_tool_use_id": null,
-            "message": { "role": "user", "content": [{ "type": "text", "text": text }] },
+            "message": { "role": "user", "content": message_content(text, images) },
         }))
     }
 
@@ -198,6 +198,25 @@ impl AgentSession for ClaudeSession {
     fn set_effort(&self, effort: Option<&str>) -> anyhow::Result<()> {
         self.control("apply_flag_settings", json!({ "settings": { "effortLevel": effort } }))
     }
+}
+
+/// A user message's content blocks: images first (as the API recommends), then the text.
+pub fn message_content(text: &str, images: &[super::PromptImage]) -> Value {
+    use base64::Engine as _;
+    let mut blocks: Vec<Value> = images
+        .iter()
+        .map(|image| {
+            json!({ "type": "image", "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": base64::engine::general_purpose::STANDARD.encode(image.data.as_slice()),
+            }})
+        })
+        .collect();
+    if !text.is_empty() || blocks.is_empty() {
+        blocks.push(json!({ "type": "text", "text": text }));
+    }
+    Value::Array(blocks)
 }
 
 /// The models `claude` offers this account, read from the `initialize` reply of a session
@@ -433,7 +452,8 @@ impl Parser {
                         })
                     })
                     .collect();
-                if let Some(model) = str_at(&m["message"], "model") {
+                // Messages Claude Code writes itself (errors) say "<synthetic>"; not a model.
+                if let Some(model) = str_at(&m["message"], "model").filter(|m| !m.starts_with('<')) {
                     events.push(AgentEvent::ModelInUse(model));
                 }
                 let usage = &m["message"]["usage"];
@@ -906,6 +926,22 @@ mod tests {
     }
 
     #[test]
+    fn images_go_before_the_text_as_base64_blocks() {
+        let image =
+            crate::agent::PromptImage { media_type: "image/png".into(), data: std::sync::Arc::new(vec![1, 2, 3]) };
+        let content = message_content("what is this?", std::slice::from_ref(&image));
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["data"], "AQID");
+        assert_eq!(content[1], json!({ "type": "text", "text": "what is this?" }));
+        assert_eq!(
+            message_content("", &[image]).as_array().unwrap().len(),
+            1,
+            "an image alone has no empty text block"
+        );
+    }
+
+    #[test]
     fn effort_becomes_a_flag() {
         let options = SessionOptions { model: Some("opus".into()), effort: Some("high".into()), ..Default::default() };
         let args = options.args().join(" ");
@@ -1015,6 +1051,34 @@ mod tests {
             }
         }
         assert!(models.iter().any(|m| m.contains("sonnet")), "{models:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An attached image reaches the model: a plain red picture is described as red.
+    #[test]
+    #[ignore]
+    fn live_image_is_seen() {
+        let dir = std::env::temp_dir().join(format!("tj-live-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = Vec::new();
+        image::RgbImage::from_pixel(64, 64, image::Rgb([220, 20, 20]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let image = crate::agent::PromptImage { media_type: "image/png".into(), data: std::sync::Arc::new(png) };
+        let options = SessionOptions { cwd: dir.clone(), model: Some("haiku".into()), ..Default::default() };
+        let (session, events) = ClaudeSession::spawn(&options).unwrap();
+        session.send_message("What colour is this image? Reply with one word.", &[image]).unwrap();
+        let mut reply = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            match smol::block_on(events.recv()).expect("events") {
+                AgentEvent::TextDelta(text) => reply.push_str(&text),
+                AgentEvent::TurnFinished { .. } => break,
+                AgentEvent::Exited { stderr, .. } => panic!("claude exited: {stderr}"),
+                _ => {}
+            }
+        }
+        assert!(reply.to_lowercase().contains("red"), "{reply}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

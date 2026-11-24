@@ -2,6 +2,7 @@
 
 mod agent;
 mod changes;
+mod composer;
 mod demo;
 mod keymap;
 mod omarchy;
