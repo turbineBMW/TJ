@@ -4,6 +4,7 @@ mod agent;
 mod changes;
 mod composer;
 mod demo;
+mod handoff;
 mod keymap;
 mod omarchy;
 mod overview;
