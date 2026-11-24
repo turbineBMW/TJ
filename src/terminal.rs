@@ -12,7 +12,7 @@ use alacritty_terminal::{
     sync::FairMutex,
     term::{Config, Term, TermMode, cell::Flags, color::Colors},
     tty,
-    vte::ansi::{Color, CursorShape, NamedColor, Rgb},
+    vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Rgb},
 };
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{prelude::FluentBuilder as _, *};
@@ -32,6 +32,74 @@ pub fn init(cx: &mut App) {
     cx.bind_keys(PASSTHROUGH_KEYS.map(|key| KeyBinding::new(key, NoAction, Some(KEY_CONTEXT))));
 }
 const LINE_HEIGHT: f32 = 1.3;
+
+/// How long the cursor takes to glide to a new cell.
+const CURSOR_GLIDE: std::time::Duration = std::time::Duration::from_millis(90);
+/// One blink: shown, fading out, hidden, fading in (milliseconds from the start of a cycle).
+const BLINK_SHOWN: u64 = 600;
+const BLINK_FADE: u64 = 110;
+const BLINK_CYCLE: u64 = 1200;
+
+/// Ease out: fast at first, settling into place.
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// Where a gliding cursor is (in cells), and whether it has arrived.
+fn glide(from: (f32, f32), to: (f32, f32), elapsed: std::time::Duration) -> ((f32, f32), bool) {
+    let t = elapsed.as_secs_f32() / CURSOR_GLIDE.as_secs_f32();
+    if t >= 1.0 {
+        return (to, true);
+    }
+    let k = ease_out(t);
+    ((from.0 + (to.0 - from.0) * k, from.1 + (to.1 - from.1) * k), false)
+}
+
+/// A blinking cursor's opacity `elapsed` into its cycle, whether it's fading (so frames are
+/// needed), and how long until the next fade starts otherwise.
+fn blink(elapsed: std::time::Duration) -> (f32, bool, std::time::Duration) {
+    let ms = elapsed.as_millis() as u64 % BLINK_CYCLE;
+    let hidden_at = BLINK_SHOWN + BLINK_FADE;
+    let fade_in_at = BLINK_CYCLE - BLINK_FADE;
+    let wait = |until: u64| std::time::Duration::from_millis(until - ms);
+    if ms < BLINK_SHOWN {
+        (1.0, false, wait(BLINK_SHOWN))
+    } else if ms < hidden_at {
+        (1.0 - (ms - BLINK_SHOWN) as f32 / BLINK_FADE as f32, true, std::time::Duration::ZERO)
+    } else if ms < fade_in_at {
+        (0.0, false, wait(fade_in_at))
+    } else {
+        ((ms - fade_in_at) as f32 / BLINK_FADE as f32, true, std::time::Duration::ZERO)
+    }
+}
+
+/// The cursor's motion and blink state.
+struct CursorState {
+    /// The glide in progress, in cells: from, to, and when it started.
+    from: (f32, f32),
+    to: (f32, f32),
+    moved_at: std::time::Instant,
+    /// When the blink cycle (re)started: moving or typing shows the cursor solid again.
+    blink_from: std::time::Instant,
+    /// The pending wake-up for the next blink change, so only one is scheduled.
+    wake: Option<(std::time::Instant, Task<()>)>,
+}
+
+impl CursorState {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self { from: (0.0, 0.0), to: (0.0, 0.0), moved_at: now - CURSOR_GLIDE, blink_from: now, wake: None }
+    }
+
+    /// Head for `to`, starting from wherever the cursor is now drawn.
+    fn move_to(&mut self, to: (f32, f32), now: std::time::Instant) {
+        if to == self.to {
+            return;
+        }
+        let (at, _) = glide(self.from, self.to, now - self.moved_at);
+        (self.from, self.to, self.moved_at, self.blink_from) = (at, to, now, now);
+    }
+}
 
 #[derive(Clone)]
 struct Listener(smol::channel::Sender<TermEvent>);
@@ -84,6 +152,7 @@ pub struct TerminalView {
     reported_button: Option<u8>,
     /// The last cell reported to the app, so motion within one cell isn't repeated.
     last_reported: Option<(usize, usize)>,
+    cursor: CursorState,
     /// Everything written to the shell, so tests can check what it received.
     #[cfg(test)]
     sent: std::cell::RefCell<Vec<u8>>,
@@ -106,7 +175,12 @@ impl TerminalView {
         let (tx, rx) = smol::channel::unbounded();
         let listener = Listener(tx);
 
-        let term = Arc::new(FairMutex::new(Term::new(Config::default(), &size, listener.clone())));
+        // Blinking unless an app asks for a steady cursor (DECSCUSR); `CSI 0 q` returns here.
+        let config = Config {
+            default_cursor_style: CursorStyle { shape: CursorShape::Block, blinking: true },
+            ..Config::default()
+        };
+        let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
 
         let mut env = HashMap::new();
         env.insert("TERM".into(), "xterm-256color".into());
@@ -147,6 +221,7 @@ impl TerminalView {
                 selecting: false,
                 reported_button: None,
                 last_reported: None,
+                cursor: CursorState::new(),
                 #[cfg(test)]
                 sent: Default::default(),
                 #[cfg(test)]
@@ -251,6 +326,7 @@ impl TerminalView {
             term.scroll_display(Scroll::Bottom);
             term.selection = None;
             drop(term);
+            self.cursor.blink_from = std::time::Instant::now();
             self.write(bytes);
             cx.stop_propagation();
         }
@@ -496,6 +572,82 @@ impl Palette<'_> {
 }
 
 impl TerminalView {
+    // ---------- cursor ----------
+
+    /// The cursor, drawn over the grid: it glides between cells and fades as it blinks. A
+    /// block shows the character under it in the background colour; an unfocused terminal
+    /// shows a hollow block that doesn't blink.
+    #[allow(clippy::too_many_arguments)]
+    fn render_cursor(
+        &mut self,
+        cursor: alacritty_terminal::term::RenderableCursor,
+        blinking: bool,
+        under: Option<(char, bool)>,
+        offset: i32,
+        focused: bool,
+        fg: Hsla,
+        bg: Hsla,
+        font: &Font,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let row = cursor.point.line.0 + offset;
+        if cursor.shape == CursorShape::Hidden || row < 0 || row as usize >= self.size.rows {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        self.cursor.move_to((cursor.point.column.0 as f32, row as f32), now);
+        let ((x, y), arrived) = glide(self.cursor.from, self.cursor.to, now - self.cursor.moved_at);
+        let (alpha, fading, until_fade) = if focused && blinking {
+            blink(now - self.cursor.blink_from)
+        } else {
+            (1.0, false, std::time::Duration::MAX)
+        };
+
+        if !arrived || fading {
+            window.request_animation_frame();
+        } else if focused && blinking {
+            // Wake for the next fade; one wake-up at a time.
+            let at = now + until_fade;
+            if self.cursor.wake.as_ref().is_none_or(|(when, _)| *when != at) {
+                let task = cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(until_fade).await;
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                });
+                self.cursor.wake = Some((at, task));
+            }
+        }
+        if alpha <= 0.0 {
+            return None;
+        }
+
+        let (c, wide) = under.unwrap_or((' ', false));
+        let cell = self.cell;
+        let width = if wide { cell.width * 2.0 } else { cell.width };
+        let mark = div().absolute().left(cell.width * x).top(cell.height * y);
+        let ink = fg.opacity(alpha);
+        Some(
+            match (focused, cursor.shape) {
+                (false, _) | (_, CursorShape::HollowBlock) => {
+                    mark.w(width).h(cell.height).border_1().border_color(fg.opacity(0.8))
+                }
+                (true, CursorShape::Beam) => mark.w(px(2.)).h(cell.height).bg(ink),
+                (true, CursorShape::Underline) => mark.top(cell.height * (y + 1.0) - px(2.)).w(width).h(px(2.)).bg(ink),
+                (true, _) => mark.w(width).h(cell.height).bg(ink).when(arrived && c != ' ' && c != '\0', |el| {
+                    el.child(
+                        div()
+                            .font(font.clone())
+                            .text_size(px(FONT_SIZE))
+                            .line_height(cell.height)
+                            .text_color(bg.opacity(alpha))
+                            .child(c.to_string()),
+                    )
+                }),
+            }
+            .into_any_element(),
+        )
+    }
+
     // ---------- mouse ----------
 
     /// The grid cell under a window position, clamped to the grid, and which half of it.
@@ -532,6 +684,7 @@ impl TerminalView {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
+        self.cursor.blink_from = std::time::Instant::now();
         let button = match event.button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
@@ -650,6 +803,8 @@ impl Render for TerminalView {
         let offset = content.display_offset as i32;
         let cursor = content.cursor;
         let selection = content.selection;
+        let cursor_style = term.cursor_style();
+        let mut cursor_cell: Option<(char, bool)> = None;
         let selection_bg = cx.theme().selection;
 
         let rows = self.size.rows;
@@ -679,12 +834,8 @@ impl Render for TerminalView {
             if selection.is_some_and(|s| s.contains(indexed.point)) {
                 cell_bg = Some(selection_bg);
             }
-            let is_cursor = focused
-                && cursor.shape != CursorShape::Hidden
-                && indexed.point == Point::new(Line(cursor.point.line.0), Column(cursor.point.column.0));
-            if is_cursor {
-                cell_bg = Some(fg);
-                cell_fg = bg;
+            if indexed.point == cursor.point {
+                cursor_cell = Some((cell.c, cell.flags.contains(Flags::WIDE_CHAR)));
             }
 
             let start = text.len();
@@ -734,6 +885,18 @@ impl Render for TerminalView {
         }
         drop(term);
 
+        let cursor_overlay = self.render_cursor(
+            cursor,
+            cursor_style.blinking,
+            cursor_cell,
+            offset,
+            focused,
+            fg,
+            bg,
+            &base_font,
+            window,
+            cx,
+        );
         let cell = self.cell;
         let this = cx.entity();
         let painted = this.clone();
@@ -796,6 +959,7 @@ impl Render for TerminalView {
                     .children(lines.into_iter().map(|(text, runs)| {
                         div().h(cell.height).whitespace_nowrap().child(StyledText::new(text).with_runs(runs))
                     }))
+                    .children(cursor_overlay)
                     .child(measure),
             )
             .when(self.exited, |el| {
@@ -820,13 +984,14 @@ impl Focusable for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{TermMode, TerminalView, key_to_bytes, mouse_report};
+    use super::{CursorState, TermMode, TerminalView, blink, glide, key_to_bytes, mouse_report};
     use alacritty_terminal::tty::Shell;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
         AppContext as _, Entity, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
         TestAppContext, WindowBounds, WindowOptions, bounds, point, px, size,
     };
+    use std::time::Duration;
 
     /// Open a real gpui-kit window (with its Root, which binds Tab and Ctrl-C) holding a
     /// terminal running /bin/sh, focus the terminal, press `keys`, and return what the
@@ -890,6 +1055,55 @@ mod tests {
         assert_eq!(mouse_report(0, 300, 0, true, TermMode::empty()), None, "past column 223");
         let utf8 = mouse_report(0, 300, 0, true, TermMode::UTF8_MOUSE).unwrap();
         assert_eq!(String::from_utf8(utf8[3..].to_vec()).unwrap().chars().nth(1), Some(char::from_u32(333).unwrap()));
+    }
+
+    #[test]
+    fn the_cursor_glides_and_settles() {
+        let ms = Duration::from_millis;
+        assert_eq!(glide((0.0, 0.0), (10.0, 2.0), ms(0)), ((0.0, 0.0), false));
+        let ((x, y), done) = glide((0.0, 0.0), (10.0, 2.0), ms(45));
+        assert!(!done && x > 5.0 && x < 10.0 && y > 1.0, "eases out: most of the way at half time ({x}, {y})");
+        assert_eq!(glide((0.0, 0.0), (10.0, 2.0), ms(90)), ((10.0, 2.0), true));
+
+        // A new target mid-glide starts from where the cursor is drawn, not from the old start.
+        let mut cursor = CursorState::new();
+        let start = cursor.moved_at + super::CURSOR_GLIDE;
+        cursor.move_to((10.0, 0.0), start);
+        cursor.move_to((10.0, 5.0), start + ms(45));
+        assert!(cursor.from.0 > 5.0 && cursor.from.1 == 0.0, "{:?}", cursor.from);
+        assert_eq!(cursor.blink_from, start + ms(45), "moving shows the cursor solid again");
+    }
+
+    #[test]
+    fn the_cursor_blinks_with_fades() {
+        let ms = Duration::from_millis;
+        assert_eq!(blink(ms(0)), (1.0, false, ms(600)));
+        let (alpha, fading, _) = blink(ms(655));
+        assert!(fading && (alpha - 0.5).abs() < 0.01, "half faded out: {alpha}");
+        assert_eq!(blink(ms(800)), (0.0, false, ms(290)));
+        let (alpha, fading, _) = blink(ms(1145));
+        assert!(fading && (alpha - 0.5).abs() < 0.01, "half faded in: {alpha}");
+        assert_eq!(blink(ms(1300)), blink(ms(100)), "and repeats");
+    }
+
+    #[gpui_kit::test]
+    fn apps_can_ask_for_a_steady_cursor(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, b"");
+        let blinking = |term: &Entity<TerminalView>, cx: &mut gpui_kit::VisualTestContext| {
+            term.read_with(cx, |t, _| t.term.lock().cursor_style().blinking)
+        };
+        assert!(blinking(&term, &mut cx), "blinking by default");
+        let feed = |bytes: &[u8], cx: &mut gpui_kit::VisualTestContext| {
+            term.update(cx, |t, _| {
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(&mut *t.term.lock(), bytes);
+            })
+        };
+        feed(b"\x1b[2 q", &mut cx); // steady block, as vi-mode prompts send
+        assert!(!blinking(&term, &mut cx));
+        feed(b"\x1b[0 q", &mut cx); // back to the default
+        assert!(blinking(&term, &mut cx));
+        cx.update(|window, cx| window.render_frame(cx));
     }
 
     /// A terminal running `sleep` (so no prompt arrives) showing `screen`, rendered once.

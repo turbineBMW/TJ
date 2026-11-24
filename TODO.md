@@ -20,7 +20,7 @@ What's missing or rough, roughly in priority order. ROADMAP.md has the direction
 
 - [x] Mouse selection and copy in the terminal (drag, double- and triple-click; primary selection, Ctrl+Shift+C, middle-click paste).
 - [x] Mouse reporting for terminal apps (vim, htop, less): clicks, drags, motion and the wheel; Shift selects instead.
-- [ ] Blinking cursor, which moves smoothly between positions.
+- [x] Blinking cursor that glides smoothly between cells and fades as it blinks.
 - [ ] Images (SIXEL/kitty), as in the vte fork.
 - [x] Drag to resize splits (the divider between panes; double-click centres it).
 
