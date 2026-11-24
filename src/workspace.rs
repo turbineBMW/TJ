@@ -8,11 +8,15 @@ use gpui_kit::component::{
     ActiveTheme as _, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     menu::{DropdownMenu as _, PopupMenuItem},
+    popover::Popover,
+    slider::{Slider, SliderEvent, SliderState, SliderValue},
+    switch::Switch,
 };
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::agent::{AgentEvent, PermissionMode, claude::SessionOptions};
 use crate::changes::{ChangeKind, ProjectChanges, Summarizer};
+use crate::settings::Settings;
 use crate::store::{self, Accounts, Paths, State};
 use crate::terminal::TerminalView;
 use crate::thread::{self, Backend, Status, ThreadChanged, ThreadSetup, ThreadView};
@@ -61,6 +65,8 @@ pub struct Workspace {
     /// The main area shows the review of the active project's changes instead of the thread.
     reviewing: bool,
     no_summaries: bool,
+    /// The sidebar-opacity slider in the settings popover.
+    opacity_slider: Entity<SliderState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -78,6 +84,16 @@ impl Workspace {
             State::default()
         });
 
+        let opacity = cx.try_global::<Settings>().map(|s| s.sidebar_opacity).unwrap_or(0.8);
+        let opacity_slider =
+            cx.new(|_| SliderState::new().min(Settings::MIN_OPACITY).max(1.0).step(0.05).default_value(opacity));
+        let slider_events = cx.subscribe(&opacity_slider, |this, _, event: &SliderEvent, cx| {
+            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
+            if let SliderValue::Single(opacity) = value {
+                let opacity = *opacity;
+                this.update_settings(cx, |s| s.sidebar_opacity = opacity);
+            }
+        });
         let mut this = Self {
             paths,
             home,
@@ -94,7 +110,8 @@ impl Workspace {
             changes: HashMap::new(),
             reviewing: false,
             no_summaries: launch.no_summaries,
-            _subscriptions: Vec::new(),
+            opacity_slider,
+            _subscriptions: vec![slider_events],
         };
 
         // Open the requested folder, or the current one when there are no projects yet.
@@ -288,6 +305,90 @@ impl Workspace {
             window.focus(&focus, cx);
         }
         cx.notify();
+    }
+
+    /// Change a setting, save it, and re-apply the theme if following it was switched.
+    fn update_settings(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Settings)) {
+        if !cx.has_global::<Settings>() {
+            cx.set_global(Settings::default());
+        }
+        let before = cx.global::<Settings>().clone();
+        cx.update_global::<Settings, _>(|settings, _| change(settings));
+        let after = cx.global::<Settings>().clone();
+        if after == before {
+            return;
+        }
+        if let Err(err) = after.save(&self.paths) {
+            self.problem = Some(format!("Could not save settings: {err:#}").into());
+        }
+        if after.follow_omarchy_theme != before.follow_omarchy_theme {
+            let font = cx.theme().font_family.to_string();
+            crate::omarchy::apply(cx, after.follow_omarchy_theme, Some(&font));
+        }
+        cx.notify();
+    }
+
+    fn settings_popover(&self, cx: &mut Context<Self>) -> AnyElement {
+        let this = cx.entity();
+        let slider = self.opacity_slider.clone();
+        let theme_name = crate::omarchy::theme_name(&self.home);
+        Popover::new("settings")
+            .anchor(Anchor::TopLeft)
+            .trigger(Button::new("settings-button").ghost().small().label("⚙").tooltip("Settings"))
+            .content(move |_, _window, cx| {
+                let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
+                let muted = cx.theme().muted_foreground;
+                let (this_follow, this_transparent) = (this.clone(), this.clone());
+                let row = |label: &'static str, hint: Option<String>, control: AnyElement| {
+                    h_flex()
+                        .gap_3()
+                        .justify_between()
+                        .child(
+                            v_flex()
+                                .child(div().text_sm().child(label))
+                                .children(hint.map(|h| div().text_xs().text_color(muted).child(h))),
+                        )
+                        .child(control)
+                };
+                v_flex()
+                    .w(px(300.))
+                    .gap_3()
+                    .p_1()
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Settings"))
+                    .child(row(
+                        "Follow Omarchy theme",
+                        Some(theme_name.clone().unwrap_or_else(|| "No Omarchy theme found".into())),
+                        Switch::new("follow-theme")
+                            .checked(settings.follow_omarchy_theme)
+                            .on_change(move |checked, _, cx| {
+                                let checked = *checked;
+                                this_follow
+                                    .update(cx, |w, cx| w.update_settings(cx, |s| s.follow_omarchy_theme = checked))
+                            })
+                            .into_any_element(),
+                    ))
+                    .child(row(
+                        "Transparent sidebar",
+                        None,
+                        Switch::new("transparent-sidebar")
+                            .checked(settings.transparent_sidebar)
+                            .on_change(move |checked, _, cx| {
+                                let checked = *checked;
+                                this_transparent
+                                    .update(cx, |w, cx| w.update_settings(cx, |s| s.transparent_sidebar = checked))
+                            })
+                            .into_any_element(),
+                    ))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(h_flex().justify_between().text_sm().child("Opacity").child(
+                                div().text_color(muted).child(format!("{:.0}%", settings.sidebar_opacity * 100.0)),
+                            ))
+                            .child(Slider::new(&slider).disabled(!settings.transparent_sidebar)),
+                    )
+            })
+            .into_any_element()
     }
 
     /// The active project's changes, created (and first read) on demand.
@@ -661,10 +762,13 @@ impl Workspace {
     // ---------- rendering ----------
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let settings = self.settings_popover(cx);
         let theme = cx.theme();
         let (muted, accent_bg, fg) =
             (theme.sidebar_foreground.opacity(0.6), theme.sidebar_accent, theme.sidebar_foreground);
         let (running, waiting) = (theme.warning, theme.primary);
+        let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
+        let sidebar_bg = theme.sidebar.opacity(alpha);
         let active = self.active.clone();
 
         let projects = self.state.projects.iter().map(|project| {
@@ -737,7 +841,7 @@ impl Workspace {
             .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_none()
-            .bg(theme.sidebar)
+            .bg(sidebar_bg)
             .border_r_1()
             .border_color(theme.sidebar_border)
             .child(
@@ -748,6 +852,7 @@ impl Workspace {
                     .gap_2()
                     .child(div().font_weight(FontWeight::BOLD).text_color(fg).child("TJ"))
                     .child(drag_area())
+                    .child(settings)
                     .child(
                         Button::new("add-project")
                             .ghost()
@@ -914,11 +1019,14 @@ impl Render for Workspace {
             terminal.as_ref().and_then(|t| t.read(cx).title().map(str::to_owned)).unwrap_or_else(|| "Terminal".into());
         let right_column = terminal.is_some() || changes_list.is_some() || overview_panel.is_some();
 
-        h_flex().size_full().bg(bg).text_color(fg).child(self.sidebar(cx)).child(
+        // The window itself is transparent: only the content area paints an opaque background,
+        // so the sidebar can be see-through.
+        h_flex().size_full().text_color(fg).child(self.sidebar(cx)).child(
             v_flex()
                 .flex_1()
                 .min_w_0()
                 .h_full()
+                .bg(bg)
                 .child(self.content_header(cx))
                 .when_some(self.problem.clone(), |el, problem| {
                     el.child(div().px_4().py_2().text_sm().text_color(danger).child(problem))
@@ -1045,6 +1153,26 @@ mod tests {
             window.click(SharedString::from("back-to-thread"), cx);
         });
         assert!(!workspace.read_with(cx, |w, _| w.reviewing));
+    }
+
+    #[gpui_kit::test]
+    fn the_settings_popover_turns_on_the_transparent_sidebar_and_saves_it(cx: &mut TestAppContext) {
+        let (window, _workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|_, cx| cx.set_global(crate::settings::Settings::default()));
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from("settings-button"), cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from("transparent-sidebar"), cx);
+        });
+        let settings = cx.update(|_, cx| cx.global::<crate::settings::Settings>().clone());
+        assert!(settings.transparent_sidebar);
+        assert_eq!(settings.sidebar_alpha(), 0.8);
+        assert_eq!(crate::settings::Settings::load(&paths), settings, "the change was saved");
     }
 
     #[gpui_kit::test]

@@ -146,7 +146,8 @@ impl TerminalView {
                     self.write(format(window_size(self.size, self.cell)).into_bytes())
                 }
                 TermEvent::ColorRequest(index, format) => {
-                    let rgb = self.term.lock().colors()[index].unwrap_or_else(|| default_rgb(index));
+                    let (ansi, _, _) = terminal_colors(cx);
+                    let rgb = self.term.lock().colors()[index].unwrap_or_else(|| default_rgb(index, &ansi));
                     self.write(format(rgb).into_bytes());
                 }
                 TermEvent::Exit | TermEvent::ChildExit(_) => self.exited = true,
@@ -324,15 +325,31 @@ fn key_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
 
 // ---------- colours ----------
 
-/// Tokyo Night-ish defaults for the 16 ANSI colours, used until the app follows the Omarchy theme.
+/// Tokyo Night-ish defaults for the 16 ANSI colours, used when no Omarchy theme is followed.
 const ANSI: [u32; 16] = [
     0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6, //
     0x414868, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xc0caf5,
 ];
 
-fn default_rgb(index: usize) -> Rgb {
+/// The 16 ANSI colours and the default foreground and background: the Omarchy theme's when
+/// TJ follows it ([`crate::omarchy::TerminalColors`]), else the built-in defaults and the UI theme.
+fn terminal_colors(cx: &App) -> ([Rgb; 16], Hsla, Hsla) {
+    let hex = |s: &str| u32::from_str_radix(s.trim_start_matches('#'), 16).ok();
+    let rgb_of = |v: u32| Rgb { r: (v >> 16) as u8, g: (v >> 8) as u8, b: v as u8 };
+    match cx.try_global::<crate::omarchy::TerminalColors>() {
+        Some(colors) => {
+            let ansi = std::array::from_fn(|i| rgb_of(hex(&colors.ansi[i]).unwrap_or(ANSI[i])));
+            let fg = hex(&colors.foreground).map(|v| rgb_to_hsla(rgb_of(v))).unwrap_or(cx.theme().foreground);
+            let bg = hex(&colors.background).map(|v| rgb_to_hsla(rgb_of(v))).unwrap_or(cx.theme().background);
+            (ansi, fg, bg)
+        }
+        None => (std::array::from_fn(|i| rgb_of(ANSI[i])), cx.theme().foreground, cx.theme().background),
+    }
+}
+
+fn default_rgb(index: usize, ansi: &[Rgb; 16]) -> Rgb {
     let hex = match index {
-        0..=15 => ANSI[index],
+        0..=15 => return ansi[index],
         16..=231 => {
             let i = index - 16;
             let level = |v: usize| if v == 0 { 0 } else { 55 + v as u32 * 40 };
@@ -353,6 +370,7 @@ fn rgb_to_hsla(c: Rgb) -> Hsla {
 
 struct Palette<'a> {
     colors: &'a Colors,
+    ansi: [Rgb; 16],
     fg: Hsla,
     bg: Hsla,
 }
@@ -360,7 +378,7 @@ struct Palette<'a> {
 impl Palette<'_> {
     /// `None` means "the default background", which is left unpainted.
     fn resolve(&self, color: Color, flags: Flags, is_fg: bool) -> Option<Hsla> {
-        let indexed = |i: usize| Some(rgb_to_hsla(self.colors[i].unwrap_or_else(|| default_rgb(i))));
+        let indexed = |i: usize| Some(rgb_to_hsla(self.colors[i].unwrap_or_else(|| default_rgb(i, &self.ansi))));
         match color {
             Color::Spec(rgb) => Some(rgb_to_hsla(rgb)),
             Color::Indexed(i) => {
@@ -388,15 +406,13 @@ impl Palette<'_> {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let fg = theme.foreground;
-        let bg = theme.background;
+        let (ansi, fg, bg) = terminal_colors(cx);
         let base_font = mono_font(cx);
         let focused = self.focus.is_focused(window);
 
         let term = self.term.lock();
         let content = term.renderable_content();
-        let palette = Palette { colors: content.colors, fg, bg };
+        let palette = Palette { colors: content.colors, ansi, fg, bg };
         let offset = content.display_offset as i32;
         let cursor = content.cursor;
 

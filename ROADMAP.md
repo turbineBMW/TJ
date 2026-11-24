@@ -6,7 +6,9 @@
 
 **Done (milestone 3b):** the pi-style overview (Goal, Now, Next, Tasks) with context, usage and cost.
 
-**Next:** the transparent-sidebar setting and following the Omarchy theme, then terminal splits and tabs.
+**Done (milestone 3c):** following the Omarchy theme live (window and terminal) and the transparent-sidebar setting.
+
+**Next:** terminal splits and tabs.
 
 These are steering decisions, not a schedule. Build toward them, but don't let them block the agent core.
 

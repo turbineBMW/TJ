@@ -11,6 +11,8 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **Saved across restarts.** Projects, threads and transcripts are saved; reopening a thread shows its history and resumes its Claude conversation.
 - **Overview and usage**, like the pi session sidebar. The top of the right column shows the thread's **Goal**, **Now**, **Next** and **Tasks** (recent done ones struck through), rewritten by Haiku on the thread's account after each turn and every minute during long ones, from the newest part of the conversation. Claude's own task list (TodoWrite) feeds into it. The thread's title in the sidebar comes from it too. Underneath: context used against the model's window, subscription usage windows, cost (marked ≈ on a subscription, where it's an estimate) and the model. **↻** updates it now.
 - **Changes and review.** The right column lists the project's uncommitted changes (git's working tree against HEAD, new files included) with A/M/D/R, paths and line counts; a dot marks files the current thread edited. Click a file, or **Review**, to see every diff stacked (unified or side by side), scrolled to that file. Under each file's header is a short summary of what changed and why, written by Haiku on the thread's account with your recent requests as context; summaries are cached until the file changes again. The list refreshes as the agent works.
+- **Omarchy theme, live.** TJ takes its colours from the active Omarchy theme (`~/.local/state/omarchy/current/theme/colors.toml`, resolved with the same cascade as Bubo and Rustle, so legacy themes work too) and follows theme switches within two seconds. Light themes get a readable "ink" for text, as in Bubo. The terminal follows the theme's `alacritty.toml`, like your other terminals, so a light theme that pins its terminals dark stays dark there.
+- **Transparent sidebar**, as an app setting like the rest of the app family: ⚙ in the sidebar header has **Transparent sidebar** (off by default) and an **Opacity** slider (0.8 by default), plus **Follow Omarchy theme**. Settings are saved in `~/.config/tj/settings.toml`.
 - **GNOME-style window**: no title bar; drag either header to move it, double-click to maximize.
 - **Streaming replies** in markdown, with tool calls shown as cards you can expand to see their output.
 - **Approval cards** when Claude wants to do something risky: **Approve**, **Approve for session**, **Decline** (with optional feedback that's passed to Claude) or **Cancel turn**.
@@ -18,7 +20,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **Usage and cost**: subscription usage windows (for example "7d 4%"), plus the cost of each turn and the whole thread.
 - **Stop** interrupts a running turn. If `claude` exits, the next message resumes the conversation.
 
-The transparent sidebar, Omarchy theming and terminal splits are next; see [ROADMAP.md](ROADMAP.md).
+Terminal splits and tabs are next; see [ROADMAP.md](ROADMAP.md).
 
 ## Run
 
@@ -58,6 +60,7 @@ Test hooks:
   config_dir = "~/.claude-work"
   ```
 
+- `~/.config/tj/settings.toml`: follow the Omarchy theme, transparent sidebar, opacity.
 - `~/.local/share/tj/state.json`: projects, threads, defaults, and what was open.
 - `~/.local/share/tj/threads/<id>.jsonl`: each thread's transcript.
 
@@ -91,5 +94,6 @@ cargo test -- --ignored live_       # runs the real claude once (needs a login; 
 - **gpui on Linux ignores the weight axis of variable fonts.** Adwaita Sans and gpui-kit's `.SystemUIFont` render **bold** as regular. TJ uses the desktop font only when it has a separate bold file, and falls back to Noto Sans otherwise.
 - **gpui runs key bindings before a view's key handler.** gpui-kit's root view binds Tab to focus traversal and Ctrl+C to Copy; `src/keymap.rs` and `terminal::init` unbind what TJ needs.
 - **A hidden window doesn't repaint** until something asks for a frame. The model keeps updating, so nothing is lost.
+- **gpui-kit's root paints the theme background over the whole window**, which would hide a see-through sidebar. `main` clears the root's own background right after opening the window (the root's style is applied after its plugins'), and the content area paints its own.
 - gpui-kit 0.11 pins `gpui-pre` 0.3.14, a snapshot of Zed's gpui published by the gpui-kit author, not Zed's `gpui` 0.2.x on crates.io.
 - The terminal handles colours, bold, underline, inverse, Nerd Font glyphs, resize, scrollback, the alt screen and bracketed paste. Not done yet: mouse selection and copy, mouse reporting, a blinking cursor, and images.

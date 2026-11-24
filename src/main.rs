@@ -4,8 +4,10 @@ mod agent;
 mod changes;
 mod demo;
 mod keymap;
+mod omarchy;
 mod overview;
 mod sample;
+mod settings;
 mod store;
 mod terminal;
 mod thread;
@@ -13,7 +15,6 @@ mod workspace;
 
 use std::path::PathBuf;
 
-use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
 use workspace::{Launch, Workspace};
@@ -127,10 +128,13 @@ fn main() {
             }
         })
         .detach();
-        Theme::change(ThemeMode::Dark, None, cx);
-        if let Some(family) = desktop_ui_font() {
-            Theme::global_mut(cx).font_family = family.into();
-        }
+        let launch = args.launch();
+        let paths = launch.paths.clone().unwrap_or_else(store::Paths::from_env);
+        let settings = settings::Settings::load(&paths);
+        let font = desktop_ui_font();
+        omarchy::apply(cx, settings.follow_omarchy_theme, font.as_deref());
+        omarchy::watch(cx, font);
+        cx.set_global(settings);
 
         // GNOME-style: no title bar; the sidebar and content headers move the window.
         let options = WindowOptions {
@@ -138,11 +142,21 @@ fn main() {
             app_id: Some("tj".into()),
             titlebar: None,
             window_decorations: Some(WindowDecorations::Client),
+            // Transparent so the sidebar can be see-through; everything else paints opaque.
+            window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         };
-        let launch = args.launch();
-        gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(launch, window, cx)))
-            .expect("failed to open window");
+        let (window, _) =
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(launch, window, cx)))
+                .expect("failed to open window");
+        // gpui-kit's root paints the theme background over the whole window. The root's own
+        // style is applied after that, so clear it there: TJ's content area paints its own
+        // background, and the sidebar can then be see-through.
+        if let Some(root) = window.downcast::<gpui_kit::base::Root>() {
+            let _ = root.update(cx, |root, _, _| {
+                root.style().background = Some(gpui_kit::transparent_black().into());
+            });
+        }
         cx.activate(true);
     });
 }
