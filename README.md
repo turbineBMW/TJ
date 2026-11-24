@@ -23,7 +23,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
   | `Ctrl+Shift+A` | Focus the next pane |
   | `Ctrl+Shift+=` / `Ctrl+Shift+-` | Grow / shrink the pane |
   | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |
-- **GNOME-style window**: no title bar; drag either header to move it, double-click to maximize. The sidebar header has **new thread** on the left, **TJ** in the middle, and **settings** and **add project** on the right. The top bar shows `[badge] Project / Thread`, like T3 Code, with the pane actions (new terminal, split right, split down) on the right. The conversation stays at a readable width in a wide window.
+- **GNOME-style window**: no title bar; drag either header to move it, double-click to maximize. The sidebar header has **add project** on the left, **TJ** in the middle, and **settings** on the right; each project's **+** starts a new thread. The top bar shows `[badge] Project / Thread`, like T3 Code, with the pane actions (new terminal, split right, split down) on the right. The conversation stays at a readable width in a wide window.
 - **Streaming replies** in markdown, with tool calls shown as cards you can expand to see their output.
 - **Approval cards** when Claude wants to do something risky: **Approve**, **Approve for session**, **Decline** (with optional feedback that's passed to Claude) or **Cancel turn**.
 - **Permission modes** for the thread: Ask, Accept edits, Auto, Plan and Full access.

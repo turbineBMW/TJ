@@ -942,29 +942,15 @@ impl Workspace {
                             .px_2()
                             .gap_1()
                             .child(
-                                Button::new("sidebar-new-thread")
-                                    .ghost()
-                                    .small()
-                                    .icon(IconName::SquarePen)
-                                    .tooltip("New thread")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        let project =
-                                            this.active_project().or(this.state.projects.first()).map(|p| p.id.clone());
-                                        if let Some(project) = project {
-                                            this.new_thread(&project, window, cx);
-                                        }
-                                    })),
-                            )
-                            .child(drag_area())
-                            .child(settings)
-                            .child(
                                 Button::new("add-project")
                                     .ghost()
                                     .small()
                                     .icon(IconName::FolderPlus)
                                     .tooltip("Add project")
                                     .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
-                            ),
+                            )
+                            .child(drag_area())
+                            .child(settings),
                     ),
             )
             .child(div().id("projects").flex_1().min_h_0().overflow_y_scroll().children(projects))
