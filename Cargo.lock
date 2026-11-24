@@ -7208,6 +7208,8 @@ dependencies = [
  "base64",
  "gpui-kit",
  "image",
+ "miniz_oxide 0.8.9",
+ "polling",
  "serde",
  "serde_json",
  "smol",

@@ -6,6 +6,7 @@ mod changes;
 mod composer;
 mod demo;
 mod handoff;
+mod images;
 mod keymap;
 mod omarchy;
 mod overview;

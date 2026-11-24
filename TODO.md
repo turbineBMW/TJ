@@ -21,7 +21,7 @@ What's missing or rough, roughly in priority order. ROADMAP.md has the direction
 - [x] Mouse selection and copy in the terminal (drag, double- and triple-click; primary selection, Ctrl+Shift+C, middle-click paste).
 - [x] Mouse reporting for terminal apps (vim, htop, less): clicks, drags, motion and the wheel; Shift selects instead.
 - [x] Smooth cursor, in the terminal and the text fields: glides, fades as it blinks, optional trail; speed and trail in settings.
-- [ ] Images (SIXEL/kitty), as in the vte fork.
+- [x] Inline images: kitty graphics, SIXEL and iTerm2 (no kitty animation or relative placements).
 - [x] Drag to resize splits (the divider between panes; double-click centres it).
 
 ## Distribution
