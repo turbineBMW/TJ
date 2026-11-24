@@ -25,7 +25,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
   | `Ctrl+Shift+E` / `Ctrl+Shift+O` | Split right / down |
   | `Ctrl+Alt+←/→/↑/↓` | Focus the pane in that direction |
   | `Ctrl+Shift+A` | Focus the next pane |
-  | `Ctrl+Shift+=` / `Ctrl+Shift+-` | Grow / shrink the pane |
+  | `Ctrl+Shift+=` / `Ctrl+Shift+-` | Grow / shrink the pane (or drag the divider between panes; double-click it to even them out) |
   | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |
 - **GNOME-style window**: no title bar; drag either header to move it, double-click to maximize. The sidebar header has **add project** on the left, **TJ** in the middle, and **settings** on the right; each project's **+** starts a new thread. The top bar shows `[badge] Project / Thread`, like T3 Code, with the pane actions (new terminal, split right, split down) on the right. The conversation stays at a readable width in a wide window.
 - **A start screen for new threads**, like T3 Code's: "What should we build in <project>?", a large prompt card with the account and mode menus, and the folder, branch and mode underneath. The first message switches to the conversation, and the overview pane appears once there's something in it.
@@ -125,4 +125,4 @@ cargo test -- --ignored live_       # runs the real claude once (needs a login; 
 - **A hidden window doesn't repaint** until something asks for a frame. The model keeps updating, so nothing is lost.
 - **gpui-kit's root paints the theme background over the whole window**, which would hide a see-through sidebar. `main` clears the root's own background right after opening the window (the root's style is applied after its plugins'), and the content area paints its own.
 - gpui-kit 0.11 pins `gpui-pre` 0.3.14, a snapshot of Zed's gpui published by the gpui-kit author, not Zed's `gpui` 0.2.x on crates.io.
-- The terminal handles colours, bold, underline, inverse, Nerd Font glyphs, resize, scrollback, the alt screen and bracketed paste. Not done yet: mouse selection and copy, mouse reporting, a blinking cursor, and images.
+- The terminal handles colours, bold, underline, inverse, Nerd Font glyphs, resize, scrollback, the alt screen and bracketed paste. It also does mouse selection and copy, and mouse reporting. Not done yet: a blinking cursor, and images.
