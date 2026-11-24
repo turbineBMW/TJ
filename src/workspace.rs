@@ -1,6 +1,6 @@
-//! The window: a full-height sidebar of projects and threads; the project's panes, where
-//! conversations, terminals and the review are tabs; and the overview on the right when
-//! there's something in it. Laid out like a GNOME app: no title bar; the headers move it.
+//! The window: a full-height sidebar of projects and threads, and the project's panes, where
+//! the agent (the picked thread with its status column), terminals and the review are tabs.
+//! Laid out like a GNOME app: no title bar; the headers move it.
 
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
@@ -17,7 +17,8 @@ use gpui_kit::component::{
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::agent::{AgentEvent, claude::SessionOptions};
-use crate::changes::{ChangeKind, ProjectChanges, ReviewView, Summarizer};
+use crate::agent_slot::{AgentSlot, AgentSlotEvent};
+use crate::changes::{ProjectChanges, ReviewView, Summarizer};
 use crate::panes::{PaneEvent, Panes, Start};
 use crate::settings::Settings;
 use crate::store::SplitDirection;
@@ -27,7 +28,6 @@ use gpui_kit::assets::IconName;
 
 const SIDEBAR_WIDTH: f32 = 264.0;
 const HEADER_HEIGHT: f32 = 46.0;
-const OVERVIEW_WIDTH: f32 = 340.0;
 
 /// How the workspace starts.
 #[derive(Default)]
@@ -56,11 +56,13 @@ pub struct Workspace {
     accounts: Accounts,
     state: State,
     threads: HashMap<String, Entity<ThreadView>>,
-    /// Per project: its panes of conversations, terminals and the review.
+    /// Per project: its panes of the agent, terminals and the review.
     panes: HashMap<String, Entity<Panes>>,
+    /// Per project: its agent, shown in the agent tab.
+    agents: HashMap<String, Entity<AgentSlot>>,
     /// Per project: the review of its changes, shown in a tab.
     reviews: HashMap<String, Entity<ReviewView>>,
-    /// The conversation the header and overview follow (the last one focused).
+    /// The thread the header follows (the one last shown or focused).
     active: Option<String>,
     shell: Option<alacritty_terminal::tty::Shell>,
     model: Option<String>,
@@ -130,6 +132,7 @@ impl Workspace {
             state,
             threads: HashMap::new(),
             panes: HashMap::new(),
+            agents: HashMap::new(),
             reviews: HashMap::new(),
             active: None,
             shell: launch.shell,
@@ -348,7 +351,7 @@ impl Workspace {
         }
     }
 
-    /// Show a conversation in its project's panes (focusing its tab, or opening one).
+    /// Show a thread in its project's agent tab, in place of the one there.
     fn open_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.ensure_thread(thread_id, window, cx) else { return };
         let Some(project_id) = self.state.thread(thread_id).map(|(p, _)| p.id.clone()) else { return };
@@ -439,7 +442,11 @@ impl Workspace {
         let Some(meta) = self.state.thread_mut(thread_id) else { return };
         meta.archived = archived;
         if archived {
-            self.close_thread_tab(thread_id, window, cx);
+            self.close_thread_tab(thread_id, cx);
+            if self.active.as_deref() == Some(thread_id) {
+                self.active = None;
+                self.pick_active(thread_id, window, cx);
+            }
         }
         self.save();
         cx.notify();
@@ -465,15 +472,17 @@ impl Workspace {
     }
 
     fn delete_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_thread_tab(thread_id, window, cx);
+        self.close_thread_tab(thread_id, cx);
+        let was_active = self.active.as_deref() == Some(thread_id);
+        if was_active {
+            self.active = None;
+            // Picked while the thread is still known, so its project's threads come first.
+            self.pick_active(thread_id, window, cx);
+        }
         // Dropping the view ends its Claude process.
         self.threads.remove(thread_id);
         self.state.remove_thread(thread_id);
         self.paths.delete_thread_files(thread_id);
-        if self.active.as_deref() == Some(thread_id) {
-            self.active = None;
-            self.pick_active(window, cx);
-        }
         self.save();
         cx.notify();
     }
@@ -514,31 +523,38 @@ impl Workspace {
         }
         // Its panes go too: their terminals' shells end with them.
         self.panes.remove(project_id);
+        self.agents.remove(project_id);
         self.reviews.remove(project_id);
         self.changes.remove(project_id);
         self.show_archived.remove(project_id);
-        if self.active.as_ref().is_some_and(|id| project.threads.iter().any(|t| &t.id == id)) {
-            self.active = None;
-            self.pick_active(window, cx);
+        if let Some(gone) = self.active.take_if(|id| project.threads.iter().any(|t| &t.id == id)) {
+            self.pick_active(&gone, window, cx);
         }
         self.save();
         cx.notify();
     }
 
-    fn close_thread_tab(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_thread_tab(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         let Some(project_id) = self.state.thread(thread_id).map(|(p, _)| p.id.clone()) else { return };
         if let Some(panes) = self.panes.get(&project_id).cloned() {
-            panes.update(cx, |p, cx| p.close_thread(thread_id, window, cx));
+            panes.update(cx, |p, cx| p.close_thread(thread_id, cx));
         }
     }
 
-    /// After the active thread went away: the conversation its panes now show, else the
-    /// newest thread left (archived ones aside), else nothing.
-    fn pick_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let shown = self.panes.values().find_map(|p| p.read(cx).active_thread_id());
-        let next = shown.or_else(|| {
-            self.state.projects.iter().flat_map(|p| p.threads.iter()).find(|t| !t.archived).map(|t| t.id.clone())
-        });
+    /// After the active thread (`gone`) went away: the next thread in its project, else the
+    /// first in any other project (archived ones aside), else nothing.
+    fn pick_active(&mut self, gone: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.state.thread(gone).map(|(p, _)| p.id.clone());
+        let candidates = |same: bool| {
+            self.state
+                .projects
+                .iter()
+                .filter(|p| (Some(&p.id) == project.as_ref()) == same)
+                .flat_map(|p| p.threads.iter())
+                .find(|t| !t.archived && t.id != gone)
+                .map(|t| t.id.clone())
+        };
+        let next = candidates(true).or_else(|| candidates(false));
         match next {
             Some(id) => self.open_thread(&id, window, cx),
             None => self.state.selected_thread = None,
@@ -931,255 +947,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Goal, Now, Next and tasks for the active thread, with its usage underneath (like pi's sidebar).
-    fn overview_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let thread = self.active_thread()?;
-        let t = thread.read(cx);
-        let theme = cx.theme();
-        let (muted, accent, fg) = (theme.muted_foreground, theme.primary, theme.foreground);
-        let ov = &t.overview;
-        if ov.is_empty() {
-            return None;
-        }
-        let label =
-            |text: &'static str| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(text);
-        let field = |name: &'static str, value: &Option<String>, color: Hsla| {
-            value.clone().map(|value| {
-                v_flex().gap_0p5().child(label(name)).child(div().text_sm().text_color(color).child(value))
-            })
-        };
-
-        let body = if ov.is_empty() {
-            div()
-                .text_sm()
-                .text_color(muted)
-                .child(if t.overview_busy {
-                    "Writing the overview…"
-                } else {
-                    "The overview appears after the first reply."
-                })
-                .into_any_element()
-        } else {
-            let tasks = ov.tasks.iter().map(|task| {
-                h_flex()
-                    .gap_2()
-                    .items_start()
-                    .text_sm()
-                    .child(div().text_color(if task.done { muted } else { accent }).child(if task.done {
-                        "✓"
-                    } else {
-                        "○"
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .when(task.done, |el| el.text_color(muted).line_through())
-                            .child(task.text.clone()),
-                    )
-            });
-            v_flex()
-                .gap_2()
-                .children(field("GOAL", &ov.goal, fg))
-                .children(field("NOW", &ov.now, accent))
-                .children(field("NEXT", &ov.next, fg))
-                .when(!ov.tasks.is_empty(), |el| {
-                    el.child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(h_flex().gap_1().child(label("TASKS")).child(
-                                div().text_xs().text_color(muted).child(format!(
-                                    "{}/{}",
-                                    ov.done_count(),
-                                    ov.tasks.len()
-                                )),
-                            ))
-                            .children(tasks),
-                    )
-                })
-                .into_any_element()
-        };
-
-        Some(
-            v_flex()
-                .id("overview")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(muted)
-                                .child("OVERVIEW"),
-                        )
-                        .when(t.overview_busy && !ov.is_empty(), |el| {
-                            el.child(div().text_xs().text_color(muted).child("updating…"))
-                        })
-                        .child(
-                            Button::new("refresh-overview")
-                                .xsmall()
-                                .ghost()
-                                .label("↻")
-                                .tooltip("Update the overview now")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(thread) = this.active_thread() {
-                                        thread.update(cx, |t, cx| t.update_overview(cx));
-                                    }
-                                })),
-                        ),
-                )
-                .child(body)
-                .into_any_element(),
-        )
-    }
-
-    /// The agent's numbers, pinned to the bottom of the overview pane: context, usage windows,
-    /// cost and model.
-    fn metrics(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let thread = self.active_thread()?;
-        let t = thread.read(cx);
-        let theme = cx.theme();
-        let (muted, border) = (theme.muted_foreground, theme.border);
-        let mut stats = Vec::new();
-        if let (Some(tokens), Some(window)) = (t.context_tokens, t.context_window) {
-            let percent = tokens as f64 / window.max(1) as f64 * 100.0;
-            stats.push(format!("ctx {} / {} · {percent:.0}%", compact(tokens), compact(window)));
-        }
-        for window in &t.usage {
-            let name = match window.id.as_str() {
-                "five_hour" => "5h",
-                "seven_day" => "7d",
-                other => other,
-            };
-            stats.push(format!("{name} {:.0}%", window.utilization * 100.0));
-        }
-        if t.cost_usd > 0.0 {
-            // On a subscription this is Claude's estimate, not a charge.
-            let approx = if t.usage.is_empty() { "" } else { "≈" };
-            stats.push(if t.cost_usd < 1.0 {
-                format!("{approx}${:.3}", t.cost_usd)
-            } else {
-                format!("{approx}${:.2}", t.cost_usd)
-            });
-        }
-        if let Some(model) = &t.model {
-            stats.push(thread::short_model(model));
-        }
-
-        if stats.is_empty() {
-            return None;
-        }
-        Some(
-            div()
-                .flex_none()
-                .px_3()
-                .py_2()
-                .border_t_1()
-                .border_color(border)
-                .text_xs()
-                .text_color(muted)
-                .child(stats.join("  ·  "))
-                .into_any_element(),
-        )
-    }
-
-    fn changes_list(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let changes = self.project_changes(cx)?;
-        let touched = self
-            .active_thread()
-            .zip(self.active_project().map(|p| p.path.clone()))
-            .map(|(t, root)| crate::changes::touched_relative(&root, &t.read(cx).touched))
-            .unwrap_or_default();
-        let model = changes.read(cx);
-        if !model.changes.is_repo || model.changes.files.is_empty() {
-            return None;
-        }
-        let theme = cx.theme();
-        let (muted, border, accent) = (theme.muted_foreground, theme.border, theme.primary);
-        let (added, deleted, modified) = (theme.success, theme.danger, theme.warning);
-        let mono = theme.mono_font_family.clone();
-        let rows = model.changes.files.iter().enumerate().map(|(ix, file)| {
-            let path = file.path.clone();
-            let (dir, name) = match path.rsplit_once('/') {
-                Some((dir, name)) => (format!("{dir}/"), name.to_string()),
-                None => (String::new(), path.clone()),
-            };
-            let color = match file.kind {
-                ChangeKind::Added => added,
-                ChangeKind::Deleted => deleted,
-                ChangeKind::Modified => modified,
-                ChangeKind::Renamed => accent,
-            };
-            h_flex()
-                .id(SharedString::from(format!("change-{ix}")))
-                .test_support()
-                .gap_2()
-                .px_3()
-                .py_0p5()
-                .cursor_pointer()
-                .hover(|el| el.bg(border.opacity(0.5)))
-                .on_click(cx.listener(move |this, _, window, cx| this.open_review(Some(path.clone()), window, cx)))
-                .child(div().w_3().text_xs().font_family(mono.clone()).text_color(color).child(file.kind.letter()))
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_sm()
-                        .child(div().text_color(muted).child(dir))
-                        .child(div().child(name)),
-                )
-                .when(touched.contains(&file.path), |el| el.child(div().size_1p5().rounded_full().bg(accent)))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_family(mono.clone())
-                        .text_color(muted)
-                        .child(format!("+{} −{}", file.additions, file.deletions)),
-                )
-        });
-        Some(
-            v_flex()
-                .flex_none()
-                .max_h(relative(0.4))
-                .border_t_1()
-                .border_color(border)
-                .child(
-                    h_flex()
-                        .px_3()
-                        .py_1()
-                        .gap_2()
-                        .child(div().text_xs().text_color(muted).child(format!(
-                            "Changes · {} files · +{} −{}",
-                            model.changes.files.len(),
-                            model.changes.additions(),
-                            model.changes.deletions()
-                        )))
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("review-changes")
-                                .xsmall()
-                                .ghost()
-                                .label("Review")
-                                .on_click(cx.listener(|this, _, window, cx| this.open_review(None, window, cx))),
-                        ),
-                )
-                .child(div().id("changes-list").pb_1().overflow_y_scroll().children(rows))
-                .into_any_element(),
-        )
-    }
-
-    /// A project's panes, restored from its saved layout on first use. `start` is the
-    /// conversation to show when there's no saved layout.
+    /// A project's panes, restored from its saved layout on first use. `start` is the thread
+    /// to show in the agent tab.
     fn project_panes(
         &mut self,
         project_id: &str,
@@ -1191,10 +960,6 @@ impl Workspace {
             return Some(panes.clone());
         }
         let project = self.state.project(project_id)?.clone();
-        // Saved conversation tabs need their threads first.
-        let ids = project.layout.as_ref().map(|l| l.thread_ids()).unwrap_or_default();
-        let threads: HashMap<String, Entity<ThreadView>> =
-            ids.into_iter().filter_map(|id| self.ensure_thread(&id, window, cx).map(|view| (id, view))).collect();
         let changes = self
             .changes
             .entry(project.id.clone())
@@ -1206,12 +971,22 @@ impl Workspace {
             .entry(project.id.clone())
             .or_insert_with(|| cx.new(|cx| ReviewView::new(changes.clone(), no_summaries, cx)))
             .clone();
+        let agent = cx.new(|cx| AgentSlot::new(project.path.clone(), changes.clone(), cx));
+        self._subscriptions.push(cx.subscribe_in(
+            &agent,
+            window,
+            |this, _, AgentSlotEvent::OpenReview(path): &AgentSlotEvent, window, cx| {
+                this.open_review(path.clone(), window, cx)
+            },
+        ));
+        self._subscriptions.push(cx.observe(&agent, |_, _, cx| cx.notify()));
+        self.agents.insert(project.id.clone(), agent.clone());
         let shell = self.shell.clone();
         let panes = cx.new(|cx| {
             Panes::new(
                 project.path.clone(),
                 project.layout.as_ref(),
-                &threads,
+                agent,
                 review,
                 Start { thread: start, terminal: false },
                 shell,
@@ -1519,6 +1294,16 @@ impl Workspace {
                 .context_menu(move |menu, _, _| choices.add_to(menu))
         });
         let has_panes = self.active_project().is_some_and(|p| self.panes.contains_key(&p.id));
+        let agent = self.active_project().and_then(|p| self.agents.get(&p.id)).cloned();
+        let status_toggle = agent.filter(|a| a.read(cx).has_status(cx)).map(|agent| {
+            let shown = agent.read(cx).status_shown(cx);
+            Button::new("header-status")
+                .ghost()
+                .small()
+                .icon(if shown { IconName::PanelRightClose } else { IconName::PanelRightOpen })
+                .tooltip(if shown { "Hide the thread's status" } else { "Show the thread's status" })
+                .on_click(move |_, _, cx| agent.update(cx, |a, cx| a.toggle_status(cx)))
+        });
 
         let pane_button = |id: &'static str, icon: IconName, tip: &'static str| {
             Button::new(id).ghost().small().icon(icon).tooltip(tip)
@@ -1570,6 +1355,7 @@ impl Workspace {
                         .on_click(with_panes(|p, window, cx| p.split(SplitDirection::Down, window, cx))),
                 )
             })
+            .children(status_toggle)
             .child(Button::new("close-window").ghost().small().icon(IconName::X).tooltip("Close").on_click(
                 cx.listener(|this, _, window, cx| {
                     this.save_layouts(cx);
@@ -1669,15 +1455,6 @@ fn initials(name: &str) -> String {
     letters.to_uppercase()
 }
 
-/// 12_345 -> "12k", 1_000_000 -> "1M".
-fn compact(n: u64) -> String {
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..1_000_000 => format!("{}k", n / 1_000),
-        _ => format!("{}M", (n as f64 / 1_000_000.0 * 10.0).round() / 10.0),
-    }
-}
-
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
@@ -1685,15 +1462,8 @@ fn shell_quote(text: &str) -> String {
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let panes = self.active_project().and_then(|p| self.panes.get(&p.id)).cloned();
-        let overview_panel = self.overview_panel(cx);
-        let changes_list = self.changes_list(cx);
-        let metrics = self.metrics(cx);
         let theme = cx.theme();
-        let (bg, fg, border, danger) = (theme.background, theme.foreground, theme.border, theme.danger);
-        // The overview pane only appears when it has something to show, and stays out of the
-        // way while the active thread is still on its intro.
-        let fresh = self.active_thread().is_some_and(|t| t.read(cx).is_fresh());
-        let right_pane = !fresh && (overview_panel.is_some() || changes_list.is_some());
+        let (bg, fg, danger) = (theme.background, theme.foreground, theme.danger);
 
         // The window itself is transparent: only the content area paints an opaque background,
         // so the sidebar can be see-through.
@@ -1707,24 +1477,7 @@ impl Render for Workspace {
                 .when_some(self.problem.clone(), |el, problem| {
                     el.child(div().px_4().py_2().text_sm().text_color(danger).child(problem))
                 })
-                .child(h_flex().flex_1().min_h_0().child(div().flex_1().min_w_0().h_full().children(panes)).when(
-                    right_pane,
-                    |el| {
-                        el.child(
-                            // Summary and tasks take the space; changed files sit above the agent's
-                            // numbers, which are pinned to the bottom.
-                            v_flex()
-                                .w(px(OVERVIEW_WIDTH))
-                                .flex_none()
-                                .h_full()
-                                .border_l_1()
-                                .border_color(border)
-                                .child(v_flex().flex_1().min_h_0().children(overview_panel))
-                                .children(changes_list)
-                                .children(metrics),
-                        )
-                    },
-                )),
+                .child(div().flex_1().min_h_0().min_w_0().children(panes)),
         )
     }
 }
@@ -1852,6 +1605,76 @@ mod tests {
         cx.run_until_parked();
         let meta = State::load(&paths).unwrap().projects[0].threads[0].clone();
         assert_eq!((meta.title.as_deref(), meta.named), (Some("Changelog work"), false));
+    }
+
+    #[gpui_kit::test]
+    fn picking_threads_swaps_the_one_agent_tab_and_keeps_the_terminals(cx: &mut TestAppContext) {
+        let (window, workspace, _, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (_, first, second) = two_threads(&workspace, cx);
+        let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
+        panes.update_in(cx, |p, window, cx| p.new_terminal(window, cx));
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2], "the agent tab and a terminal");
+
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from(format!("thread-{first}")), cx);
+        });
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2], "no tab per thread");
+        assert_eq!(panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some(first.clone()));
+        assert_eq!(workspace.read_with(cx, |w, _| w.active.clone()), Some(first));
+
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from(format!("thread-{second}")), cx);
+        });
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2]);
+        assert_eq!(panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some(second));
+        let layout = panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
+        let crate::store::PaneLayout::Pane { tabs, .. } = layout else { panic!("{layout:?}") };
+        assert_eq!(tabs[0], crate::store::TabState::Agent, "saved without a thread id");
+    }
+
+    #[gpui_kit::test]
+    fn the_status_column_sits_in_the_agent_tab_and_folds_when_narrow(cx: &mut TestAppContext) {
+        let (window, workspace, _, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        thread.update(cx, |t, cx| {
+            t.handle(crate::agent::AgentEvent::TextDelta("Started.".into()), cx);
+            let overview = crate::overview::Overview { goal: Some("Ship it".into()), ..Default::default() };
+            t.apply_overview(overview, 0, cx);
+        });
+        let settle = |cx: &mut VisualTestContext| {
+            for _ in 0..3 {
+                cx.update(|window, cx| window.render_frame(cx));
+                cx.run_until_parked();
+            }
+        };
+        let status_showing = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.render_frame(cx);
+                window.try_find(SharedString::from("status")).is_some()
+            })
+        };
+        settle(cx);
+        assert!(status_showing(cx), "a wide agent tab shows the status column");
+
+        // Split twice: the agent tab gets narrow and the column folds away.
+        cx.update(|window, cx| {
+            window.click(SharedString::from("header-split-right"), cx);
+            window.render_frame(cx);
+        });
+        settle(cx);
+        assert!(!status_showing(cx), "folded when narrow");
+
+        // The top bar shows it again by hand.
+        cx.update(|window, cx| window.click(SharedString::from("header-status"), cx));
+        settle(cx);
+        assert!(status_showing(cx), "shown by hand");
+        cx.update(|window, cx| window.click(SharedString::from("header-status"), cx));
+        settle(cx);
+        assert!(!status_showing(cx), "and hidden again");
     }
 
     #[gpui_kit::test]
@@ -2004,7 +1827,7 @@ mod tests {
             window.press("ctrl-shift-w", cx);
         });
         assert!(!panes.read_with(cx, |p, _| p.review_is_showing()));
-        assert!(panes.read_with(cx, |p, _| p.active_thread_id().is_some()));
+        assert!(panes.read_with(cx, |p, cx| p.active_thread_id(cx).is_some()));
     }
 
     #[gpui_kit::test]
