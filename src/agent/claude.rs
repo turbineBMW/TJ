@@ -1,0 +1,636 @@
+//! Claude Code backend: runs the `claude` binary and speaks its stdio protocol.
+//!
+//! This is the protocol Anthropic's Agent SDKs use (stream-json in both directions,
+//! plus `control_request` / `control_response` messages). It is not a documented
+//! public API, so everything that depends on its shape lives in this file, unknown
+//! messages are skipped rather than treated as errors, and recorded sessions in
+//! `tests/fixtures/` pin the shapes this code was written against.
+
+use std::{
+    collections::VecDeque,
+    io::{BufRead, BufReader, Read, Write},
+    path::PathBuf,
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use anyhow::Context as _;
+use serde_json::{Value, json};
+
+use super::{AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, UsageWindow};
+
+/// The `claude` version the protocol handling was written and recorded against.
+pub const TESTED_VERSION: &str = "2.1.331";
+
+const STDERR_LINES_KEPT: usize = 40;
+
+/// How to start a session.
+#[derive(Clone, Debug, Default)]
+pub struct SessionOptions {
+    /// The binary to run; `claude` on `PATH` when `None`.
+    pub binary: Option<PathBuf>,
+    pub cwd: PathBuf,
+    /// The account's config directory (`CLAUDE_CONFIG_DIR`); Claude's default when `None`.
+    pub config_dir: Option<PathBuf>,
+    pub model: Option<String>,
+    pub permission_mode: PermissionMode,
+    /// Continue an earlier conversation.
+    pub resume: Option<String>,
+}
+
+impl SessionOptions {
+    pub fn args(&self) -> Vec<String> {
+        let mut args: Vec<String> = [
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            // Permission prompts come to us as `can_use_tool` control requests.
+            "--permission-prompt-tool=stdio",
+        ]
+        .map(String::from)
+        .to_vec();
+        args.extend(["--permission-mode".into(), self.permission_mode.claude_name().into()]);
+        if let Some(model) = &self.model {
+            args.extend(["--model".into(), model.clone()]);
+        }
+        if let Some(session) = &self.resume {
+            args.extend(["--resume".into(), session.clone()]);
+        }
+        args
+    }
+}
+
+/// A running `claude` process.
+pub struct ClaudeSession {
+    stdin: Arc<Mutex<ChildStdin>>,
+    child: Arc<Mutex<Child>>,
+    next_id: AtomicU64,
+}
+
+impl ClaudeSession {
+    /// Start `claude` and return the session plus the channel its events arrive on.
+    pub fn spawn(options: &SessionOptions) -> anyhow::Result<(Self, smol::channel::Receiver<AgentEvent>)> {
+        let binary = options.binary.clone().unwrap_or_else(|| "claude".into());
+        let mut command = Command::new(&binary);
+        command
+            .args(options.args())
+            .current_dir(&options.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(dir) = &options.config_dir {
+            command.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        let mut child = command.spawn().with_context(|| format!("could not start {}", binary.display()))?;
+        let stdin = child.stdin.take().context("claude stdin")?;
+        let stdout = child.stdout.take().context("claude stdout")?;
+        let stderr = child.stderr.take().context("claude stderr")?;
+
+        let (tx, rx) = smol::channel::unbounded();
+        let session =
+            Self { stdin: Arc::new(Mutex::new(stdin)), child: Arc::new(Mutex::new(child)), next_id: AtomicU64::new(1) };
+
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let tail = stderr_tail.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let mut tail = tail.lock().unwrap();
+                    if tail.len() == STDERR_LINES_KEPT {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+            });
+        }
+        {
+            let child = session.child.clone();
+            std::thread::spawn(move || {
+                let mut parser = Parser;
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    for event in parser.parse_line(&line) {
+                        if tx.send_blocking(event).is_err() {
+                            return;
+                        }
+                    }
+                }
+                // stdout closed: the process is ending.
+                let code = child.lock().unwrap().wait().ok().and_then(|status| status.code());
+                let stderr = stderr_tail.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n");
+                let _ = tx.send_blocking(AgentEvent::Exited { code, stderr });
+            });
+        }
+
+        session.control("initialize", json!({}))?;
+        Ok((session, rx))
+    }
+
+    fn write(&self, message: &Value) -> anyhow::Result<()> {
+        let mut stdin = self.stdin.lock().unwrap();
+        serde_json::to_writer(&mut *stdin, message)?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    /// Send a control request. Its id starts with `tj-` and the `subtype` names it.
+    fn control(&self, subtype: &str, mut fields: Value) -> anyhow::Result<()> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        fields["subtype"] = json!(subtype);
+        self.write(&json!({
+            "type": "control_request",
+            "request_id": format!("tj-{subtype}-{id}"),
+            "request": fields,
+        }))
+    }
+
+    /// Ask for the subscription usage windows; they arrive as [`AgentEvent::Usage`].
+    pub fn request_usage(&self) -> anyhow::Result<()> {
+        self.control("get_usage", json!({}))
+    }
+}
+
+impl AgentSession for ClaudeSession {
+    fn send_prompt(&self, text: &str) -> anyhow::Result<()> {
+        self.write(&json!({
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": { "role": "user", "content": [{ "type": "text", "text": text }] },
+        }))
+    }
+
+    fn respond(&self, request: &PermissionRequest, decision: Decision) -> anyhow::Result<()> {
+        self.write(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request.id,
+                "response": permission_result(request, &decision),
+            },
+        }))
+    }
+
+    fn interrupt(&self) -> anyhow::Result<()> {
+        self.control("interrupt", json!({}))
+    }
+
+    fn set_permission_mode(&self, mode: PermissionMode) -> anyhow::Result<()> {
+        self.control("set_permission_mode", json!({ "mode": mode.claude_name() }))
+    }
+}
+
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        let _ = self.child.lock().unwrap().kill();
+    }
+}
+
+/// The `can_use_tool` answer for a decision.
+pub fn permission_result(request: &PermissionRequest, decision: &Decision) -> Value {
+    match decision {
+        Decision::Approve => json!({ "behavior": "allow", "updatedInput": request.input }),
+        Decision::ApproveForSession => json!({
+            "behavior": "allow",
+            "updatedInput": request.input,
+            "updatedPermissions": session_rules(request),
+        }),
+        Decision::Decline { feedback } => {
+            let message = match feedback.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+                Some(feedback) => format!("The user declined this tool call and said:\n{feedback}"),
+                None => "The user declined this tool call.".to_string(),
+            };
+            json!({ "behavior": "deny", "message": message })
+        }
+        Decision::Cancel => {
+            json!({ "behavior": "deny", "message": "The user cancelled the turn.", "interrupt": true })
+        }
+    }
+}
+
+/// The rules an "approve for session" saves: the agent's own suggestions, kept to this
+/// session. A suggestion to switch permission mode is left out so approving one call
+/// never silently changes the mode the user picked.
+fn session_rules(request: &PermissionRequest) -> Vec<Value> {
+    let rules: Vec<Value> = request
+        .suggestions
+        .iter()
+        .filter(|s| s.get("type").and_then(Value::as_str) != Some("setMode"))
+        .cloned()
+        .map(|mut s| {
+            s["destination"] = json!("session");
+            s
+        })
+        .collect();
+    if rules.is_empty() {
+        vec![json!({
+            "type": "addRules",
+            "rules": [{ "toolName": request.tool_name }],
+            "behavior": "allow",
+            "destination": "session",
+        })]
+    } else {
+        rules
+    }
+}
+
+/// Turns protocol lines into [`AgentEvent`]s.
+#[derive(Default)]
+pub struct Parser;
+
+impl Parser {
+    pub fn parse_line(&mut self, line: &str) -> Vec<AgentEvent> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Vec::new();
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(message) => self.parse(&message),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn parse(&mut self, m: &Value) -> Vec<AgentEvent> {
+        let str_at = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+        // Messages from subagents carry their parent's tool id; only the main thread is shown.
+        let from_subagent = m.get("parent_tool_use_id").is_some_and(|p| !p.is_null());
+
+        match m.get("type").and_then(Value::as_str) {
+            Some("system") if str_at(m, "subtype").as_deref() == Some("init") => match str_at(m, "session_id") {
+                Some(session_id) => vec![AgentEvent::SessionInfo { session_id, model: str_at(m, "model") }],
+                None => Vec::new(),
+            },
+            Some("stream_event") if !from_subagent => {
+                let event = &m["event"];
+                match event.get("type").and_then(Value::as_str) {
+                    Some("content_block_start") if event["content_block"]["type"] == "text" => {
+                        vec![AgentEvent::TextStarted]
+                    }
+                    Some("content_block_delta") if event["delta"]["type"] == "text_delta" => {
+                        str_at(&event["delta"], "text").map(AgentEvent::TextDelta).into_iter().collect()
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            Some("assistant") if !from_subagent => blocks(m)
+                .filter(|b| b["type"] == "tool_use")
+                .filter_map(|b| {
+                    Some(AgentEvent::ToolStarted {
+                        id: str_at(b, "id")?,
+                        name: str_at(b, "name")?,
+                        input: b.get("input").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect(),
+            Some("user") if !from_subagent => blocks(m)
+                .filter(|b| b["type"] == "tool_result")
+                .filter_map(|b| {
+                    Some(AgentEvent::ToolFinished {
+                        id: str_at(b, "tool_use_id")?,
+                        output: tool_output(b.get("content")),
+                        is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                    })
+                })
+                .collect(),
+            Some("rate_limit_event") => {
+                let windows = m["rate_limit_info"]["unifiedWindows"]
+                    .as_object()
+                    .map(|windows| {
+                        windows
+                            .iter()
+                            .filter_map(|(id, w)| {
+                                Some(UsageWindow {
+                                    id: id.clone(),
+                                    utilization: w.get("utilization")?.as_f64()?,
+                                    resets_at: w.get("resetsAt").and_then(Value::as_i64),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if windows.is_empty() { Vec::new() } else { vec![AgentEvent::Usage(windows)] }
+            }
+            Some("result") => {
+                let is_error = m.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                vec![AgentEvent::TurnFinished {
+                    cost_usd: m.get("total_cost_usd").and_then(Value::as_f64),
+                    duration_ms: m.get("duration_ms").and_then(Value::as_u64),
+                    is_error,
+                    error: is_error.then(|| str_at(m, "result").unwrap_or_else(|| "The turn failed.".into())),
+                }]
+            }
+            Some("control_request") => {
+                let request = &m["request"];
+                match (str_at(request, "subtype").as_deref(), str_at(m, "request_id")) {
+                    (Some("can_use_tool"), Some(id)) => vec![AgentEvent::PermissionRequested(PermissionRequest {
+                        id,
+                        tool_name: str_at(request, "tool_name").unwrap_or_else(|| "tool".into()),
+                        tool_use_id: str_at(request, "tool_use_id"),
+                        description: str_at(request, "description"),
+                        input: request.get("input").cloned().unwrap_or(Value::Null),
+                        suggestions: request["permission_suggestions"].as_array().cloned().unwrap_or_default(),
+                        reason: str_at(request, "decision_reason").map(|r| strip_ansi(&r)),
+                        no_standing_grant: request
+                            .get("suppress_always_allow_rule")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })],
+                    _ => Vec::new(),
+                }
+            }
+            Some("control_cancel_request") => {
+                str_at(m, "request_id").map(|id| AgentEvent::PermissionWithdrawn { id }).into_iter().collect()
+            }
+            Some("control_response") => {
+                let response = &m["response"];
+                let request_id = str_at(response, "request_id").unwrap_or_default();
+                if response["subtype"] == "error" {
+                    let error = str_at(response, "error").unwrap_or_default();
+                    return vec![AgentEvent::Error(format!("{request_id}: {error}"))];
+                }
+                let body = &response["response"];
+                if request_id.starts_with("tj-initialize-") {
+                    vec![AgentEvent::Started {
+                        version: str_at(body, "claude_code_version"),
+                        permission_mode: str_at(body, "current_permission_mode")
+                            .and_then(|mode| PermissionMode::from_claude_name(&mode)),
+                    }]
+                } else if request_id.starts_with("tj-get_usage-") {
+                    let windows: Vec<UsageWindow> = body["rate_limits"]
+                        .as_object()
+                        .map(|limits| {
+                            limits
+                                .iter()
+                                .filter_map(|(id, w)| {
+                                    Some(UsageWindow {
+                                        id: id.clone(),
+                                        // get_usage reports percent; the stream reports a fraction.
+                                        utilization: w.get("utilization")?.as_f64()? / 100.0,
+                                        resets_at: None,
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if windows.is_empty() { Vec::new() } else { vec![AgentEvent::Usage(windows)] }
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn blocks(message: &Value) -> impl Iterator<Item = &Value> {
+    message["message"]["content"].as_array().into_iter().flatten()
+}
+
+/// A tool result's content is either a string or a list of content blocks.
+fn tool_output(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => {
+            parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+/// Remove ANSI escape sequences; the agent's reason text may carry terminal colours.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether `version` is newer than [`TESTED_VERSION`], comparing dotted numbers.
+pub fn is_newer_than_tested(version: &str) -> bool {
+    let parse = |v: &str| v.split('.').map(|p| p.trim().parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    parse(version) > parse(TESTED_VERSION)
+}
+
+/// Read a recorded session (`{"dir": "out", "msg": ...}` per line) and return what the
+/// agent sent, for replaying through [`Parser`].
+pub fn read_fixture(reader: impl Read) -> Vec<Value> {
+    BufReader::new(reader)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter(|record| record["dir"] == "out")
+        .filter_map(|record| record.get("msg").cloned())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replay(name: &str) -> Vec<AgentEvent> {
+        let path = format!("{}/tests/fixtures/claude/{name}", env!("CARGO_MANIFEST_DIR"));
+        let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut parser = Parser;
+        read_fixture(file).iter().flat_map(|m| parser.parse(m)).collect()
+    }
+
+    fn text(events: &[AgentEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn approved_tool_call_runs_and_the_turn_finishes() {
+        let events = replay("2.1.331-approve.jsonl");
+
+        assert!(
+            matches!(&events[0], AgentEvent::Started { version: Some(v), permission_mode: Some(PermissionMode::Ask) } if v == TESTED_VERSION)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SessionInfo { model: Some(m), .. } if m == "claude-haiku-5-5"))
+        );
+
+        let tool_id = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolStarted { id, name, input } if name == "Bash" => {
+                    assert_eq!(input["command"], "touch tj-probe.txt");
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .expect("a Bash tool call");
+        let request = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::PermissionRequested(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("a permission request");
+        assert_eq!(request.tool_name, "Bash");
+        assert_eq!(request.tool_use_id.as_deref(), Some(tool_id.as_str()));
+        assert!(!request.suggestions.is_empty());
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::ToolFinished { id, is_error: false, .. } if *id == tool_id))
+        );
+        assert!(text(&events).trim().ends_with("DONE"), "{}", text(&events));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Usage(w) if w.iter().any(|w| w.id == "seven_day"))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnFinished { cost_usd: Some(c), is_error: false, .. } if *c > 0.0))
+        );
+    }
+
+    #[test]
+    fn declined_tool_call_comes_back_as_an_error_result() {
+        let events = replay("2.1.331-decline.jsonl");
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::PermissionRequested(_))));
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::ToolFinished { is_error: true, output, .. } if output.contains("declined"))
+        ));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnFinished { .. })));
+    }
+
+    #[test]
+    fn usage_from_the_stream_and_from_get_usage_agree() {
+        // The stream reports a fraction and get_usage a percent; both become a fraction.
+        let events = replay("2.1.331-approve.jsonl");
+        let windows: Vec<f64> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Usage(w) => w.iter().find(|w| w.id == "seven_day").map(|w| w.utilization),
+                _ => None,
+            })
+            .collect();
+        assert!(windows.len() >= 2, "expected stream and get_usage values, got {windows:?}");
+        assert!(windows.iter().all(|u| (0.0..=1.0).contains(u)));
+        assert!((windows[0] - windows[windows.len() - 1]).abs() < 0.02);
+    }
+
+    fn request() -> PermissionRequest {
+        PermissionRequest {
+            id: "req-1".into(),
+            tool_name: "Bash".into(),
+            tool_use_id: Some("toolu_1".into()),
+            description: None,
+            input: json!({ "command": "touch x" }),
+            suggestions: vec![
+                json!({ "type": "addRules", "rules": [{ "toolName": "Bash", "ruleContent": "touch x" }], "behavior": "allow", "destination": "localSettings" }),
+                json!({ "type": "setMode", "mode": "acceptEdits", "destination": "session" }),
+            ],
+            reason: None,
+            no_standing_grant: false,
+        }
+    }
+
+    #[test]
+    fn decisions_become_the_answers_claude_expects() {
+        let r = request();
+        assert_eq!(
+            permission_result(&r, &Decision::Approve),
+            json!({ "behavior": "allow", "updatedInput": { "command": "touch x" } })
+        );
+
+        let session = permission_result(&r, &Decision::ApproveForSession);
+        let rules = session["updatedPermissions"].as_array().unwrap();
+        assert_eq!(rules.len(), 1, "setMode must not ride along: {rules:?}");
+        assert_eq!(rules[0]["type"], "addRules");
+        assert_eq!(rules[0]["destination"], "session");
+
+        let declined = permission_result(&r, &Decision::Decline { feedback: Some("use mktemp".into()) });
+        assert_eq!(declined["behavior"], "deny");
+        assert!(declined["message"].as_str().unwrap().ends_with("use mktemp"));
+
+        let cancelled = permission_result(&r, &Decision::Cancel);
+        assert_eq!(cancelled["interrupt"], true);
+    }
+
+    #[test]
+    fn approve_for_session_without_suggestions_allows_the_tool() {
+        let mut r = request();
+        r.suggestions.clear();
+        let rules = permission_result(&r, &Decision::ApproveForSession)["updatedPermissions"].clone();
+        assert_eq!(rules[0]["rules"][0]["toolName"], "Bash");
+    }
+
+    #[test]
+    fn version_check() {
+        assert!(!is_newer_than_tested(TESTED_VERSION));
+        assert!(!is_newer_than_tested("2.1.300"));
+        assert!(is_newer_than_tested("2.1.332"));
+        assert!(is_newer_than_tested("2.2.0"));
+    }
+
+    #[test]
+    fn unknown_messages_are_skipped() {
+        let mut parser = Parser;
+        assert!(parser.parse_line(r#"{"type":"something_new","x":1}"#).is_empty());
+        assert!(parser.parse_line("not json").is_empty());
+    }
+
+    #[test]
+    fn ansi_is_stripped_from_reasons() {
+        assert_eq!(strip_ansi("\x1b[1mbold\x1b[0m path"), "bold path");
+    }
+
+    /// Runs the real `claude` (uses a little of the logged-in account's usage):
+    /// `cargo test -- --ignored live_`
+    #[test]
+    #[ignore]
+    fn live_session_asks_and_runs_after_approval() {
+        let dir = std::env::temp_dir().join(format!("tj-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = SessionOptions { cwd: dir.clone(), model: Some("haiku".into()), ..Default::default() };
+        let (session, events) = ClaudeSession::spawn(&options).unwrap();
+        session
+            .send_prompt("Use the Bash tool to run exactly: touch tj-live.txt. Then reply with one word: DONE.")
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut asked = false;
+        while std::time::Instant::now() < deadline {
+            match smol::block_on(events.recv()).expect("events") {
+                AgentEvent::PermissionRequested(request) => {
+                    asked = true;
+                    session.respond(&request, Decision::Approve).unwrap();
+                }
+                AgentEvent::TurnFinished { is_error, .. } => {
+                    assert!(!is_error);
+                    break;
+                }
+                AgentEvent::Exited { stderr, .. } => panic!("claude exited: {stderr}"),
+                _ => {}
+            }
+        }
+        assert!(asked, "expected a permission request");
+        assert!(dir.join("tj-live.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -150,10 +150,8 @@ impl TerminalView {
                     self.write(format(rgb).into_bytes());
                 }
                 TermEvent::Exit | TermEvent::ChildExit(_) => self.exited = true,
-                TermEvent::Wakeup
-                | TermEvent::Bell
-                | TermEvent::MouseCursorDirty
-                | TermEvent::CursorBlinkingChange => {}
+                TermEvent::Wakeup | TermEvent::Bell | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {
+                }
             }
         }
         cx.notify();
@@ -231,11 +229,8 @@ fn mono_font(cx: &App) -> Font {
 
 fn cell_size(window: &mut Window, cx: &App) -> Size<Pixels> {
     let font_id = window.text_system().resolve_font(&mono_font(cx));
-    let width = window
-        .text_system()
-        .advance(font_id, px(FONT_SIZE), 'm')
-        .map(|s| s.width)
-        .unwrap_or(px(FONT_SIZE * 0.6));
+    let width =
+        window.text_system().advance(font_id, px(FONT_SIZE), 'm').map(|s| s.width).unwrap_or(px(FONT_SIZE * 0.6));
     size(width, px((FONT_SIZE * LINE_HEIGHT).round()))
 }
 
@@ -374,7 +369,13 @@ impl Palette<'_> {
                 if is_fg && flags.contains(Flags::BOLD) && i < 8 { indexed(i + 8) } else { indexed(i) }
             }
             Color::Named(NamedColor::Foreground | NamedColor::BrightForeground) => Some(self.fg),
-            Color::Named(NamedColor::Background) => if is_fg { Some(self.bg) } else { None },
+            Color::Named(NamedColor::Background) => {
+                if is_fg {
+                    Some(self.bg)
+                } else {
+                    None
+                }
+            }
             Color::Named(NamedColor::DimForeground) => Some(self.fg.opacity(0.7)),
             Color::Named(NamedColor::Cursor) => Some(self.fg),
             Color::Named(named) => {
@@ -445,10 +446,11 @@ impl Render for TerminalView {
             if cell.flags.contains(Flags::ITALIC) {
                 run_font.style = FontStyle::Italic;
             }
-            let underline = cell
-                .flags
-                .intersects(Flags::ALL_UNDERLINES)
-                .then(|| UnderlineStyle { thickness: px(1.0), color: Some(cell_fg), wavy: cell.flags.contains(Flags::UNDERCURL) });
+            let underline = cell.flags.intersects(Flags::ALL_UNDERLINES).then(|| UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(cell_fg),
+                wavy: cell.flags.contains(Flags::UNDERCURL),
+            });
             let strikethrough = cell
                 .flags
                 .contains(Flags::STRIKEOUT)
@@ -498,10 +500,7 @@ impl Render for TerminalView {
             .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll(cx.listener(Self::on_scroll))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.focus.focus(window, cx)),
-            )
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.focus.focus(window, cx)))
             .relative()
             .size_full()
             .overflow_hidden()
@@ -515,10 +514,7 @@ impl Render for TerminalView {
                     .text_size(px(FONT_SIZE))
                     .line_height(cell.height)
                     .children(lines.into_iter().map(|(text, runs)| {
-                        div()
-                            .h(cell.height)
-                            .whitespace_nowrap()
-                            .child(StyledText::new(text).with_runs(runs))
+                        div().h(cell.height).whitespace_nowrap().child(StyledText::new(text).with_runs(runs))
                     }))
                     .child(measure),
             )
@@ -546,8 +542,10 @@ impl Focusable for TerminalView {
 mod tests {
     use super::{TermMode, TerminalView, key_to_bytes};
     use alacritty_terminal::tty::Shell;
-    use gpui_kit::{AppContext as _, Entity, Keystroke, TestAppContext, WindowBounds, WindowOptions, bounds, point, px, size};
     use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{
+        AppContext as _, Entity, Keystroke, TestAppContext, WindowBounds, WindowOptions, bounds, point, px, size,
+    };
 
     /// Open a real gpui-kit window (with its Root, which binds Tab and Ctrl-C) holding a
     /// terminal running /bin/sh, focus the terminal, press `keys`, and return what the
