@@ -22,6 +22,8 @@ RESULT_DROP = {"credential_expires_at"}
 def scrub_str(s, workdirs):
     for w in workdirs:
         s = s.replace(w, "/work")
+    # Streamed text can split a path across chunks, so whole-path replacement misses pieces.
+    s = s.replace("/tmp/", "/work/")
     s = s.replace(home, "/home/user").replace(user, "user")
     s = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "user@example.com", s)
     return s

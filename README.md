@@ -27,6 +27,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 - **A start screen for new threads**, like T3 Code's: "What should we build in <project>?", a large prompt card with the account and mode menus, and the folder, branch and mode underneath. The first message switches to the conversation, and the overview pane appears once there's something in it.
 - **Streaming replies** in markdown, with tool calls shown as cards you can expand to see their output.
 - **Approval cards** when Claude wants to do something risky: **Approve**, **Approve for session**, **Decline** (with optional feedback that's passed to Claude) or **Cancel turn**.
+- **Questions and plans.** When Claude asks you something (AskUserQuestion), a card shows each question with its options: pick one (or several, for a multi-select) or type your own answer. When Claude presents a plan in plan mode, the card shows it formatted, with **Start, accepting edits**, **Start, asking first** (both leave plan mode) or **Keep planning** (with optional feedback).
 - **Permission modes** for the thread: Ask, Accept edits, Auto, Plan and Full access.
 - **Usage and cost**: subscription usage windows (for example "7d 4%"), plus the cost of each turn and the whole thread.
 - **Stop** interrupts a running turn. If `claude` exits, the next message resumes the conversation.
