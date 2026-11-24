@@ -148,6 +148,36 @@ pub enum AgentEvent {
         tokens: Option<u64>,
         window: Option<u64>,
     },
+    /// A subagent (the Agent/Task tool call `tool_use_id`) started working, often in the background.
+    SubagentStarted {
+        tool_use_id: String,
+        description: String,
+        agent_type: Option<String>,
+    },
+    /// What a subagent is doing now, with its running totals.
+    SubagentProgress {
+        tool_use_id: String,
+        description: String,
+        tool_uses: Option<u64>,
+        tokens: Option<u64>,
+    },
+    /// A subagent called a tool.
+    SubagentTool {
+        tool_use_id: String,
+        name: String,
+        input: Value,
+    },
+    /// A subagent said something (usually its report).
+    SubagentText {
+        tool_use_id: String,
+        text: String,
+    },
+    /// A subagent finished; `summary` is its report.
+    SubagentFinished {
+        tool_use_id: String,
+        status: String,
+        summary: Option<String>,
+    },
     TurnFinished {
         cost_usd: Option<f64>,
         duration_ms: Option<u64>,

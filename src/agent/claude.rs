@@ -279,8 +279,55 @@ impl Parser {
         // Messages from subagents carry their parent's tool id; only the main thread is shown.
         let from_subagent = m.get("parent_tool_use_id").is_some_and(|p| !p.is_null());
 
+        // A subagent's own messages carry the Agent tool call they belong to.
+        if from_subagent {
+            let parent = str_at(m, "parent_tool_use_id").unwrap_or_default();
+            return match m.get("type").and_then(Value::as_str) {
+                Some("assistant") => blocks(m)
+                    .filter_map(|b| match b["type"].as_str() {
+                        Some("tool_use") => Some(AgentEvent::SubagentTool {
+                            tool_use_id: parent.clone(),
+                            name: str_at(b, "name")?,
+                            input: b.get("input").cloned().unwrap_or(Value::Null),
+                        }),
+                        Some("text") => str_at(b, "text")
+                            .filter(|t| !t.trim().is_empty())
+                            .map(|text| AgentEvent::SubagentText { tool_use_id: parent.clone(), text }),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+        }
+
+        let subtype = str_at(m, "subtype");
         match m.get("type").and_then(Value::as_str) {
-            Some("system") if str_at(m, "subtype").as_deref() == Some("init") => match str_at(m, "session_id") {
+            Some("system") if subtype.as_deref() == Some("task_started") => match str_at(m, "tool_use_id") {
+                Some(tool_use_id) => vec![AgentEvent::SubagentStarted {
+                    tool_use_id,
+                    description: str_at(m, "description").unwrap_or_default(),
+                    agent_type: str_at(m, "subagent_type"),
+                }],
+                None => Vec::new(),
+            },
+            Some("system") if subtype.as_deref() == Some("task_progress") => match str_at(m, "tool_use_id") {
+                Some(tool_use_id) => vec![AgentEvent::SubagentProgress {
+                    tool_use_id,
+                    description: str_at(m, "description").unwrap_or_default(),
+                    tool_uses: m["usage"]["tool_uses"].as_u64(),
+                    tokens: m["usage"]["total_tokens"].as_u64(),
+                }],
+                None => Vec::new(),
+            },
+            Some("system") if subtype.as_deref() == Some("task_notification") => match str_at(m, "tool_use_id") {
+                Some(tool_use_id) => vec![AgentEvent::SubagentFinished {
+                    tool_use_id,
+                    status: str_at(m, "status").unwrap_or_else(|| "completed".into()),
+                    summary: str_at(m, "summary"),
+                }],
+                None => Vec::new(),
+            },
+            Some("system") if subtype.as_deref() == Some("init") => match str_at(m, "session_id") {
                 Some(session_id) => vec![AgentEvent::SessionInfo { session_id, model: str_at(m, "model") }],
                 None => Vec::new(),
             },
@@ -636,6 +683,38 @@ mod tests {
             plan.iter()
                 .any(|e| matches!(e, AgentEvent::ToolFinished { output, .. } if output.contains("approved your plan")))
         );
+    }
+
+    #[test]
+    fn a_background_subagent_reports_through_its_tool_call() {
+        let events = replay("2.1.331-subagent.jsonl");
+        let agent_id = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolStarted { id, name, .. } if name == "Agent" => Some(id.clone()),
+                _ => None,
+            })
+            .expect("an Agent call");
+        let for_agent = |e: &&AgentEvent| match e {
+            AgentEvent::SubagentStarted { tool_use_id, .. }
+            | AgentEvent::SubagentProgress { tool_use_id, .. }
+            | AgentEvent::SubagentTool { tool_use_id, .. }
+            | AgentEvent::SubagentText { tool_use_id, .. }
+            | AgentEvent::SubagentFinished { tool_use_id, .. } => *tool_use_id == agent_id,
+            _ => false,
+        };
+        let sub: Vec<&AgentEvent> = events.iter().filter(for_agent).collect();
+        assert!(
+            matches!(sub.first(), Some(AgentEvent::SubagentStarted { agent_type: Some(t), .. }) if t == "general-purpose")
+        );
+        assert!(sub.iter().any(|e| matches!(e, AgentEvent::SubagentTool { name, .. } if name == "Bash")));
+        assert!(sub.iter().any(|e| matches!(e, AgentEvent::SubagentProgress { tool_uses: Some(1), .. })));
+        assert!(sub.iter().any(|e| matches!(e, AgentEvent::SubagentText { .. })));
+        assert!(
+            matches!(sub.last(), Some(AgentEvent::SubagentFinished { status, summary: Some(_), .. }) if status == "completed")
+        );
+        let turns = events.iter().filter(|e| matches!(e, AgentEvent::TurnFinished { .. })).count();
+        assert_eq!(turns, 2, "Claude reports the subagent's result in a turn of its own");
     }
 
     #[test]
