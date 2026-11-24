@@ -76,6 +76,8 @@ const MAX_CONVERSATION_WIDTH: f32 = 860.0;
 #[derive(Clone, Default)]
 pub struct ThreadSetup {
     pub title: Option<String>,
+    /// The user named the thread; the overview keeps its own title to itself.
+    pub named: bool,
     pub session_id: Option<String>,
     pub account_id: String,
     pub account_name: String,
@@ -253,6 +255,8 @@ struct MentionPicker {
 
 pub struct ThreadView {
     pub title: Option<String>,
+    /// The user named the thread, so the overview's title doesn't replace it.
+    pub named: bool,
     pub account_id: String,
     pub account_name: String,
     rows: Vec<Row>,
@@ -345,6 +349,7 @@ impl ThreadView {
         let log = setup.transcript.as_deref().and_then(|path| TranscriptWriter::open(path).ok());
         let mut this = Self {
             title: setup.title,
+            named: setup.named,
             account_id: setup.account_id,
             account_name: setup.account_name,
             rows: Vec::new(),
@@ -544,6 +549,23 @@ impl ThreadView {
         if let Some((text, images)) = self.queued.take() {
             self.dispatch(&text, images, cx);
         }
+        cx.notify();
+    }
+
+    /// Give the thread the user's own title; an empty one hands naming back to the overview
+    /// (and to the first message, until the overview has one).
+    pub fn rename(&mut self, title: &str, cx: &mut Context<Self>) {
+        let title = title.trim();
+        self.named = !title.is_empty();
+        self.title = if self.named {
+            Some(title.to_string())
+        } else {
+            self.overview
+                .title
+                .clone()
+                .or_else(|| self.plain.first().and_then(|m| m.strip_prefix("User: ")).map(title_from))
+        };
+        cx.emit(ThreadChanged);
         cx.notify();
     }
 
@@ -1140,7 +1162,7 @@ impl ThreadView {
 
     /// Take a new overview covering `plain[..mark]`, and save it.
     pub fn apply_overview(&mut self, overview: Overview, mark: usize, cx: &mut Context<Self>) {
-        if let Some(title) = &overview.title {
+        if let Some(title) = overview.title.as_ref().filter(|_| !self.named) {
             self.title = Some(title.clone());
         }
         self.overview = overview.clone();

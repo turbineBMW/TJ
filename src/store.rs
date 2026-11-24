@@ -54,6 +54,13 @@ impl Paths {
     pub fn transcript(&self, thread_id: &str) -> PathBuf {
         self.data_dir.join("threads").join(format!("{thread_id}.jsonl"))
     }
+
+    /// Delete what TJ keeps for a thread: its transcript and attached images.
+    pub fn delete_thread_files(&self, thread_id: &str) {
+        let transcript = self.transcript(thread_id);
+        let _ = fs::remove_file(&transcript);
+        let _ = fs::remove_dir_all(crate::composer::files_dir(&transcript));
+    }
 }
 
 pub fn home_dir() -> PathBuf {
@@ -193,6 +200,16 @@ pub struct ThreadMeta {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    /// Hidden from the sidebar's list (shown under "Archived").
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
+    /// The title was given by the user, so the overview doesn't replace it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub named: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -356,9 +373,31 @@ impl State {
                 mode: None,
                 model: None,
                 effort: None,
+                archived: false,
+                named: false,
             },
         );
         Some(id)
+    }
+
+    /// Forget a thread. Its files are deleted separately ([`Paths::delete_thread_files`]).
+    pub fn remove_thread(&mut self, thread_id: &str) -> Option<ThreadMeta> {
+        let project = self.projects.iter_mut().find(|p| p.threads.iter().any(|t| t.id == thread_id))?;
+        let ix = project.threads.iter().position(|t| t.id == thread_id)?;
+        if self.selected_thread.as_deref() == Some(thread_id) {
+            self.selected_thread = None;
+        }
+        Some(project.threads.remove(ix))
+    }
+
+    /// Forget a project and its threads (the project's folder is not touched).
+    pub fn remove_project(&mut self, project_id: &str) -> Option<Project> {
+        let ix = self.projects.iter().position(|p| p.id == project_id)?;
+        let project = self.projects.remove(ix);
+        if self.selected_thread.as_ref().is_some_and(|id| project.threads.iter().any(|t| &t.id == id)) {
+            self.selected_thread = None;
+        }
+        Some(project)
     }
 }
 
