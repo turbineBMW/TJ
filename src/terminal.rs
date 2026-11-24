@@ -7,7 +7,8 @@ use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, Notify, OnResize, WindowSize},
     event_loop::{EventLoop, Notifier},
     grid::{Dimensions, Scroll},
-    index::{Column, Line, Point},
+    index::{Column, Line, Point, Side},
+    selection::{Selection, SelectionType},
     sync::FairMutex,
     term::{Config, Term, TermMode, cell::Flags, color::Colors},
     tty,
@@ -75,9 +76,21 @@ pub struct TerminalView {
     /// The shell's process id, for reading its working directory.
     pid: Option<u32>,
     _pump: Task<()>,
-    /// Bytes produced by key presses, so tests can check what the shell received.
+    /// Where the grid's top-left corner is in the window, for turning mouse positions into cells.
+    origin: gpui_kit::Point<Pixels>,
+    /// A drag is selecting text.
+    selecting: bool,
+    /// The button an app in mouse mode saw pressed (for drag motion and the release).
+    reported_button: Option<u8>,
+    /// The last cell reported to the app, so motion within one cell isn't repeated.
+    last_reported: Option<(usize, usize)>,
+    /// Everything written to the shell, so tests can check what it received.
     #[cfg(test)]
-    keys_sent: Vec<u8>,
+    sent: std::cell::RefCell<Vec<u8>>,
+    /// Tests that only check `sent` keep writes from the PTY: its echo would wake the view
+    /// from the PTY's thread, which the test scheduler rejects.
+    #[cfg(test)]
+    muted: bool,
 }
 
 impl TerminalView {
@@ -130,8 +143,14 @@ impl TerminalView {
                 exited: false,
                 pid,
                 _pump: pump,
+                origin: gpui_kit::Point::default(),
+                selecting: false,
+                reported_button: None,
+                last_reported: None,
                 #[cfg(test)]
-                keys_sent: Vec::new(),
+                sent: Default::default(),
+                #[cfg(test)]
+                muted: false,
             }
         }))
     }
@@ -183,6 +202,14 @@ impl TerminalView {
     }
 
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        let bytes = bytes.into();
+        #[cfg(test)]
+        {
+            self.sent.borrow_mut().extend_from_slice(&bytes);
+            if self.muted {
+                return;
+            }
+        }
         self.notifier.notify(bytes);
     }
 
@@ -204,20 +231,26 @@ impl TerminalView {
         // Ctrl+Shift+V pastes, honouring bracketed paste.
         if m.control && m.shift && ks.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                if mode.contains(TermMode::BRACKETED_PASTE) {
-                    self.write(format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes());
-                } else {
-                    self.write(text.replace("\r\n", "\r").replace('\n', "\r").into_bytes());
-                }
+                self.paste(&text);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        // Ctrl+Shift+C copies the selection.
+        if m.control && m.shift && ks.key == "c" {
+            if let Some(text) = self.selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             cx.stop_propagation();
             return;
         }
 
         if let Some(bytes) = key_to_bytes(ks, mode) {
-            self.term.lock().scroll_display(Scroll::Bottom);
-            #[cfg(test)]
-            self.keys_sent.extend_from_slice(&bytes);
+            // Typing goes to the prompt at the bottom; a selection there would be stale.
+            let mut term = self.term.lock();
+            term.scroll_display(Scroll::Bottom);
+            term.selection = None;
+            drop(term);
             self.write(bytes);
             cx.stop_propagation();
         }
@@ -226,6 +259,14 @@ impl TerminalView {
     fn on_scroll(&mut self, event: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let lines = (event.delta.pixel_delta(self.cell.height).y / self.cell.height).round() as i32;
         if lines == 0 {
+            return;
+        }
+        // An app in mouse mode gets the wheel as buttons 64 (up) and 65 (down).
+        if self.app_wants_mouse(&event.modifiers) {
+            let button = if lines > 0 { 64 } else { 65 };
+            for _ in 0..lines.unsigned_abs() {
+                self.report_mouse(button, event.position, &event.modifiers, true);
+            }
             return;
         }
         let mut term = self.term.lock();
@@ -241,6 +282,37 @@ impl TerminalView {
             cx.notify();
         }
     }
+}
+
+/// Modifier bits in a mouse report: Shift 4, Alt 8, Ctrl 16.
+fn modifier_bits(modifiers: &Modifiers) -> u8 {
+    (if modifiers.shift { 4 } else { 0 })
+        | (if modifiers.alt { 8 } else { 0 })
+        | (if modifiers.control { 16 } else { 0 })
+}
+
+/// The bytes that report a mouse event to an app in mouse mode, at a 0-based cell. SGR
+/// (`CSI < b ; x ; y M/m`) when the app asked for it; otherwise the classic `CSI M b x y`,
+/// where a release is button 3 and positions past 223 can't be sent (UTF-8 mode stretches
+/// that to 2015).
+fn mouse_report(code: u8, col: usize, row: usize, pressed: bool, mode: TermMode) -> Option<Vec<u8>> {
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let end = if pressed { 'M' } else { 'm' };
+        return Some(format!("\x1b[<{code};{};{}{end}", col + 1, row + 1).into_bytes());
+    }
+    let code = if pressed { code } else { 3 | (code & 0b1_1100) };
+    let values = [32 + code as usize, 33 + col, 33 + row];
+    let mut bytes = b"\x1b[M".to_vec();
+    for value in values {
+        if mode.contains(TermMode::UTF8_MOUSE) {
+            let c = char::from_u32(value as u32).filter(|_| value <= 2047)?;
+            let mut buf = [0; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        } else {
+            bytes.push(u8::try_from(value).ok()?);
+        }
+    }
+    Some(bytes)
 }
 
 fn mono_font(cx: &App) -> Font {
@@ -423,6 +495,149 @@ impl Palette<'_> {
     }
 }
 
+impl TerminalView {
+    // ---------- mouse ----------
+
+    /// The grid cell under a window position, clamped to the grid, and which half of it.
+    fn cell_at(&self, position: gpui_kit::Point<Pixels>) -> (usize, usize, Side) {
+        let x = (position.x - self.origin.x) / self.cell.width;
+        let y = (position.y - self.origin.y) / self.cell.height;
+        let col = (x.max(0.0).floor() as usize).min(self.size.cols.saturating_sub(1));
+        let row = (y.max(0.0).floor() as usize).min(self.size.rows.saturating_sub(1));
+        let side = if x < 0.0 {
+            Side::Left
+        } else if x >= self.size.cols as f32 || x - x.floor() >= 0.5 {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        (col, row, side)
+    }
+
+    /// Whether the app asked for mouse events. Shift keeps the mouse for selecting, as in
+    /// other terminals.
+    fn app_wants_mouse(&self, modifiers: &Modifiers) -> bool {
+        self.term.lock().mode().intersects(TermMode::MOUSE_MODE) && !modifiers.shift
+    }
+
+    fn report_mouse(&mut self, button: u8, position: gpui_kit::Point<Pixels>, modifiers: &Modifiers, pressed: bool) {
+        let (col, row, _) = self.cell_at(position);
+        let mode = *self.term.lock().mode();
+        let code = button | modifier_bits(modifiers);
+        if let Some(bytes) = mouse_report(code, col, row, pressed, mode) {
+            self.write(bytes);
+        }
+        self.last_reported = Some((col, row));
+    }
+
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        let button = match event.button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            _ => return,
+        };
+        if self.app_wants_mouse(&event.modifiers) {
+            self.report_mouse(button, event.position, &event.modifiers, true);
+            self.reported_button = Some(button);
+            cx.stop_propagation();
+            return;
+        }
+        match event.button {
+            // One click starts a selection; two select a word, three a line.
+            MouseButton::Left => {
+                let (col, row, side) = self.cell_at(event.position);
+                let kind = match event.click_count {
+                    1 => SelectionType::Simple,
+                    2 => SelectionType::Semantic,
+                    _ => SelectionType::Lines,
+                };
+                let mut term = self.term.lock();
+                let point = Point::new(Line(row as i32 - term.grid().display_offset() as i32), Column(col));
+                term.selection = Some(Selection::new(kind, point, side));
+                drop(term);
+                self.selecting = true;
+                if event.click_count > 1 {
+                    self.copy_selection_to_primary(cx);
+                }
+                cx.notify();
+            }
+            // Middle click pastes the primary selection, as in other Linux terminals.
+            MouseButton::Middle => {
+                if let Some(text) = cx.read_from_primary().and_then(|c| c.text()) {
+                    self.paste(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mouse moves anywhere in the window (a drag can leave the terminal).
+    fn on_window_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.selecting {
+            if event.pressed_button != Some(MouseButton::Left) {
+                return;
+            }
+            let (col, row, side) = self.cell_at(event.position);
+            let mut term = self.term.lock();
+            let point = Point::new(Line(row as i32 - term.grid().display_offset() as i32), Column(col));
+            if let Some(selection) = term.selection.as_mut() {
+                selection.update(point, side);
+            }
+            drop(term);
+            cx.notify();
+            return;
+        }
+        let mode = *self.term.lock().mode();
+        let reporting = match self.reported_button {
+            Some(_) => mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION),
+            None => mode.contains(TermMode::MOUSE_MOTION) && self.contains(event.position),
+        };
+        let (col, row, _) = self.cell_at(event.position);
+        if reporting && self.last_reported != Some((col, row)) {
+            // Motion is reported as button + 32; with no button held, as "button 3".
+            let button = self.reported_button.unwrap_or(3) + 32;
+            self.report_mouse(button, event.position, &event.modifiers, true);
+        }
+    }
+
+    fn on_window_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.selecting && event.button == MouseButton::Left {
+            self.selecting = false;
+            self.copy_selection_to_primary(cx);
+        }
+        if let Some(button) = self.reported_button.take() {
+            self.report_mouse(button, event.position, &event.modifiers, false);
+        }
+    }
+
+    fn contains(&self, position: gpui_kit::Point<Pixels>) -> bool {
+        let size = size(self.cell.width * self.size.cols as f32, self.cell.height * self.size.rows as f32);
+        Bounds::new(self.origin, size).contains(&position)
+    }
+
+    /// Linux terminals put whatever is selected in the primary selection.
+    fn copy_selection_to_primary(&self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_primary(ClipboardItem::new_string(text));
+        }
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        self.term.lock().selection_to_string().filter(|t| !t.is_empty())
+    }
+
+    fn paste(&self, text: &str) {
+        let mode = *self.term.lock().mode();
+        if mode.contains(TermMode::BRACKETED_PASTE) {
+            self.write(format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes());
+        } else {
+            self.write(text.replace("\r\n", "\r").replace('\n', "\r").into_bytes());
+        }
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (ansi, fg, bg) = terminal_colors(cx);
@@ -434,6 +649,8 @@ impl Render for TerminalView {
         let palette = Palette { colors: content.colors, ansi, fg, bg };
         let offset = content.display_offset as i32;
         let cursor = content.cursor;
+        let selection = content.selection;
+        let selection_bg = cx.theme().selection;
 
         let rows = self.size.rows;
         let mut lines: Vec<(String, Vec<TextRun>)> = (0..rows).map(|_| (String::new(), Vec::new())).collect();
@@ -458,6 +675,9 @@ impl Render for TerminalView {
             }
             if cell.flags.contains(Flags::DIM) {
                 cell_fg = cell_fg.opacity(0.7);
+            }
+            if selection.is_some_and(|s| s.contains(indexed.point)) {
+                cell_bg = Some(selection_bg);
             }
             let is_cursor = focused
                 && cursor.shape != CursorShape::Hidden
@@ -516,17 +736,40 @@ impl Render for TerminalView {
 
         let cell = self.cell;
         let this = cx.entity();
+        let painted = this.clone();
         let measure = canvas(
             move |bounds, _window, cx| {
                 let size = GridSize {
                     cols: (bounds.size.width / cell.width).floor() as usize,
                     rows: (bounds.size.height / cell.height).floor() as usize,
                 };
-                cx.defer(move |cx| this.update(cx, |t, cx| t.resize(size, cx)));
+                cx.defer(move |cx| {
+                    this.update(cx, |t, cx| {
+                        t.origin = bounds.origin;
+                        t.resize(size, cx)
+                    })
+                });
             },
-            |_, _, _, _| {},
+            // Moves and releases anywhere in the window: a drag may leave the terminal.
+            move |_, _, window, _| {
+                let (moved, released) = (painted.clone(), painted.clone());
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        moved.update(cx, |t, cx| t.on_window_mouse_move(event, cx));
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        released.update(cx, |t, cx| t.on_window_mouse_up(event, cx));
+                    }
+                });
+            },
         )
+        // Pinned to the grid's top-left: an absolute element without an inset is placed after
+        // the lines, and its origin is where mouse positions are measured from.
         .absolute()
+        .top_0()
+        .left_0()
         .size_full();
 
         div()
@@ -535,7 +778,9 @@ impl Render for TerminalView {
             .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll(cx.listener(Self::on_scroll))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.focus.focus(window, cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
             .relative()
             .size_full()
             .overflow_hidden()
@@ -575,11 +820,12 @@ impl Focusable for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{TermMode, TerminalView, key_to_bytes};
+    use super::{TermMode, TerminalView, key_to_bytes, mouse_report};
     use alacritty_terminal::tty::Shell;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
-        AppContext as _, Entity, Keystroke, TestAppContext, WindowBounds, WindowOptions, bounds, point, px, size,
+        AppContext as _, Entity, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        TestAppContext, WindowBounds, WindowOptions, bounds, point, px, size,
     };
 
     /// Open a real gpui-kit window (with its Root, which binds Tab and Ctrl-C) holding a
@@ -611,7 +857,7 @@ mod tests {
                 window.press(key, cx);
             }
             let focused = term.read(cx).focus.is_focused(window);
-            (term.read(cx).keys_sent.clone(), focused)
+            (term.read(cx).sent.borrow().clone(), focused)
         })
         .unwrap()
     }
@@ -631,6 +877,143 @@ mod tests {
     fn root_takes_tab_without_init(cx: &mut TestAppContext) {
         let (sent, _) = press_in_terminal(cx, false, &["tab"]);
         assert!(!sent.contains(&b'\t'), "expected Root to consume Tab, got {sent:?}");
+    }
+
+    #[test]
+    fn mouse_reports_in_sgr_and_classic_form() {
+        assert_eq!(mouse_report(0, 2, 1, true, TermMode::SGR_MOUSE), Some(b"\x1b[<0;3;2M".to_vec()));
+        assert_eq!(mouse_report(0, 2, 1, false, TermMode::SGR_MOUSE), Some(b"\x1b[<0;3;2m".to_vec()));
+        assert_eq!(mouse_report(64, 0, 0, true, TermMode::SGR_MOUSE), Some(b"\x1b[<64;1;1M".to_vec()));
+        // Classic: 32 + button, 33 + column, 33 + row; a release is button 3 (modifiers kept).
+        assert_eq!(mouse_report(0, 2, 1, true, TermMode::empty()), Some(vec![0x1b, b'[', b'M', 32, 35, 34]));
+        assert_eq!(mouse_report(16, 0, 0, false, TermMode::empty()), Some(vec![0x1b, b'[', b'M', 32 + 19, 33, 33]));
+        assert_eq!(mouse_report(0, 300, 0, true, TermMode::empty()), None, "past column 223");
+        let utf8 = mouse_report(0, 300, 0, true, TermMode::UTF8_MOUSE).unwrap();
+        assert_eq!(String::from_utf8(utf8[3..].to_vec()).unwrap().chars().nth(1), Some(char::from_u32(333).unwrap()));
+    }
+
+    /// A terminal running `sleep` (so no prompt arrives) showing `screen`, rendered once.
+    fn terminal_showing(cx: &mut TestAppContext, screen: &[u8]) -> (Entity<TerminalView>, gpui_kit::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            super::init(cx);
+        });
+        let (window, term): (_, Entity<TerminalView>) = cx.update(|cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds(point(px(0.), px(0.)), size(px(800.), px(500.))))),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                let shell = Some(Shell::new("sleep".into(), vec!["30".into()]));
+                TerminalView::spawn(None, shell, window, cx).expect("spawn sleep")
+            })
+            .expect("open test window")
+        });
+        let mut cx = gpui_kit::VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.run_until_parked();
+        term.update(&mut cx, |t, cx| {
+            t.muted = true;
+            let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+            parser.advance(&mut *t.term.lock(), screen);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        // Mouse positions are measured from the grid's top-left (inside the 8px padding).
+        let origin = term.read_with(&cx, |t, _| t.origin);
+        assert!(origin.y < px(20.) && origin.x < px(20.), "grid origin {origin:?}");
+        (term, cx)
+    }
+
+    /// The window position of a cell, a quarter or three quarters across it.
+    fn at(
+        term: &Entity<TerminalView>,
+        cx: &mut gpui_kit::VisualTestContext,
+        col: usize,
+        row: usize,
+        right: bool,
+    ) -> gpui_kit::Point<gpui_kit::Pixels> {
+        term.read_with(cx, |t, _| {
+            let x = t.origin.x + t.cell.width * (col as f32 + if right { 0.75 } else { 0.25 });
+            point(x, t.origin.y + t.cell.height * (row as f32 + 0.5))
+        })
+    }
+
+    fn mouse(
+        button: MouseButton,
+        position: gpui_kit::Point<gpui_kit::Pixels>,
+        clicks: usize,
+        shift: bool,
+    ) -> MouseDownEvent {
+        let modifiers = Modifiers { shift, ..Default::default() };
+        MouseDownEvent { button, position, modifiers, click_count: clicks, first_mouse: false }
+    }
+
+    fn up(position: gpui_kit::Point<gpui_kit::Pixels>) -> MouseUpEvent {
+        MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 }
+    }
+
+    #[gpui_kit::test]
+    fn dragging_selects_text_into_the_primary_selection(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, b"hello world\r\nsecond line");
+        let cx = &mut cx;
+        let (start, end) = (at(&term, cx, 0, 0, false), at(&term, cx, 4, 0, true));
+        cx.simulate_event(mouse(MouseButton::Left, start, 1, false));
+        cx.simulate_event(MouseMoveEvent {
+            position: end,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        cx.simulate_event(up(end));
+        assert_eq!(term.read_with(cx, |t, _| t.selected_text()).as_deref(), Some("hello"));
+        assert_eq!(cx.update(|_, cx| cx.read_from_primary().and_then(|c| c.text())).as_deref(), Some("hello"));
+
+        // Ctrl+Shift+C copies it to the clipboard; typing clears it.
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("ctrl-shift-c");
+        assert_eq!(cx.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text())).as_deref(), Some("hello"));
+        cx.simulate_keystrokes("x");
+        assert_eq!(term.read_with(cx, |t, _| t.selected_text()), None);
+    }
+
+    #[gpui_kit::test]
+    fn double_and_triple_clicks_select_a_word_and_a_line(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, b"hello world\r\nsecond line");
+        let cx = &mut cx;
+        let word = at(&term, cx, 8, 0, false);
+        cx.simulate_event(mouse(MouseButton::Left, word, 2, false));
+        cx.simulate_event(up(word));
+        assert_eq!(term.read_with(cx, |t, _| t.selected_text()).as_deref(), Some("world"));
+        let line = at(&term, cx, 2, 1, false);
+        cx.simulate_event(mouse(MouseButton::Left, line, 3, false));
+        cx.simulate_event(up(line));
+        assert_eq!(term.read_with(cx, |t, _| t.selected_text()).as_deref().map(str::trim_end), Some("second line"));
+    }
+
+    #[gpui_kit::test]
+    fn an_app_in_mouse_mode_gets_clicks_unless_shift_is_held(cx: &mut TestAppContext) {
+        // What vim or htop sends to turn on click reporting in SGR form.
+        let (term, mut cx) = terminal_showing(cx, b"\x1b[?1000h\x1b[?1006hmenu item");
+        let cx = &mut cx;
+        let spot = at(&term, cx, 2, 0, false);
+        cx.simulate_event(mouse(MouseButton::Left, spot, 1, false));
+        cx.simulate_event(up(spot));
+        let sent = term.read_with(cx, |t, _| t.sent.borrow().clone());
+        assert_eq!(String::from_utf8_lossy(&sent), "\x1b[<0;3;1M\x1b[<0;3;1m");
+        assert_eq!(term.read_with(cx, |t, _| t.selected_text()), None);
+
+        term.read_with(cx, |t, _| t.sent.borrow_mut().clear());
+        let end = at(&term, cx, 3, 0, true);
+        let start = at(&term, cx, 0, 0, false);
+        cx.simulate_event(mouse(MouseButton::Left, start, 1, true));
+        cx.simulate_event(MouseMoveEvent {
+            position: end,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers { shift: true, ..Default::default() },
+        });
+        cx.simulate_event(up(end));
+        assert_eq!(term.read_with(cx, |t, _| t.selected_text()).as_deref(), Some("menu"), "Shift selects locally");
+        assert!(term.read_with(cx, |t, _| t.sent.borrow().is_empty()), "and nothing is reported");
     }
 
     fn bytes(keys: &'static str, mode: TermMode) -> Option<Vec<u8>> {
