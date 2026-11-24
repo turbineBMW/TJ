@@ -60,6 +60,16 @@ impl Dimensions for GridSize {
     }
 }
 
+/// A grid cell showing part of an image.
+#[derive(Clone, Copy, Debug)]
+struct ImageCell {
+    row: usize,
+    col: usize,
+    id: u16,
+    image_row: u16,
+    image_col: u16,
+}
+
 /// The shell ended; the terminal area closes its tab.
 pub struct TerminalExited;
 
@@ -85,6 +95,11 @@ pub struct TerminalView {
     /// The last cell reported to the app, so motion within one cell isn't repeated.
     last_reported: Option<(usize, usize)>,
     caret: crate::caret::Caret,
+    /// The display scale the PTY's pixel sizes were reported at.
+    scale: f32,
+    /// What the image filter knows of the grid, and the images it decoded.
+    geometry: crate::images::SharedGeometry,
+    images: crate::images::SharedStore,
     /// Everything written to the shell, so tests can check what it received.
     #[cfg(test)]
     sent: std::cell::RefCell<Vec<u8>>,
@@ -92,6 +107,9 @@ pub struct TerminalView {
     /// from the PTY's thread, which the test scheduler rejects.
     #[cfg(test)]
     muted: bool,
+    /// How many image slices the last frame drew.
+    #[cfg(test)]
+    image_slices: usize,
 }
 
 impl TerminalView {
@@ -119,8 +137,24 @@ impl TerminalView {
         env.insert("COLORTERM".into(), "truecolor".into());
         env.insert("TERM_PROGRAM".into(), "tj".into());
         let options = tty::Options { shell, working_directory: cwd, drain_on_exit: false, env };
-        let pty = tty::new(&options, window_size(size, cell), 0)?;
-        let pid = Some(pty.child().id());
+        let scale = window.scale_factor();
+        let pty = tty::new(&options, window_size(size, cell, scale), 0)?;
+
+        // Images come out of the output before alacritty sees it (see `images`).
+        let geometry = Arc::new(std::sync::Mutex::new(crate::images::Geometry {
+            cell_width: f32::from(cell.width) * scale,
+            cell_height: f32::from(cell.height) * scale,
+            scale,
+            cols: size.cols as u16,
+            rows: size.rows as u16,
+        }));
+        let images: crate::images::SharedStore = Default::default();
+        let replies = listener.clone();
+        let filter = crate::images::Filter::new(geometry.clone(), images.clone(), move |reply| {
+            replies.send_event(TermEvent::PtyWrite(reply))
+        });
+        let pty = crate::images::FilteredPty::new(pty, filter)?;
+        let pid = Some(pty.child_id());
 
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let notifier = Notifier(event_loop.channel());
@@ -154,10 +188,15 @@ impl TerminalView {
                 reported_button: None,
                 last_reported: None,
                 caret: Default::default(),
+                scale,
+                geometry,
+                images,
                 #[cfg(test)]
                 sent: Default::default(),
                 #[cfg(test)]
                 muted: false,
+                #[cfg(test)]
+                image_slices: 0,
             }
         }))
     }
@@ -183,7 +222,7 @@ impl TerminalView {
                     self.write(format(&text).into_bytes());
                 }
                 TermEvent::TextAreaSizeRequest(format) => {
-                    self.write(format(window_size(self.size, self.cell)).into_bytes())
+                    self.write(format(window_size(self.size, self.cell, self.scale)).into_bytes())
                 }
                 TermEvent::ColorRequest(index, format) => {
                     let (ansi, _, _) = terminal_colors(cx);
@@ -220,13 +259,28 @@ impl TerminalView {
         self.notifier.notify(bytes);
     }
 
+    /// Moving to a screen with another scale changes the pixel sizes apps were told.
+    fn sync_scale(&mut self, scale: f32) {
+        if scale == self.scale {
+            return;
+        }
+        self.scale = scale;
+        {
+            let mut g = self.geometry.lock().unwrap();
+            g.scale = scale;
+            g.cell_width = f32::from(self.cell.width) * scale;
+            g.cell_height = f32::from(self.cell.height) * scale;
+        }
+        self.notifier.on_resize(window_size(self.size, self.cell, scale));
+    }
+
     fn resize(&mut self, size: GridSize, cx: &mut Context<Self>) {
         if size == self.size || size.cols < 2 || size.rows < 1 {
             return;
         }
         self.size = size;
         self.term.lock().resize(size);
-        self.notifier.on_resize(window_size(size, self.cell));
+        self.notifier.on_resize(window_size(size, self.cell, self.scale));
         cx.notify();
     }
 
@@ -334,12 +388,14 @@ fn cell_size(window: &mut Window, cx: &App) -> Size<Pixels> {
     size(width, px((FONT_SIZE * LINE_HEIGHT).round()))
 }
 
-fn window_size(size: GridSize, cell: Size<Pixels>) -> WindowSize {
+/// The size the PTY reports to apps. Cells are in device pixels, so image tools send pictures
+/// sharp enough for the screen (they're drawn at one image pixel per device pixel).
+fn window_size(size: GridSize, cell: Size<Pixels>, scale: f32) -> WindowSize {
     WindowSize {
         num_lines: size.rows as u16,
         num_cols: size.cols as u16,
-        cell_width: f32::from(cell.width) as u16,
-        cell_height: f32::from(cell.height) as u16,
+        cell_width: (f32::from(cell.width) * scale).round() as u16,
+        cell_height: (f32::from(cell.height) * scale).round() as u16,
     }
 }
 
@@ -577,6 +633,67 @@ impl TerminalView {
         out
     }
 
+    // ---------- images ----------
+
+    /// Each run of placeholder cells (side by side, same image and row, in order) becomes
+    /// that slice of its image: the image drawn at its place on the grid, clipped to the run.
+    fn render_images(&self, cells: &[ImageCell]) -> Vec<AnyElement> {
+        if cells.is_empty() {
+            return Vec::new();
+        }
+        let store = self.images.lock().unwrap();
+        let cell = self.cell;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < cells.len() {
+            let first = cells[i];
+            let mut n = 1;
+            while let Some(next) = cells.get(i + n) {
+                let follows = next.row == first.row
+                    && next.col == first.col + n
+                    && next.id == first.id
+                    && next.image_row == first.image_row
+                    && next.image_col as usize == first.image_col as usize + n;
+                if !follows {
+                    break;
+                }
+                n += 1;
+            }
+            i += n;
+            let Some(placement) = store.placement(first.id) else { continue };
+            let (bw, bh) = (cell.width * placement.cols as f32, cell.height * placement.rows as f32);
+            let natural =
+                size(px(placement.picture.width as f32 / self.scale), px(placement.picture.height as f32 / self.scale));
+            let shown = match placement.fit {
+                crate::images::Fit::Natural => natural,
+                crate::images::Fit::Stretch => size(bw, bh),
+                crate::images::Fit::Contain => {
+                    let k = (bw / natural.width).min(bh / natural.height);
+                    size(natural.width * k, natural.height * k)
+                }
+            };
+            out.push(
+                div()
+                    .absolute()
+                    .left(cell.width * first.col as f32)
+                    .top(cell.height * first.row as f32)
+                    .w(cell.width * n as f32)
+                    .h(cell.height)
+                    .overflow_hidden()
+                    .child(
+                        img(gpui_kit::ImageSource::Render(placement.picture.image.clone()))
+                            .absolute()
+                            .left(-(cell.width * first.image_col as f32))
+                            .top(-(cell.height * first.image_row as f32))
+                            .w(shown.width)
+                            .h(shown.height),
+                    )
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+
     // ---------- mouse ----------
 
     /// The grid cell under a window position, clamped to the grid, and which half of it.
@@ -722,6 +839,7 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_scale(window.scale_factor());
         let (ansi, fg, bg) = terminal_colors(cx);
         let base_font = mono_font(cx);
         let focused = self.focus.is_focused(window);
@@ -738,6 +856,7 @@ impl Render for TerminalView {
 
         let rows = self.size.rows;
         let mut lines: Vec<(String, Vec<TextRun>)> = (0..rows).map(|_| (String::new(), Vec::new())).collect();
+        let mut image_cells: Vec<ImageCell> = Vec::new();
 
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + offset;
@@ -749,6 +868,28 @@ impl Render for TerminalView {
                 continue;
             }
             let (text, runs) = &mut lines[row as usize];
+
+            // An image's cell: drawn below as part of its image, so no text or background.
+            if let Some((id, image_row, image_col)) = crate::images::decode_cell(cell.c, cell.fg, cell.bg) {
+                image_cells.push(ImageCell {
+                    row: row as usize,
+                    col: indexed.point.column.0,
+                    id,
+                    image_row,
+                    image_col,
+                });
+                let start = text.len();
+                text.push(' ');
+                runs.push(TextRun {
+                    len: text.len() - start,
+                    font: base_font.clone(),
+                    color: fg,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+                continue;
+            }
 
             let mut cell_fg = palette.resolve(cell.fg, cell.flags, true).unwrap_or(fg);
             let mut cell_bg = palette.resolve(cell.bg, cell.flags, false);
@@ -814,6 +955,11 @@ impl Render for TerminalView {
         }
         drop(term);
 
+        let image_slices = self.render_images(&image_cells);
+        #[cfg(test)]
+        {
+            self.image_slices = image_slices.len();
+        }
         let cursor_overlay = self.render_cursor(
             cursor,
             cursor_style.blinking,
@@ -888,6 +1034,7 @@ impl Render for TerminalView {
                     .children(lines.into_iter().map(|(text, runs)| {
                         div().h(cell.height).whitespace_nowrap().child(StyledText::new(text).with_runs(runs))
                     }))
+                    .children(image_slices)
                     .children(cursor_overlay)
                     .child(measure),
             )
@@ -983,6 +1130,30 @@ mod tests {
         assert_eq!(mouse_report(0, 300, 0, true, TermMode::empty()), None, "past column 223");
         let utf8 = mouse_report(0, 300, 0, true, TermMode::UTF8_MOUSE).unwrap();
         assert_eq!(String::from_utf8(utf8[3..].to_vec()).unwrap().chars().nth(1), Some(char::from_u32(333).unwrap()));
+    }
+
+    #[gpui_kit::test]
+    fn an_image_is_drawn_one_slice_per_row(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, b"");
+        let cx = &mut cx;
+        term.update(cx, |t, cx| {
+            // A 3x2-cell image through the terminal's own filter, as the PTY would deliver it.
+            let mut png = Vec::new();
+            image::RgbaImage::from_pixel(20, 30, image::Rgba([1, 2, 3, 255]))
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            use base64::Engine as _;
+            let sequence =
+                format!("\x1b_Ga=T,f=100,c=3,r=2;{}\x1b\\", base64::engine::general_purpose::STANDARD.encode(png));
+            let mut filter = crate::images::Filter::new(t.geometry.clone(), t.images.clone(), |_| {});
+            let mut out = Vec::new();
+            filter.feed(sequence.as_bytes(), &mut out);
+            let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+            parser.advance(&mut *t.term.lock(), &out);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(term.read_with(cx, |t, _| t.image_slices), 2, "one run of three cells per row");
     }
 
     #[gpui_kit::test]
