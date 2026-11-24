@@ -1641,7 +1641,7 @@ impl ThreadView {
                     for model in &menus.models {
                         let (thread, value) = (thread.clone(), model.value.clone());
                         let picked = choice.as_deref().unwrap_or("default") == model.value;
-                        let (name, description) = (model.name.clone(), model.description.clone());
+                        let (name, description) = model_menu_text(model);
                         let item = PopupMenuItem::element(move |_, cx| {
                             let muted = cx.theme().muted_foreground;
                             v_flex()
@@ -1876,6 +1876,30 @@ pub fn short_model(model: &str) -> String {
         }
         _ => model.to_string(),
     }
+}
+
+/// A model's two menu lines. The version goes in the title ("Opus 5.5") and leaves the
+/// description, when the description starts with it ("Opus 5.5 · Best for ..."). The default
+/// entry keeps its name and gets the version only if the description doesn't already say it.
+pub fn model_menu_text(model: &crate::agent::ModelChoice) -> (String, String) {
+    let Some(version) = model.resolved.as_deref().map(short_model).filter(|v| v.contains(' ')) else {
+        return (model.name.clone(), model.description.clone());
+    };
+    let description = model
+        .description
+        .strip_prefix(version.as_str())
+        .and_then(|rest| rest.strip_prefix(" · "))
+        .unwrap_or(&model.description)
+        .to_string();
+    let family = version.split(' ').next().unwrap_or_default();
+    let title = if model.name.split(' ').next().is_some_and(|word| word.eq_ignore_ascii_case(family)) {
+        version
+    } else if description.contains(&version) {
+        model.name.clone()
+    } else {
+        format!("{} · {version}", model.name)
+    };
+    (title, description)
 }
 
 /// Where a new thread runs.
@@ -2294,6 +2318,58 @@ mod tests {
         assert!(has_summary);
         assert!(thread.read_with(cx, |t, _| t.plain.iter().any(|l| l.starts_with("(Subagent "))));
         assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Idle);
+    }
+
+    #[test]
+    fn model_versions_move_from_the_description_to_the_title() {
+        use super::model_menu_text;
+        use crate::agent::ModelChoice;
+        let entry = |value: &str, name: &str, resolved: Option<&str>, description: &str| ModelChoice {
+            value: value.into(),
+            name: name.into(),
+            description: description.into(),
+            resolved: resolved.map(str::to_owned),
+            efforts: vec![],
+        };
+        let text = |m: ModelChoice| {
+            let (title, description) = model_menu_text(&m);
+            (title, description)
+        };
+        // The Work account's wording.
+        assert_eq!(
+            text(entry(
+                "opus",
+                "Opus",
+                Some("claude-opus-5-5"),
+                "Opus 5.5 · Best for everyday, complex tasks · $4/$20 per Mtok"
+            )),
+            ("Opus 5.5".into(), "Best for everyday, complex tasks · $4/$20 per Mtok".into())
+        );
+        assert_eq!(
+            text(entry(
+                "default",
+                "Default (recommended)",
+                Some("claude-opus-5-5"),
+                "Use the default model (currently Opus 5.5) · $4/$20 per Mtok"
+            )),
+            ("Default (recommended)".into(), "Use the default model (currently Opus 5.5) · $4/$20 per Mtok".into())
+        );
+        // A default whose description starts with the version takes it into the title.
+        assert_eq!(
+            text(entry(
+                "default",
+                "Default (recommended)",
+                Some("claude-opus-5-5"),
+                "Opus 5.5 · Best for everyday tasks"
+            )),
+            ("Default (recommended) · Opus 5.5".into(), "Best for everyday tasks".into())
+        );
+        // A full id, and an entry claude didn't resolve.
+        assert_eq!(
+            text(entry("claude-haiku-4-5-20251001", "Haiku 4.5", Some("claude-haiku-4-5-20251001"), "Fastest")),
+            ("Haiku 4.5".into(), "Fastest".into())
+        );
+        assert_eq!(text(entry("opus", "Opus", None, "Opus 5.5 · Best")), ("Opus".into(), "Opus 5.5 · Best".into()));
     }
 
     #[gpui_kit::test]
