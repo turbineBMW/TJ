@@ -1298,16 +1298,20 @@ mod tests {
         focus_active(&s.panes, cx);
         let first = s.panes.read_with(cx, |p, _| p.focused_pane());
 
-        cx.update(|window, cx| window.press("ctrl-shift-e", cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1], "Ctrl+Shift+E splits right");
+        cx.update(|window, cx| window.press("ctrl-alt-h", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1], "Ctrl+Alt+H splits right");
         let right = s.panes.read_with(cx, |p, _| p.focused_pane());
         assert_ne!(right, first, "focus moves to the new pane");
 
         cx.update(|window, cx| window.press("ctrl-shift-t", cx));
         assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 2], "Ctrl+Shift+T opens a tab in the focused pane");
 
+        cx.update(|window, cx| window.press("ctrl-alt-s", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), first, "Ctrl+Alt+S moves to the left pane");
+        cx.update(|window, cx| window.press("ctrl-alt-f", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), right, "Ctrl+Alt+F moves back right");
         cx.update(|window, cx| window.press("ctrl-alt-left", cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), first, "Ctrl+Alt+Left moves to the left pane");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), first, "Ctrl+Alt+Left still moves left");
 
         cx.update(|window, cx| window.press("ctrl-shift-w", cx));
         assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2], "closing a pane's last tab folds the split");
@@ -1319,8 +1323,8 @@ mod tests {
         let s = open(cx, None, true);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
         focus_active(&s.panes, cx);
-        cx.update(|window, cx| window.press("ctrl-shift-o", cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "Ctrl+Shift+O from the prompt splits down");
+        cx.update(|window, cx| window.press("ctrl-alt-v", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "Ctrl+Alt+V from the prompt splits down");
     }
 
     #[gpui_kit::test]

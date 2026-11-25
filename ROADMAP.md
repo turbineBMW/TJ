@@ -31,8 +31,8 @@ The model is Rustle and Bubo (`~/Projects/Rustle`, `~/Projects/Bubo`):
   | Keys | Action |
   |---|---|
   | `Ctrl+Shift+T` / `Ctrl+Shift+W` | New tab (same directory) / close tab |
-  | `Ctrl+Shift+E` / `Ctrl+Shift+O` | Split right / down |
-  | `Ctrl+Alt+←/→/↑/↓` | Focus pane in that direction |
+  | `Ctrl+Alt+H` / `Ctrl+Alt+V` | Split right / down |
+  | `Ctrl+Alt+S/F/E/D` or `Ctrl+Alt+←/→/↑/↓` | Focus pane left / right / up / down |
   | `Ctrl+Shift+A` | Focus next pane |
   | `Ctrl+Shift+=` / `Ctrl+Shift+-` | Grow / shrink pane |
   | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |

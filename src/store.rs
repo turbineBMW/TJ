@@ -360,7 +360,7 @@ pub struct State {
     pub projects: Vec<Project>,
     #[serde(default)]
     pub selected_thread: Option<String>,
-    /// The sidebar is folded away (Ctrl+Alt+S, or the button at the left of the top bar).
+    /// The sidebar is folded away (Ctrl+Shift+S, or the button at the left of the top bar).
     #[serde(default)]
     pub sidebar_collapsed: bool,
 }
