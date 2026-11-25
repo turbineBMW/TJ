@@ -73,6 +73,12 @@ impl Settings {
     pub fn sidebar_alpha(&self) -> f32 {
         if self.transparent_sidebar { self.sidebar_opacity.clamp(Self::MIN_OPACITY, 1.0) } else { 1.0 }
     }
+
+    /// How opaque a card on the frame is (the selected thread, the status column's sections):
+    /// half the frame's own opacity, so it stays see-through with it.
+    pub fn card_alpha(&self) -> f32 {
+        self.sidebar_alpha() * 0.5
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +106,7 @@ mod tests {
         std::fs::write(paths.config_dir.join("settings.toml"), old).unwrap();
         assert_eq!(Settings::load(&paths).cursor_glide_ms, 90, "a file from before the trail went still loads");
         assert_eq!(settings.sidebar_alpha(), 0.6);
+        assert_eq!(settings.card_alpha(), 0.3, "cards are half as opaque as the frame");
         assert_eq!(Settings::default().sidebar_alpha(), 1.0, "off means opaque");
         assert_eq!(Settings { transparent_sidebar: true, sidebar_opacity: 0.0, ..settings }.sidebar_alpha(), 0.3);
     }

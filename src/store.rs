@@ -52,6 +52,10 @@ impl Paths {
     pub fn state_file(&self) -> PathBuf {
         self.data_dir.join("state.json")
     }
+    /// The accounts' last usage and the models' context windows.
+    pub fn usage_file(&self) -> PathBuf {
+        self.data_dir.join("usage.json")
+    }
     pub fn transcript(&self, thread_id: &str) -> PathBuf {
         self.data_dir.join("threads").join(format!("{thread_id}.jsonl"))
     }

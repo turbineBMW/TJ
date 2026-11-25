@@ -617,17 +617,22 @@ impl ThreadView {
     /// to (also for "default"), else the entry's name; then the effort, when one is set.
     /// Descriptions are never used: accounts word them differently (some add pricing).
     pub fn model_label(&self) -> String {
-        let info = self.model_info();
-        let resolved = info.and_then(|m| m.resolved.as_deref()).map(short_model);
-        let name = match &self.model_choice {
-            // A session reports the model that really answered; after a switch it catches up.
-            None => self.model.as_deref().map(short_model).or(resolved),
-            Some(value) => resolved.or_else(|| info.map(|m| m.name.clone())).or_else(|| Some(value.clone())),
-        }
-        .unwrap_or_else(|| "Default model".into());
+        let name = self.model_name().unwrap_or_else(|| "Default model".into());
         match &self.effort {
             Some(effort) => format!("{name} · {}", capitalize(effort)),
             None => name,
+        }
+    }
+
+    /// The model's short name ("Opus 5.5"): the one a session runs, else the one the picked
+    /// entry resolves to, else the entry's name.
+    pub fn model_name(&self) -> Option<String> {
+        let info = self.model_info();
+        let resolved = info.and_then(|m| m.resolved.as_deref()).map(short_model);
+        match &self.model_choice {
+            // A session reports the model that really answered; after a switch it catches up.
+            None => self.model.as_deref().map(short_model).or(resolved),
+            Some(value) => resolved.or_else(|| info.map(|m| m.name.clone())).or_else(|| Some(value.clone())),
         }
     }
 
@@ -1757,6 +1762,10 @@ impl ThreadView {
             AgentEvent::Context { tokens, window } => {
                 self.context_tokens = tokens.or(self.context_tokens);
                 self.context_window = window.or(self.context_window);
+                // An old transcript's window may be out of date; only a live one is kept.
+                if let (false, Some(window), Some(model)) = (self.replaying, window, self.model_name()) {
+                    crate::usage::Usage::set_context_window(cx, model, window);
+                }
             }
             AgentEvent::Usage(windows) => crate::usage::Usage::update(cx, &self.account_id, |u| u.merge(windows)),
             AgentEvent::Plan(plan) => crate::usage::Usage::update(cx, &self.account_id, |u| u.plan = Some(plan)),

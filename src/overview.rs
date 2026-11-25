@@ -28,9 +28,6 @@ pub struct Overview {
 }
 
 impl Overview {
-    pub fn is_empty(&self) -> bool {
-        self.goal.is_none() && self.now.is_none() && self.next.is_none() && self.tasks.is_empty()
-    }
     pub fn done_count(&self) -> usize {
         self.tasks.iter().filter(|t| t.done).count()
     }
