@@ -502,6 +502,19 @@ fn terminal_colors(cx: &App) -> ([Rgb; 16], Hsla, Hsla) {
     }
 }
 
+/// The built-in ANSI colours (Tokyo Night), for dark surfaces when the theme's own terminal
+/// palette is made for a light background.
+pub fn default_ansi() -> [Hsla; 16] {
+    ANSI.map(|v| rgb_to_hsla(Rgb { r: (v >> 16) as u8, g: (v >> 8) as u8, b: v as u8 }))
+}
+
+/// The terminal palette as UI colours: the 16 ANSI colours, foreground and background. Tool
+/// cards use it so their colours follow the Omarchy theme like the terminal does.
+pub fn palette(cx: &App) -> ([Hsla; 16], Hsla, Hsla) {
+    let (ansi, fg, bg) = terminal_colors(cx);
+    (ansi.map(rgb_to_hsla), fg, bg)
+}
+
 fn default_rgb(index: usize, ansi: &[Rgb; 16]) -> Rgb {
     let hex = match index {
         0..=15 => return ansi[index],

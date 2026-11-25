@@ -1459,8 +1459,20 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// TJ asks for client-side decorations, and gpui-kit sets a 20 px shadow inset for them. When
+/// the compositor draws the frame instead (Hyprland does), that inset is never cleared, and gpui
+/// still counts it when keeping overlays inside the window: a full-window dialog backdrop gets
+/// pushed 20 px down, leaving a strip at the top undimmed. A server-decorated window has no
+/// shadow, so its inset is zero (the platform already sizes the window that way).
+fn clear_stale_client_inset(window: &mut Window) {
+    if matches!(window.window_decorations(), Decorations::Server) && window.client_inset().is_some_and(|i| i > px(0.)) {
+        window.set_client_inset(px(0.));
+    }
+}
+
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        clear_stale_client_inset(window);
         let panes = self.active_project().and_then(|p| self.panes.get(&p.id)).cloned();
         let theme = cx.theme();
         let (bg, fg, danger) = (theme.background, theme.foreground, theme.danger);

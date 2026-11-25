@@ -109,6 +109,20 @@ impl PermissionMode {
     }
 }
 
+/// A picture in a tool's result. Live events carry the bytes; a thread saves them beside its
+/// transcript and keeps only the file name, so transcripts stay small.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolImage {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    /// The picture as base64, until it's saved.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub data: String,
+    /// Its file name in the thread's files folder, once saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
 /// The agent wants to use a tool and is waiting for the user.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
@@ -188,6 +202,9 @@ pub enum AgentEvent {
         id: String,
         output: String,
         is_error: bool,
+        /// Pictures the tool returned (Read on an image, an MCP tool's screenshot).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ToolImage>,
     },
     PermissionRequested(PermissionRequest),
     /// The agent no longer needs the answer (for example the turn was interrupted).

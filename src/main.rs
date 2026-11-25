@@ -8,6 +8,7 @@ mod changes;
 mod composer;
 mod demo;
 mod handoff;
+mod highlight;
 mod images;
 mod keymap;
 mod omarchy;
@@ -19,6 +20,7 @@ mod settings;
 mod store;
 mod terminal;
 mod thread;
+mod tool_card;
 mod workspace;
 
 use std::path::PathBuf;
