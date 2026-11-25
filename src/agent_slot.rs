@@ -1,7 +1,10 @@
-//! A project's one agent tab: the conversation of the thread picked in the sidebar, with its
-//! status column on the right (the overview, the project's changed files and the agent's
-//! numbers). Picking another thread swaps what's in it; the panes and terminals around it stay
-//! as they are. The column folds away when the tab is narrow, and can be shown or hidden by hand.
+//! A project's one agent tab: the conversation of the thread picked in the sidebar. Picking
+//! another thread swaps what's in it; the panes and terminals around it stay as they are.
+//!
+//! It also builds the thread's status column (the overview, the project's changed files and the
+//! agent's numbers), which the workspace shows at the right of the window, in the frame like the
+//! sidebar, whichever pane is focused. The changes and the numbers are cards in the sidebar's
+//! selected-row colour.
 
 use std::path::PathBuf;
 
@@ -14,8 +17,6 @@ use crate::thread::ThreadView;
 
 /// How wide the status column is.
 pub const STATUS_WIDTH: f32 = 340.0;
-/// Below this width the status column folds away, unless it was shown by hand.
-const FOLD_WIDTH: f32 = 760.0;
 
 pub enum AgentSlotEvent {
     /// Open the review, scrolled to this file if given.
@@ -28,10 +29,6 @@ pub struct AgentSlot {
     thread: Option<(String, Entity<ThreadView>)>,
     project_dir: PathBuf,
     changes: Entity<ProjectChanges>,
-    /// Shown or hidden by hand; `None` follows the width.
-    status_choice: Option<bool>,
-    /// The tab's width at the last paint.
-    width: Pixels,
     _thread_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -40,16 +37,7 @@ impl AgentSlot {
     pub fn new(project_dir: PathBuf, changes: Entity<ProjectChanges>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&changes, |_, _, cx| cx.notify());
         let usage = cx.observe_global::<crate::usage::Usage>(|_, cx| cx.notify());
-        Self {
-            thread: None,
-            project_dir,
-            changes,
-            status_choice: None,
-            // Until it's measured, assume there's room.
-            width: px(f32::MAX),
-            _thread_subscription: None,
-            _subscriptions: vec![observe, usage],
-        }
+        Self { thread: None, project_dir, changes, _thread_subscription: None, _subscriptions: vec![observe, usage] }
     }
 
     pub fn thread_id(&self) -> Option<&str> {
@@ -77,39 +65,53 @@ impl AgentSlot {
         cx.notify();
     }
 
-    /// Whether the status column has anything to show: not while the thread is on its intro.
-    pub fn has_status(&self, cx: &App) -> bool {
-        let Some(t) = self.thread().map(|t| t.read(cx)) else { return false };
-        if t.is_fresh() {
-            return false;
-        }
-        let changes = &self.changes.read(cx).changes;
-        !t.overview.is_empty() || (changes.is_repo && !changes.files.is_empty())
+    /// Whether there's a status column: whenever a thread is shown, even a new one, whose
+    /// overview says what it doesn't have yet.
+    pub fn has_status(&self) -> bool {
+        self.thread.is_some()
     }
 
-    pub fn status_shown(&self, cx: &App) -> bool {
-        self.has_status(cx) && self.status_choice.unwrap_or(self.width >= px(FOLD_WIDTH))
-    }
-
-    pub fn toggle_status(&mut self, cx: &mut Context<Self>) {
-        self.status_choice = Some(!self.status_shown(cx));
-        cx.notify();
-    }
-
-    /// Goal, Now, Next and tasks for the thread, like pi's session sidebar.
-    fn overview(&self, view: &Entity<ThreadView>, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let t = view.read(cx);
-        let ov = &t.overview;
-        if ov.is_empty() {
+    /// The status column for the thread shown: the overview on top, straight on the frame like
+    /// the sidebar's projects, then the changed files and the agent's numbers at the bottom as
+    /// cards of `card` colour.
+    pub fn status_column(&self, card: Hsla, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.has_status() {
             return None;
         }
+        let view = self.thread()?.clone();
+        let section = |el: Stateful<Div>| el.flex_none().rounded_lg().overflow_hidden().bg(card);
+        Some(
+            v_flex()
+                .id("status")
+                .test_support()
+                .w(px(STATUS_WIDTH))
+                .flex_none()
+                .h_full()
+                .gap_2()
+                .px_2()
+                .pb_2()
+                // The overview takes the space, and scrolls when it runs out.
+                .child(self.overview(&view, cx).flex_1().min_h_0())
+                .children(self.changes_list(&view, card, cx).map(section))
+                .child(section(self.metrics(&view, cx)).test_support())
+                .into_any_element(),
+        )
+    }
+
+    /// Goal, Now, Next and tasks for the thread, like pi's session sidebar, in the sidebar's
+    /// colours. Every part always shows, saying so when there's nothing yet.
+    fn overview(&self, view: &Entity<ThreadView>, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = view.read(cx);
+        let ov = &t.overview;
         let theme = cx.theme();
-        let (muted, accent, fg) = (theme.muted_foreground, theme.primary, theme.foreground);
+        let (muted, accent, fg) = (theme.sidebar_foreground.opacity(0.6), theme.primary, theme.sidebar_foreground);
         let label =
             |text: &'static str| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(text);
-        let field = |name: &'static str, value: &Option<String>, color: Hsla| {
-            value.clone().map(|value| {
-                v_flex().gap_0p5().child(label(name)).child(div().text_sm().text_color(color).child(value))
+        let empty = |text: &'static str| div().text_sm().italic().text_color(muted).child(text);
+        let field = |name: &'static str, value: &Option<String>, color: Hsla, none: &'static str| {
+            v_flex().gap_0p5().child(label(name)).child(match value.clone() {
+                Some(value) => div().text_sm().text_color(color).child(value),
+                None => empty(none),
             })
         };
         let tasks = ov.tasks.iter().map(|task| {
@@ -132,64 +134,60 @@ impl AgentSlot {
         });
         let body = v_flex()
             .gap_2()
-            .children(field("GOAL", &ov.goal, fg))
-            .children(field("NOW", &ov.now, accent))
-            .children(field("NEXT", &ov.next, fg))
-            .when(!ov.tasks.is_empty(), |el| {
-                el.child(
-                    v_flex()
-                        .gap_0p5()
-                        .child(h_flex().gap_1().child(label("TASKS")).child(
-                            div().text_xs().text_color(muted).child(format!("{}/{}", ov.done_count(), ov.tasks.len())),
-                        ))
-                        .children(tasks),
-                )
-            });
+            .child(field("GOAL", &ov.goal, fg, "No goal established yet"))
+            .child(field("NOW", &ov.now, accent, "Nothing in progress"))
+            .child(field("NEXT", &ov.next, fg, "No next steps established yet"))
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(h_flex().gap_1().child(label("TASKS")).when(!ov.tasks.is_empty(), |el| {
+                        el.child(div().text_xs().text_color(muted).child(format!(
+                            "{}/{}",
+                            ov.done_count(),
+                            ov.tasks.len()
+                        )))
+                    }))
+                    .children(tasks)
+                    .when(ov.tasks.is_empty(), |el| el.child(empty("No tasks yet"))),
+            );
         let view = view.clone();
-        Some(
-            v_flex()
-                .id("overview")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(muted)
-                                .child("OVERVIEW"),
-                        )
-                        .when(t.overview_busy, |el| el.child(div().text_xs().text_color(muted).child("updating…")))
-                        .child(
-                            Button::new("refresh-overview")
-                                .xsmall()
-                                .ghost()
-                                .label("↻")
-                                .tooltip("Update the overview now")
-                                .on_click(move |_, _, cx| view.update(cx, |t, cx| t.update_overview(cx))),
-                        ),
-                )
-                .child(body)
-                .into_any_element(),
-        )
+        v_flex()
+            .id("overview")
+            .overflow_y_scroll()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div().flex_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child("OVERVIEW"),
+                    )
+                    .when(t.overview_busy, |el| el.child(div().text_xs().text_color(muted).child("updating…")))
+                    .child(
+                        Button::new("refresh-overview")
+                            .xsmall()
+                            .ghost()
+                            .label("↻")
+                            .tooltip("Update the overview now")
+                            .on_click(move |_, _, cx| view.update(cx, |t, cx| t.update_overview(cx))),
+                    ),
+            )
+            .child(body)
     }
 
     /// The agent's numbers, pinned to the bottom of the column: the account's usage limits as
     /// meters (a subscription's 5-hour and weekly windows, or a spending limit), the context
     /// window, and what the thread has cost. The model is left to the prompt card.
-    fn metrics(&self, view: &Entity<ThreadView>, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn metrics(&self, view: &Entity<ThreadView>, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = view.read(cx);
         let account = crate::usage::Usage::get(cx, &t.account_id).cloned().unwrap_or_default();
-        let (account_name, cost, context) = (t.account_name.clone(), t.cost_usd, (t.context_tokens, t.context_window));
+        // Before the first turn, the room the model had last time.
+        let window =
+            t.context_window.or_else(|| t.model_name().and_then(|m| crate::usage::Usage::context_window(cx, &m)));
+        let (account_name, cost, context) = (t.account_name.clone(), t.cost_usd, (t.context_tokens, window));
         let theme = cx.theme();
-        let (muted, fg, border) = (theme.muted_foreground, theme.foreground, theme.border);
+        let (muted, fg) = (theme.muted_foreground, theme.foreground);
         let (warning, danger, primary) = (theme.warning, theme.danger, theme.primary);
         let mono = theme.mono_font_family.clone();
         let (ansi, _, _) = crate::terminal::palette(cx);
@@ -281,20 +279,19 @@ impl AgentSlot {
             let capped = window.spend.as_ref().is_none_or(|s| s.limit.is_some());
             rows.push(meter(emoji, name, value, note, capped.then_some(fraction), color).into_any_element());
         }
-        if let (Some(tokens), Some(window)) = context {
-            let fraction = tokens as f64 / window.max(1) as f64;
-            rows.push(
-                meter(
-                    "🧠",
-                    "Context".into(),
-                    format!("{:.0}%", fraction * 100.0),
-                    Some(format!("{} / {}", compact(tokens), compact(window))),
-                    Some(fraction),
-                    tone(ansi[12], fraction, None),
-                )
+        // Always shown: empty until the first turn, with the model's window once it's known.
+        let (value, note, fraction) = match context {
+            (tokens, Some(window)) => {
+                let tokens = tokens.unwrap_or(0);
+                let fraction = tokens as f64 / window.max(1) as f64;
+                (format!("{:.0}%", fraction * 100.0), format!("{} / {}", compact(tokens), compact(window)), fraction)
+            }
+            (_, None) => ("—".to_string(), "after the first message".to_string(), 0.0),
+        };
+        rows.push(
+            meter("🧠", "Context".into(), value, Some(note), Some(fraction), tone(ansi[12], fraction, None))
                 .into_any_element(),
-            );
-        }
+        );
         if cost > 0.0 {
             // On a subscription this is Claude's estimate, not a charge.
             let approx = if account.is_subscription() { "≈" } else { "" };
@@ -302,10 +299,6 @@ impl AgentSlot {
             let note = account.is_subscription().then(|| "estimate".to_string());
             rows.push(meter("💵", "This thread".into(), amount, note, None, fg).into_any_element());
         }
-        if rows.is_empty() && account.plan.is_none() {
-            return None;
-        }
-
         let plan = account.plan.as_deref().map(|plan| match plan {
             "max" => "Max".to_string(),
             "pro" => "Pro".to_string(),
@@ -325,49 +318,38 @@ impl AgentSlot {
             .child("👤")
             .child(account_name)
             .children(plan.map(|plan| div().font_weight(FontWeight::SEMIBOLD).child(format!("· {plan}"))));
-        let quiet = account
-            .windows
-            .is_empty()
-            .then(|| div().text_xs().text_color(muted).child("No usage limits reported for this account yet."));
-        Some(
-            v_flex()
-                .id("metrics")
-                .test_support()
-                .flex_none()
-                .gap_2()
-                .px_3()
-                .pt_2()
-                .pb_3()
-                .border_t_1()
-                .border_color(border)
-                .bg(linear_gradient(
-                    180.,
-                    linear_color_stop(primary.opacity(0.0), 0.),
-                    linear_color_stop(primary.opacity(0.06), 1.),
-                ))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div().flex_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child("USAGE"),
-                        )
-                        .child(badge),
-                )
-                .children(quiet)
-                .children(rows)
-                .into_any_element(),
-        )
+        let quiet = account.windows.is_empty().then(|| {
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child("No usage limits reported yet; they show once Claude starts on this account.")
+        });
+        v_flex()
+            .id("metrics")
+            .flex_none()
+            .gap_2()
+            .px_3()
+            .pt_2()
+            .pb_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child("USAGE"))
+                    .child(badge),
+            )
+            .children(quiet)
+            .children(rows)
     }
 
     /// The project's uncommitted changes; a dot marks files this thread edited.
-    fn changes_list(&self, view: &Entity<ThreadView>, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn changes_list(&self, view: &Entity<ThreadView>, card: Hsla, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let touched = crate::changes::touched_relative(&self.project_dir, &view.read(cx).touched);
         let model = self.changes.read(cx);
         if !model.changes.is_repo || model.changes.files.is_empty() {
             return None;
         }
         let theme = cx.theme();
-        let (muted, border, accent) = (theme.muted_foreground, theme.border, theme.primary);
+        let (muted, accent) = (theme.muted_foreground, theme.primary);
         let (added, deleted, modified) = (theme.success, theme.danger, theme.warning);
         let mono = theme.mono_font_family.clone();
         let rows = model.changes.files.iter().enumerate().map(|(ix, file)| {
@@ -389,7 +371,8 @@ impl AgentSlot {
                 .px_3()
                 .py_0p5()
                 .cursor_pointer()
-                .hover(|el| el.bg(border.opacity(0.5)))
+                // One more layer of the card's colour.
+                .hover(|el| el.bg(card))
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(AgentSlotEvent::OpenReview(Some(path.clone())))))
                 .child(div().w_3().text_xs().font_family(mono.clone()).text_color(color).child(file.kind.letter()))
                 .child(
@@ -414,10 +397,8 @@ impl AgentSlot {
         });
         Some(
             v_flex()
-                .flex_none()
+                .id("changes")
                 .max_h(relative(0.4))
-                .border_t_1()
-                .border_color(border)
                 .child(
                     h_flex()
                         .px_3()
@@ -441,8 +422,7 @@ impl AgentSlot {
                                 .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentSlotEvent::OpenReview(None)))),
                         ),
                 )
-                .child(div().id("changes-list").pb_1().overflow_y_scroll().children(rows))
-                .into_any_element(),
+                .child(div().id("changes-list").pb_1().overflow_y_scroll().children(rows)),
         )
     }
 }
@@ -458,61 +438,18 @@ fn compact(n: u64) -> String {
 
 impl Render for AgentSlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let this = cx.entity();
-        // Measure the tab, so the status column can fold away when it gets narrow.
-        let measure = canvas(
-            move |bounds, _, cx| {
-                let width = bounds.size.width;
-                if (this.read(cx).width - width).abs() > px(0.5) {
-                    cx.defer(move |cx| {
-                        this.update(cx, |slot, cx| {
-                            slot.width = width;
-                            cx.notify();
-                        })
-                    });
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_full();
-
         let Some(view) = self.thread().cloned() else {
             let muted = cx.theme().muted_foreground;
             return div()
-                .relative()
                 .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
                 .text_sm()
                 .text_color(muted)
-                .child("Pick a thread in the sidebar.")
-                .child(measure);
+                .child("Pick a thread in the sidebar.");
         };
-        let status = self.status_shown(cx).then(|| {
-            let border = cx.theme().border;
-            // Summary and tasks take the space; changed files sit above the agent's numbers,
-            // which are pinned to the bottom.
-            v_flex()
-                .id("status")
-                .test_support()
-                .w(px(STATUS_WIDTH))
-                .flex_none()
-                .h_full()
-                .border_l_1()
-                .border_color(border)
-                .child(v_flex().flex_1().min_h_0().children(self.overview(&view, cx)))
-                .children(self.changes_list(&view, cx))
-                .children(self.metrics(&view, cx))
-        });
-        div()
-            .relative()
-            .size_full()
-            .flex()
-            .child(div().flex_1().min_w_0().h_full().child(view))
-            .children(status)
-            .child(measure)
+        div().size_full().child(view)
     }
 }
 

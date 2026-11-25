@@ -26,6 +26,9 @@ use crate::thread::{
 use gpui_kit::assets::IconName;
 
 const SIDEBAR_WIDTH: f32 = 264.0;
+/// The status column folds away when it would leave the content narrower than this, unless it
+/// was shown by hand.
+const STATUS_FOLD_WIDTH: f32 = 640.0;
 const HEADER_HEIGHT: f32 = 46.0;
 
 // The top bar's floating things sit in its middle.
@@ -78,6 +81,8 @@ pub struct Workspace {
     reviews: HashMap<String, Entity<ReviewView>>,
     /// The thread the header follows (the one last shown or focused).
     active: Option<String>,
+    /// The status column shown or hidden by hand; `None` follows the window's width.
+    status_choice: Option<bool>,
     shell: Option<alacritty_terminal::tty::Shell>,
     model: Option<String>,
     scripted: Option<Vec<(Duration, AgentEvent)>>,
@@ -116,6 +121,8 @@ impl Workspace {
             problem = Some(format!("Could not read saved projects: {err:#}").into());
             State::default()
         });
+        // The last usage and context windows heard, so the status column has numbers at once.
+        crate::usage::Usage::load(cx, paths.usage_file());
 
         let mut this = Self {
             paths,
@@ -127,6 +134,7 @@ impl Workspace {
             agents: HashMap::new(),
             reviews: HashMap::new(),
             active: None,
+            status_choice: None,
             shell: launch.shell,
             model: launch.model,
             scripted: launch.scripted,
@@ -209,6 +217,24 @@ impl Workspace {
 
     fn active_project(&self) -> Option<&store::Project> {
         self.active.as_ref().and_then(|id| self.state.thread(id)).map(|(project, _)| project)
+    }
+
+    /// The active project's agent, which builds the status column.
+    fn active_agent(&self) -> Option<Entity<AgentSlot>> {
+        self.active_project().and_then(|p| self.agents.get(&p.id)).cloned()
+    }
+
+    /// Whether the status column has something to show for the active thread.
+    fn has_status(&self, cx: &App) -> bool {
+        self.active_agent().is_some_and(|a| a.read(cx).has_status())
+    }
+
+    /// Whether the status column is on screen: by hand, else while the content keeps
+    /// [`STATUS_FOLD_WIDTH`] beside it.
+    fn status_shown(&self, window: &Window, cx: &App) -> bool {
+        let sidebar = if self.state.sidebar_collapsed { 0. } else { SIDEBAR_WIDTH };
+        let room = window.viewport_size().width - px(sidebar + crate::agent_slot::STATUS_WIDTH);
+        self.has_status(cx) && self.status_choice.unwrap_or(room >= px(STATUS_FOLD_WIDTH))
     }
 
     // ---------- threads ----------
@@ -1165,6 +1191,10 @@ impl Workspace {
         let waiting = theme.primary;
         let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
         let sidebar_bg = theme.sidebar.opacity(alpha);
+        // The selected thread is a card like the status column's sections, see-through with the
+        // sidebar; a hovered row is a fainter one.
+        let card_alpha = cx.try_global::<Settings>().map(Settings::card_alpha).unwrap_or(0.5);
+        let (selected_bg, hover_bg) = (accent_bg.opacity(card_alpha), accent_bg.opacity(card_alpha * 0.6));
         let active = self.active.clone();
 
         let workspace = cx.entity();
@@ -1213,8 +1243,7 @@ impl Workspace {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .when(selected, |el| el.bg(accent_bg))
-                .hover(|el| el.bg(accent_bg.opacity(0.6)))
+                .map(|el| if selected { el.bg(selected_bg) } else { el.hover(|el| el.bg(hover_bg)) })
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     // A double click renames, as in a file manager.
                     if event.click_count() >= 2 {
@@ -1341,7 +1370,7 @@ impl Workspace {
                                 .text_xs()
                                 .text_color(muted)
                                 .cursor_pointer()
-                                .hover(|el| el.bg(accent_bg.opacity(0.6)))
+                                .hover(|el| el.bg(hover_bg))
                                 .child(gpui_kit::component::Icon::new(IconName::Clock).xsmall())
                                 .child(div().flex_1().child("History"))
                                 .child(format!("{history} more"))
@@ -1418,7 +1447,7 @@ impl Workspace {
     }
 
     /// The top bar: `[badge] Project / Thread title`, like T3 Code, then the pane actions.
-    fn content_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn content_header(&self, status_shown: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (waiting, muted, fg) = (theme.warning, theme.muted_foreground, theme.foreground);
         let (tab, tab_fg, shown) = (theme.tab, theme.tab_foreground, theme.tab_active);
@@ -1447,7 +1476,6 @@ impl Workspace {
         // One pane: its tabs are the top bar's. Split: each pane keeps its strip and the bar
         // names the project and thread.
         let tabs = panes.as_ref().and_then(|panes| panes.read(cx).header_tabs(panes.clone(), avatar(16.), cx));
-        let agent = self.active_project().and_then(|p| self.agents.get(&p.id)).cloned();
 
         // Every action is its own round chip.
         let chip = |id: &'static str, icon: IconName, tip: SharedString| {
@@ -1470,14 +1498,17 @@ impl Workspace {
                 .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
                 .child(Icon::new(icon).small())
         };
-        let status_toggle = agent.filter(|a| a.read(cx).has_status(cx)).map(|agent| {
-            let shown = agent.read(cx).status_shown(cx);
+        let status_toggle = self.has_status(cx).then(|| {
+            let shown = status_shown;
             chip(
                 "header-status",
                 if shown { IconName::PanelRightClose } else { IconName::PanelRightOpen },
                 if shown { "Hide the thread's status" } else { "Show the thread's status" }.into(),
             )
-            .on_click(move |_, _, cx| agent.update(cx, |a, cx| a.toggle_status(cx)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.status_choice = Some(!shown);
+                cx.notify();
+            }))
         });
         let with_panes = |f: fn(&mut Panes, &mut Window, &mut Context<Panes>)| {
             cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
@@ -1698,6 +1729,16 @@ impl Render for Workspace {
         // content below is the theme's own background.
         let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
         let frame = theme.sidebar.opacity(alpha);
+        let card_alpha = cx.try_global::<Settings>().map(Settings::card_alpha).unwrap_or(0.5);
+        let card = theme.sidebar_accent.opacity(card_alpha);
+
+        // The thread's status sits in the frame at the right, under the top bar, mirroring the
+        // sidebar on the left, for whichever pane is focused.
+        let status_shown = self.status_shown(window, cx);
+        let status = self
+            .active_agent()
+            .filter(|_| status_shown)
+            .and_then(|agent| agent.update(cx, |a, cx| a.status_column(card, cx)));
 
         // The window itself is transparent: only the content under the top bar paints an
         // opaque background, so the sidebar and the frame can be see-through.
@@ -1714,20 +1755,27 @@ impl Render for Workspace {
             .text_color(fg)
             .children(sidebar)
             .child(
-                v_flex().flex_1().min_w_0().h_full().bg(frame).child(self.content_header(cx)).child(
-                    v_flex()
+                v_flex().flex_1().min_w_0().h_full().bg(frame).child(self.content_header(status_shown, cx)).child(
+                    h_flex()
                         .flex_1()
                         .min_h_0()
                         .min_w_0()
-                        // Rounded at the top like a browser's page, so it sits in the frame. The
-                        // views in it round their own backgrounds to match.
-                        .rounded_t(px(crate::panes::CONTENT_RADIUS))
-                        .overflow_hidden()
-                        .bg(bg)
-                        .when_some(self.problem.clone(), |el, problem| {
-                            el.child(div().px_4().py_2().text_sm().text_color(danger).child(problem))
-                        })
-                        .child(div().flex_1().min_h_0().min_w_0().children(panes)),
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .h_full()
+                                .min_w_0()
+                                // Rounded at the top like a browser's page, so it sits in the
+                                // frame. The views in it round their own backgrounds to match.
+                                .rounded_t(px(crate::panes::CONTENT_RADIUS))
+                                .overflow_hidden()
+                                .bg(bg)
+                                .when_some(self.problem.clone(), |el, problem| {
+                                    el.child(div().px_4().py_2().text_sm().text_color(danger).child(problem))
+                                })
+                                .child(div().flex_1().min_h_0().min_w_0().children(panes)),
+                        )
+                        .children(status),
                 ),
             )
     }
@@ -1940,7 +1988,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_status_column_sits_in_the_agent_tab_and_folds_when_narrow(cx: &mut TestAppContext) {
+    fn the_status_column_sits_in_the_frame_and_folds_when_the_window_is_narrow(cx: &mut TestAppContext) {
         let (window, workspace, _, _) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
@@ -1962,13 +2010,10 @@ mod tests {
             })
         };
         settle(cx);
-        assert!(status_showing(cx), "a wide agent tab shows the status column");
+        assert!(status_showing(cx), "a wide window shows the status column");
 
-        // Split twice: the agent tab gets narrow and the column folds away.
-        cx.update(|window, cx| {
-            window.click(SharedString::from("header-split-right"), cx);
-            window.render_frame(cx);
-        });
+        // A narrow window folds it away.
+        cx.simulate_resize(size(px(1000.), px(900.)));
         settle(cx);
         assert!(!status_showing(cx), "folded when narrow");
 
@@ -1979,6 +2024,17 @@ mod tests {
         cx.update(|window, cx| window.click(SharedString::from("header-status"), cx));
         settle(cx);
         assert!(!status_showing(cx), "and hidden again");
+
+        // It belongs to the window, not the agent tab: in a wide window a split leaves it shown.
+        cx.update(|window, cx| window.click(SharedString::from("header-status"), cx));
+        cx.simulate_resize(size(px(1400.), px(900.)));
+        settle(cx);
+        cx.update(|window, cx| {
+            window.click(SharedString::from("header-split-right"), cx);
+            window.render_frame(cx);
+        });
+        settle(cx);
+        assert!(status_showing(cx), "still shown beside a split");
     }
 
     #[gpui_kit::test]
@@ -2166,14 +2222,7 @@ mod tests {
         }
         assert_eq!(changes.read_with(cx, |c, _| c.changes.files[0].path.clone()), "notes.md");
 
-        // While the thread is on its intro, the overview pane (and its file list) stays hidden.
-        cx.update(|window, cx| {
-            window.render_frame(cx);
-            assert!(window.try_find(SharedString::from("change-0")).is_none());
-        });
-        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
-        thread.update(cx, |t, cx| t.handle(crate::agent::AgentEvent::TextDelta("Started.".into()), cx));
-
+        // The status column (and its file list) shows even while the thread is on its intro.
         cx.update(|window, cx| {
             window.render_frame(cx);
             window.click(SharedString::from("change-0"), cx);

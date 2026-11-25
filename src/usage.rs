@@ -2,17 +2,25 @@
 //! windows (and extra-usage spend), or a team or enterprise seat's spending limit. Whichever
 //! thread hears from `claude` last updates its account, and the status column shows the
 //! account of the thread on show.
+//!
+//! What was last heard is saved (`usage.json`, beside the state file) with the context window
+//! each model reported, so a restarted TJ shows numbers before any thread has run. A window that
+//! has reset since is shown empty.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use gpui_kit::{App, Global};
+use serde::{Deserialize, Serialize};
 
 use crate::agent::UsageWindow;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountUsage {
+    #[serde(default)]
     /// The plan, such as `max`, `pro`, `team` or `enterprise`.
     pub plan: Option<String>,
+    #[serde(default)]
     pub windows: Vec<UsageWindow>,
 }
 
@@ -44,19 +52,81 @@ impl AccountUsage {
     }
 }
 
-/// Usage by account id.
+/// What's kept in `usage.json`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Saved {
+    /// Usage by account id.
+    #[serde(default)]
+    pub accounts: HashMap<String, AccountUsage>,
+    /// The context window each model last reported, by its short name ("Opus 5.5"), so a
+    /// thread that hasn't started yet can show the room it will have.
+    #[serde(default)]
+    pub context_windows: HashMap<String, u64>,
+}
+
+/// Every account's usage and every model's context window, saved as they change.
 #[derive(Default)]
-pub struct Usage(pub HashMap<String, AccountUsage>);
+pub struct Usage {
+    saved: Saved,
+    /// Where it's saved; nothing is saved when `None`.
+    file: Option<PathBuf>,
+}
 
 impl Global for Usage {}
 
 impl Usage {
+    /// Read what was saved in `file` and keep saving there. A missing or unreadable file
+    /// starts empty.
+    pub fn load(cx: &mut App, file: PathBuf) {
+        let saved = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|text| {
+                serde_json::from_str(&text).inspect_err(|err| eprintln!("tj: ignoring {}: {err}", file.display())).ok()
+            })
+            .unwrap_or_default();
+        cx.set_global(Usage { saved, file: Some(file) });
+    }
+
     pub fn get<'a>(cx: &'a App, account: &str) -> Option<&'a AccountUsage> {
-        cx.try_global::<Usage>()?.0.get(account)
+        cx.try_global::<Usage>()?.saved.accounts.get(account)
     }
 
     pub fn update(cx: &mut App, account: &str, f: impl FnOnce(&mut AccountUsage)) {
-        f(cx.default_global::<Usage>().0.entry(account.to_string()).or_default());
+        let usage = cx.default_global::<Usage>();
+        let entry = usage.saved.accounts.entry(account.to_string()).or_default();
+        let before = entry.clone();
+        f(entry);
+        if *entry != before {
+            usage.save();
+        }
+    }
+
+    pub fn context_window(cx: &App, model: &str) -> Option<u64> {
+        cx.try_global::<Usage>()?.saved.context_windows.get(model).copied()
+    }
+
+    pub fn set_context_window(cx: &mut App, model: String, window: u64) {
+        let usage = cx.default_global::<Usage>();
+        if usage.saved.context_windows.insert(model, window) != Some(window) {
+            usage.save();
+        }
+    }
+
+    /// Write atomically, like the state file; a failure only costs the numbers after a restart.
+    fn save(&self) {
+        let Some(file) = &self.file else { return };
+        let result = (|| -> anyhow::Result<()> {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = file.with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(&self.saved)?)?;
+            std::fs::rename(&tmp, file)?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            eprintln!("tj: couldn't save {}: {err:#}", file.display());
+        }
     }
 }
 
@@ -138,6 +208,34 @@ mod tests {
 
     fn window(id: &str, utilization: f64) -> UsageWindow {
         UsageWindow { id: id.into(), utilization, ..Default::default() }
+    }
+
+    #[gpui_kit::test]
+    fn usage_and_context_windows_survive_a_restart(cx: &mut gpui_kit::TestAppContext) {
+        let file = std::env::temp_dir().join(format!("tj-usage-{}", crate::store::new_id())).join("usage.json");
+        cx.update(|cx| {
+            Usage::load(cx, file.clone());
+            assert_eq!(Usage::get(cx, "personal"), None, "nothing saved yet");
+            Usage::update(cx, "personal", |u| {
+                u.plan = Some("max".into());
+                u.merge(vec![window("five_hour", 0.42)]);
+            });
+            Usage::set_context_window(cx, "Opus 5.5".into(), 1_000_000);
+        });
+        // A new app: what the last one heard comes back from the file.
+        let restarted = gpui_kit::TestAppContext::single();
+        restarted.update(|cx| {
+            Usage::load(cx, file.clone());
+            let personal = Usage::get(cx, "personal").unwrap();
+            assert_eq!(personal.plan.as_deref(), Some("max"));
+            assert_eq!(personal.windows[0].utilization, 0.42);
+            assert_eq!(Usage::context_window(cx, "Opus 5.5"), Some(1_000_000));
+        });
+        std::fs::write(&file, "not json").unwrap();
+        restarted.update(|cx| {
+            Usage::load(cx, file.clone());
+            assert_eq!(Usage::get(cx, "personal"), None, "an unreadable file starts empty");
+        });
     }
 
     #[test]
