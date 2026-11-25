@@ -984,7 +984,7 @@ fn tab_label(tab: &Tab, cx: &App) -> (String, Option<Hsla>) {
             let t = term.read(cx);
             (tab_title(t.title(), t.cwd()), None)
         }
-        Tab::Review(review) => (format!("Review · {}", review.read(cx).file_count(cx)), None),
+        Tab::Review(review) => (review.read(cx).title(cx), None),
     }
 }
 
