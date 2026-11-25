@@ -17,7 +17,7 @@ TJ should work entirely from the keyboard (ROADMAP.md, "Keyboard rules"). Still 
 
 - [ ] Approval cards: Approve, Approve for session, Decline, Cancel turn.
 - [ ] The plan card: Start, accepting edits / Start, asking first / Keep planning.
-- [x] Moving between projects (Ctrl+Alt+N/P), a new thread (Ctrl+Shift+N), and finding any project or thread (Ctrl+Space).
+- [x] Moving between projects (Ctrl+Alt+N/P), a new thread (Ctrl+Shift+O), and finding any project or thread (Ctrl+Space).
 - [ ] Moving through the threads in the sidebar itself, and opening a project's history.
 - [ ] The account, mode and model menus under the prompt box.
 - [ ] Thread and project right-click menus (rename, archive, delete, remove, project picture).

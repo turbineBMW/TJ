@@ -2382,7 +2382,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_sidebar_folds_away_from_the_top_bar_or_ctrl_alt_s_and_stays_so(cx: &mut TestAppContext) {
+    fn the_sidebar_folds_away_from_the_top_bar_or_ctrl_shift_s_and_stays_so(cx: &mut TestAppContext) {
         let (window, workspace, paths, _) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         let collapsed = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.state.sidebar_collapsed);
@@ -2393,9 +2393,9 @@ mod tests {
         });
         assert!(collapsed(cx), "the top bar's button hides it");
         assert!(State::load(&paths).unwrap().sidebar_collapsed, "and that's saved");
-        cx.simulate_keystrokes("ctrl-alt-s");
-        assert!(!collapsed(cx), "Ctrl+Alt+S brings it back");
-        cx.simulate_keystrokes("ctrl-alt-s");
+        cx.simulate_keystrokes("ctrl-shift-s");
+        assert!(!collapsed(cx), "Ctrl+Shift+S brings it back");
+        cx.simulate_keystrokes("ctrl-shift-s");
         assert!(collapsed(cx), "and hides it again");
     }
 
@@ -2493,7 +2493,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn ctrl_alt_n_and_p_move_between_projects_and_ctrl_shift_n_starts_a_thread(cx: &mut TestAppContext) {
+    fn ctrl_alt_n_and_p_move_between_projects_and_ctrl_shift_o_starts_a_thread(cx: &mut TestAppContext) {
         let (window, workspace, _, _) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         let (first, second) = two_projects(&workspace, cx);
@@ -2514,7 +2514,7 @@ mod tests {
             "coming back shows the thread it was left on"
         );
 
-        cx.simulate_keystrokes("ctrl-shift-n");
+        cx.simulate_keystrokes("ctrl-shift-o");
         let (active, threads) = workspace
             .read_with(cx, |w, _| (w.active.clone().unwrap(), w.state.project(&second).unwrap().threads.len()));
         assert_ne!(active, second_thread, "a new thread is shown");
