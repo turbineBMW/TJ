@@ -22,6 +22,7 @@ mod store;
 mod terminal;
 mod thread;
 mod tool_card;
+mod working;
 mod workspace;
 
 use std::path::PathBuf;

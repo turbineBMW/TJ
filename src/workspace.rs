@@ -28,6 +28,8 @@ use gpui_kit::assets::IconName;
 
 const SIDEBAR_WIDTH: f32 = 264.0;
 const HEADER_HEIGHT: f32 = 46.0;
+/// The agent mark at the end of a thread's row in the sidebar.
+const MARK_SIZE: f32 = 14.0;
 
 /// How the workspace starts.
 #[derive(Default)]
@@ -1025,12 +1027,15 @@ impl Workspace {
 
     // ---------- rendering ----------
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = self.settings_popover(cx);
+        // A working thread's agent mark breathes instead of showing a dot.
+        let working = self.threads.values().any(|t| t.read(cx).status == Status::Running);
+        let breath = if working { crate::working::breath(crate::working::tick(window, cx)) } else { 1.0 };
         let theme = cx.theme();
         let (muted, accent_bg, fg) =
             (theme.sidebar_foreground.opacity(0.6), theme.sidebar_accent, theme.sidebar_foreground);
-        let (running, waiting) = (theme.warning, theme.primary);
+        let waiting = theme.primary;
         let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
         let (sidebar_bg, sidebar_border) = (theme.sidebar.opacity(alpha), theme.sidebar_border);
         let active = self.active.clone();
@@ -1040,11 +1045,8 @@ impl Workspace {
         let thread_row = |meta: &store::ThreadMeta, cx: &mut Context<Self>| {
             let id = meta.id.clone();
             let status = self.threads.get(&meta.id).map(|t| t.read(cx).status).unwrap_or(Status::Idle);
-            let dot = match status {
-                Status::Idle => None,
-                Status::Running => Some(running),
-                Status::AwaitingApproval => Some(waiting),
-            };
+            let dot = (status == Status::AwaitingApproval).then_some(waiting);
+            let mark = MARK_SIZE * if status == Status::Running { breath } else { 1.0 };
             let selected = active.as_deref() == Some(meta.id.as_str());
             let editing = renaming.as_ref().filter(|(r, _)| *r == meta.id).map(|(_, input)| input.clone());
             let label = div()
@@ -1113,7 +1115,10 @@ impl Workspace {
                     div()
                         .id(SharedString::from(format!("thread-agent-{}", meta.id)))
                         .flex_none()
-                        .size(px(14.))
+                        .size(px(MARK_SIZE))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .when(meta.archived, |el| el.opacity(0.6))
                         .tooltip({
                             let label = meta.agent.label();
@@ -1121,7 +1126,8 @@ impl Workspace {
                         })
                         .child(
                             img(crate::agent_icon::icon(meta.agent, if meta.archived { muted } else { fg }))
-                                .size_full()
+                                .size(px(mark))
+                                .flex_none()
                                 .object_fit(ObjectFit::Contain),
                         ),
                 )
@@ -1264,11 +1270,12 @@ impl Workspace {
     /// The top bar: `[badge] Project / Thread title`, like T3 Code, then the pane actions.
     fn content_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, warning, muted, fg) = (theme.border, theme.warning, theme.muted_foreground, theme.foreground);
+        let (border, waiting, muted, fg) = (theme.border, theme.warning, theme.muted_foreground, theme.foreground);
         let thread = self.active_thread().map(|t| t.read(cx));
         let title = thread.and_then(|t| t.title.clone()).unwrap_or_else(|| "New thread".into());
+        // Work in progress shows in the sidebar and the composer; only a question for the user
+        // shows up here.
         let status = match thread.map(|t| t.status) {
-            Some(Status::Running) => "Working…",
             Some(Status::AwaitingApproval) => "Waiting for you",
             _ => "",
         };
@@ -1328,7 +1335,7 @@ impl Workspace {
                     .child(title),
             )
             .child(drag_area())
-            .child(div().text_sm().text_color(warning).child(status))
+            .child(div().text_sm().text_color(waiting).child(status))
             .when(has_panes, |el| {
                 el.child(
                     pane_button("header-new-terminal", IconName::SquareTerminal, "New terminal tab (Ctrl+Shift+T)")
@@ -1468,7 +1475,7 @@ impl Render for Workspace {
 
         // The window itself is transparent: only the content area paints an opaque background,
         // so the sidebar can be see-through.
-        crate::caret::watch(h_flex()).size_full().text_color(fg).child(self.sidebar(cx)).child(
+        crate::caret::watch(h_flex()).size_full().text_color(fg).child(self.sidebar(window, cx)).child(
             v_flex()
                 .flex_1()
                 .min_w_0()
