@@ -74,6 +74,8 @@ pub struct MenuContext {
     /// The project folder for display (`~/Projects/TJ`), and its git branch.
     pub project_dir: String,
     pub branch: Option<String>,
+    /// The slash commands `claude` offers in this project on the thread's account.
+    pub commands: Vec<crate::agent::SlashCommand>,
 }
 
 /// The model menu's width; descriptions wrap inside it.
@@ -228,6 +230,17 @@ struct MentionPicker {
     selected: usize,
 }
 
+/// The `/command` picker, open while the prompt's first word is a slash and a name.
+struct CommandPicker {
+    matches: Vec<crate::agent::SlashCommand>,
+    selected: usize,
+    /// What's typed after the slash.
+    query: String,
+}
+
+/// How many commands the picker shows at once (it scrolls through the rest).
+const COMMANDS_SHOWN: usize = 50;
+
 pub struct ThreadView {
     pub title: Option<String>,
     /// The user named the thread, so the overview's title doesn't replace it.
@@ -278,6 +291,10 @@ pub struct ThreadView {
     /// Tool calls the next message asks about.
     quotes: Vec<Quote>,
     mention: Option<MentionPicker>,
+    command_picker: Option<CommandPicker>,
+    command_scroll: ScrollHandle,
+    /// The slash commands the running session said it accepts; until it has, the workspace's list.
+    session_commands: Vec<crate::agent::SlashCommand>,
     /// The project's files, for the picker; listed again each time a mention starts.
     project_files: Option<Arc<Vec<String>>>,
     listing_files: bool,
@@ -326,7 +343,10 @@ impl ThreadView {
         cx.subscribe_in(&prompt, window, |this, _, event: &InputEvent, window, cx| match event {
             // Shift+Enter has already inserted a newline; only a plain or Ctrl+Enter sends.
             InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
-            InputEvent::Change => this.update_mention(cx),
+            InputEvent::Change => {
+                this.update_mention(cx);
+                this.update_command_picker(cx);
+            }
             _ => {}
         })
         .detach();
@@ -366,6 +386,9 @@ impl ThreadView {
             attachments: Vec::new(),
             quotes: Vec::new(),
             mention: None,
+            command_picker: None,
+            command_scroll: ScrollHandle::new(),
+            session_commands: Vec::new(),
             project_files: None,
             listing_files: false,
             backend: Some(backend),
@@ -664,6 +687,7 @@ impl ThreadView {
         let text = parts.join("\n\n");
         let attachments = std::mem::take(&mut self.attachments);
         self.mention = None;
+        self.command_picker = None;
         self.prompt.update(cx, |p, cx| p.set_value("", window, cx));
         self.send_with(&text, attachments, cx);
     }
@@ -779,6 +803,74 @@ impl ThreadView {
         }
         let len = picker.matches.len() as isize;
         picker.selected = (picker.selected as isize + by).rem_euclid(len) as usize;
+        cx.notify();
+        true
+    }
+
+    // ---------- slash commands ----------
+
+    /// The commands this thread can run: the live session's, else the workspace's list.
+    fn commands(&self) -> &[crate::agent::SlashCommand] {
+        if self.session_commands.is_empty() { &self.menus.commands } else { &self.session_commands }
+    }
+
+    /// Open, update or close the `/command` picker after the prompt text changed.
+    fn update_command_picker(&mut self, cx: &mut Context<Self>) {
+        let query = {
+            let prompt = self.prompt.read(cx);
+            crate::composer::command_query(&prompt.value(), prompt.cursor()).map(|(_, query)| query)
+        };
+        let Some(query) = query else {
+            if self.command_picker.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        // Typing re-ranks the list, so the highlight goes back to the best match.
+        let matches = crate::composer::rank_commands(self.commands(), &query, COMMANDS_SHOWN);
+        self.command_picker = Some(CommandPicker { matches, selected: 0, query });
+        cx.notify();
+    }
+
+    fn move_command(&mut self, by: isize, cx: &mut Context<Self>) -> bool {
+        let Some(picker) = &mut self.command_picker else { return false };
+        if picker.matches.is_empty() {
+            return false;
+        }
+        let len = picker.matches.len() as isize;
+        picker.selected = (picker.selected as isize + by).rem_euclid(len) as usize;
+        cx.notify();
+        true
+    }
+
+    /// Put the picked command in place of the first word, then a space for its arguments.
+    /// False when there was nothing to pick, or (with `send_if_typed`, for Enter) when the
+    /// command is already typed out in full, so Enter sends it.
+    fn accept_command(&mut self, send_if_typed: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(picker) = &self.command_picker else { return false };
+        let Some(command) = picker.matches.get(picker.selected).cloned() else { return false };
+        if send_if_typed && picker.query.eq_ignore_ascii_case(&command.name) {
+            self.command_picker = None;
+            return false;
+        }
+        let range = {
+            let prompt = self.prompt.read(cx);
+            crate::composer::command_query(&prompt.value(), prompt.cursor()).map(|(range, _)| range)
+        };
+        let Some(range) = range else {
+            self.command_picker = None;
+            return false;
+        };
+        let name = format!("/{}", command.name);
+        self.prompt.update(cx, |prompt, cx| {
+            // Replacing just the word keeps the rest, mentions included, and the undo history.
+            let spaced = prompt.value()[range.end..].starts_with(char::is_whitespace);
+            prompt.set_selected_range(range, cx);
+            prompt.replace(if spaced { name.clone() } else { format!("{name} ") }, window, cx);
+            let after = name.len() + 1;
+            prompt.set_selected_range(after..after, cx);
+        });
+        self.command_picker = None;
         cx.notify();
         true
     }
@@ -1020,28 +1112,31 @@ impl ThreadView {
         v_flex()
             .relative()
             .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                if this.move_mention(-1, cx) {
+                if this.move_mention(-1, cx) || this.move_command(-1, cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                if this.move_mention(1, cx) {
+                if this.move_mention(1, cx) || this.move_command(1, cx) {
                     cx.stop_propagation();
                 }
             }))
+            // Enter picks the highlighted mention or command; a command already typed in full
+            // is sent instead.
             .capture_action(cx.listener(|this, enter: &Enter, window, cx| {
-                if !enter.shift && this.accept_mention(window, cx) {
+                if !enter.shift && (this.accept_mention(window, cx) || this.accept_command(true, window, cx)) {
                     cx.stop_propagation();
                 }
             }))
-            // Tab picks a mention too; otherwise it stays in the prompt box (it never moves focus).
+            // Tab picks a mention or command too; otherwise it stays in the prompt box (it
+            // never moves focus).
             .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                if this.accept_mention(window, cx) {
+                if this.accept_mention(window, cx) || this.accept_command(false, window, cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &Escape, _, cx| {
-                if this.mention.take().is_some() {
+                if this.mention.take().is_some() || this.command_picker.take().is_some() {
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -1056,6 +1151,7 @@ impl ThreadView {
             }))
             .drag_over::<gpui_kit::ExternalPaths>(move |style, _, _, _| style.border_color(primary))
             .children(self.render_mention_picker(cx))
+            .children(self.render_command_picker(cx))
     }
 
     /// What goes with the next message, each with a remove button: the tool calls it asks
@@ -1183,6 +1279,71 @@ impl ThreadView {
                         this.accept_mention(window, cx);
                     }))
             }));
+        Some(gpui_kit::deferred(list).with_priority(1).into_any_element())
+    }
+
+    /// The `/command` picker, floating just above the composer: each command's name, what it
+    /// takes, and its description on one line.
+    fn render_command_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let picker = self.command_picker.as_ref()?;
+        let theme = cx.theme();
+        let (popover, border, muted, selected_bg) = (theme.popover, theme.border, theme.muted_foreground, theme.accent);
+        let mono = theme.mono_font_family.clone();
+        let empty = match self.commands().is_empty() {
+            true => Some("Claude hasn't listed its commands yet. They show once it has started."),
+            false if picker.matches.is_empty() => Some("No matching commands. Enter sends it as typed."),
+            false => None,
+        };
+        let list = v_flex()
+            .id("command-picker")
+            .absolute()
+            .bottom_full()
+            .left_0()
+            .right_0()
+            .mb_1()
+            .p_1()
+            .max_h(px(320.))
+            .overflow_y_scroll()
+            .track_scroll(&self.command_scroll)
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(popover)
+            .shadow_md()
+            .when_some(empty, |el, text| el.child(div().px_2().py_1().text_sm().text_color(muted).child(text)))
+            .children(picker.matches.iter().enumerate().map(|(ix, command)| {
+                h_flex()
+                    .id(("command", ix))
+                    .test_support()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(ix == picker.selected, |el| el.bg(selected_bg))
+                    .child(div().flex_shrink_0().font_family(mono.clone()).child(format!("/{}", command.name)))
+                    .when(!command.argument_hint.is_empty(), |el| {
+                        el.child(div().flex_shrink_0().text_xs().text_color(muted).child(command.argument_hint.clone()))
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(command.description.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(picker) = &mut this.command_picker {
+                            picker.selected = ix;
+                        }
+                        this.accept_command(false, window, cx);
+                    }))
+            }));
+        self.command_scroll.scroll_to_item(picker.selected);
         Some(gpui_kit::deferred(list).with_priority(1).into_any_element())
     }
 
@@ -1551,7 +1712,10 @@ impl ThreadView {
             self.status = Status::Running;
         }
         match event {
-            AgentEvent::Started { version, permission_mode } => {
+            AgentEvent::Started { version, permission_mode, commands } => {
+                if !commands.is_empty() {
+                    self.session_commands = commands;
+                }
                 if let Some(version) = version.filter(|v| !self.version_warned && claude::is_newer_than_tested(v)) {
                     self.version_warned = true;
                     self.notice(
@@ -1620,6 +1784,36 @@ impl ThreadView {
                     self.plain_current = None;
                     self.remeasure(ix, cx);
                 }
+            }
+            AgentEvent::CommandOutput { command, text } => {
+                self.current_text = None;
+                if !text.trim().is_empty() {
+                    self.push_text_row(false, &text, cx);
+                    self.plain.push(format!("(/{command} printed: {})", truncate(text.trim(), 600)));
+                    self.plain_current = None;
+                }
+            }
+            AgentEvent::ConversationReset => {
+                self.current_text = None;
+                self.context_tokens = None;
+                self.plain.push("(The user cleared Claude's context; it starts again from here.)".into());
+                self.plain_current = None;
+                self.notice(
+                    NoticeKind::Info,
+                    "Context cleared. Claude starts a new conversation from here; the messages above are only kept for you.",
+                    cx,
+                );
+            }
+            AgentEvent::Compacted { pre_tokens, manual } => {
+                self.current_text = None;
+                self.context_tokens = None;
+                let how = if manual {
+                    "Conversation compacted"
+                } else {
+                    "Context was full, so the conversation was compacted"
+                };
+                let from = pre_tokens.map(|t| format!(" (from {}k tokens)", t.div_ceil(1000))).unwrap_or_default();
+                self.notice(NoticeKind::Info, format!("{how}{from}. Claude carries on from a summary."), cx);
             }
             AgentEvent::TextStarted => {
                 self.current_text = Some(self.push_text_row(false, "", cx));
@@ -1784,7 +1978,8 @@ impl ThreadView {
                     self.notice(NoticeKind::Error, error.unwrap_or_else(|| "The turn failed.".into()), cx);
                 }
                 let mut parts = Vec::new();
-                if let Some(model) = &self.model {
+                // A local slash command's turn has no cost or time; a footer would only name the model.
+                if let Some(model) = self.model.as_ref().filter(|_| cost_usd.is_some() || duration_ms.is_some()) {
                     parts.push(short_model(model));
                 }
                 if let Some(cost) = cost_usd {
@@ -3574,6 +3769,104 @@ mod tests {
         cx.update(|window, cx| window.render_frame(cx));
         cx.simulate_keystrokes("enter");
         assert_eq!(prompt_text(&thread, cx), "@src/thread.rs ");
+    }
+
+    fn commands() -> Vec<crate::agent::SlashCommand> {
+        [
+            ("compact", "Summarize the conversation", "<instructions>"),
+            ("context", "Show context usage", ""),
+            ("clear", "Start over", ""),
+        ]
+        .map(|(name, description, hint)| crate::agent::SlashCommand {
+            name: name.into(),
+            description: description.into(),
+            argument_hint: hint.into(),
+        })
+        .to_vec()
+    }
+
+    #[gpui_kit::test]
+    fn a_slash_opens_the_command_picker_and_enter_picks_one(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, _| t.menus.commands = commands());
+        type_into_prompt(&thread, "/co", cx);
+        let names = thread.read_with(cx, |t, _| {
+            t.command_picker.as_ref().map(|p| p.matches.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+        });
+        assert_eq!(names, Some(vec!["compact".to_string(), "context".to_string()]));
+
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(prompt_text(&thread, cx), "/context ");
+        assert!(thread.read_with(cx, |t, _| t.command_picker.is_none()), "picking closes the picker");
+        assert!(!calls(&thread, cx).iter().any(|c| matches!(c, ScriptedCall::Prompt(_))), "Enter picked, not sent");
+
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("enter");
+        assert!(
+            calls(&thread, cx).contains(&ScriptedCall::Prompt("/context".into())),
+            "sent as typed, for Claude to run"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn enter_on_a_command_typed_in_full_sends_it(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, _| t.menus.commands = commands());
+        type_into_prompt(&thread, "/clear", cx);
+        assert!(thread.read_with(cx, |t, _| t.command_picker.is_some()));
+        cx.simulate_keystrokes("enter");
+        assert!(calls(&thread, cx).contains(&ScriptedCall::Prompt("/clear".into())));
+    }
+
+    #[gpui_kit::test]
+    fn the_command_picker_is_only_for_the_first_word(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, _| t.menus.commands = commands());
+        type_into_prompt(&thread, "/comp", cx);
+        cx.simulate_keystrokes("tab");
+        assert_eq!(prompt_text(&thread, cx), "/compact ");
+        type_into_prompt(&thread, "keep /co", cx);
+        assert!(thread.read_with(cx, |t, _| t.command_picker.is_none()), "arguments don't open it");
+
+        // The live session's own list wins over the one read ahead of time.
+        thread.update(cx, |t, cx| {
+            t.handle(
+                AgentEvent::Started {
+                    version: None,
+                    permission_mode: None,
+                    commands: vec![crate::agent::SlashCommand {
+                        name: "deploy".into(),
+                        description: String::new(),
+                        argument_hint: String::new(),
+                    }],
+                },
+                cx,
+            );
+            assert_eq!(t.commands().len(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_local_command_shows_what_it_printed_without_a_footer(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, cx| {
+            let before = t.rows.len();
+            t.handle(
+                AgentEvent::CommandOutput { command: "effort".into(), text: "Set effort level to high".into() },
+                cx,
+            );
+            t.handle(AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, error: None }, cx);
+            assert_eq!(t.rows.len(), before + 1, "one row, and no footer");
+            assert!(matches!(t.rows.last(), Some(Row::Assistant(_))));
+            t.handle(AgentEvent::ConversationReset, cx);
+            assert!(
+                matches!(t.rows.last(), Some(Row::Notice(super::NoticeKind::Info, text)) if text.contains("Context cleared"))
+            );
+        });
     }
 
     #[gpui_kit::test]

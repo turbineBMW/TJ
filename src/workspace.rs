@@ -94,6 +94,10 @@ pub struct Workspace {
     /// Per account: the models `claude` offers it (loaded once, in the background).
     models: HashMap<String, Vec<crate::agent::ModelChoice>>,
     models_loading: std::collections::HashSet<String>,
+    /// Per account and project folder: the slash commands `claude` accepts there (loaded once,
+    /// in the background; a project's own commands and skills are part of it).
+    commands: HashMap<(String, PathBuf), Vec<crate::agent::SlashCommand>>,
+    commands_loading: std::collections::HashSet<(String, PathBuf)>,
     no_summaries: bool,
     /// The thread whose title is being edited in the sidebar, and the editor.
     renaming: Option<(String, Entity<InputState>)>,
@@ -143,6 +147,8 @@ impl Workspace {
             changes: HashMap::new(),
             models: HashMap::new(),
             models_loading: Default::default(),
+            commands: Default::default(),
+            commands_loading: Default::default(),
             renaming: None,
             show_archived: Default::default(),
             found_icons: HashMap::new(),
@@ -249,6 +255,7 @@ impl Workspace {
         let (project, meta) = self.state.thread(thread_id)?;
         if !self.threads.contains_key(thread_id) {
             let account = self.accounts.resolve(meta.account.as_deref(), project.account.as_deref()).clone();
+            let project_path = project.path.clone();
             // A Claude session lives in its account's config directory; resume it only there.
             let session_id = meta.session_id.clone().filter(|_| meta.session_account.as_deref() == Some(&account.id));
             let mode = meta.mode.or(project.mode).unwrap_or_default();
@@ -310,6 +317,7 @@ impl Workspace {
                 },
             ));
             self.load_models(&account.id, cx);
+            self.load_commands(&account.id, &project_path, cx);
             self.threads.insert(thread_id.to_string(), thread);
             self.refresh_menus(cx);
         }
@@ -340,6 +348,34 @@ impl Workspace {
                     }
                     // The fallback list stays; the session itself still works.
                     Err(err) => eprintln!("tj: could not list models: {err:#}"),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Ask `claude` once, in the background, which slash commands a project offers on an account.
+    fn load_commands(&mut self, account_id: &str, project: &std::path::Path, cx: &mut Context<Self>) {
+        let key = (account_id.to_string(), project.to_path_buf());
+        if self.no_summaries || self.commands.contains_key(&key) || !self.commands_loading.insert(key.clone()) {
+            return;
+        }
+        let config_dir = self.accounts.get(account_id).and_then(|a| a.config_path(&self.home));
+        cx.spawn(async move |this, cx| {
+            let dir = key.1.clone();
+            let commands = cx
+                .background_executor()
+                .spawn(async move { crate::agent::claude::list_commands(config_dir.as_deref(), &dir) })
+                .await;
+            let _ = this.update(cx, |this: &mut Workspace, cx| {
+                this.commands_loading.remove(&key);
+                match commands {
+                    Ok(commands) => {
+                        this.commands.insert(key, commands);
+                        this.refresh_menus(cx);
+                    }
+                    // A running session lists them too, so the picker fills in after the first message.
+                    Err(err) => eprintln!("tj: could not list slash commands: {err:#}"),
                 }
             });
         })
@@ -384,6 +420,11 @@ impl Workspace {
                     .unwrap_or_else(crate::agent::ModelChoice::fallback),
                 project_model: project.model.clone(),
                 project_effort: project.effort.clone(),
+                commands: self
+                    .commands
+                    .get(&(thread.read(cx).account_id.clone(), project.path.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
             };
             thread.update(cx, |t, cx| {
                 t.menus = menus;
@@ -813,6 +854,9 @@ impl Workspace {
         let config_dir = account.config_path(&self.home);
         thread.update(cx, |t, cx| t.set_account(&account.id, &account.name, config_dir, cx));
         self.load_models(&account.id, cx);
+        if let Some(path) = self.active_project().map(|p| p.path.clone()) {
+            self.load_commands(&account.id, &path, cx);
+        }
         self.refresh_menus(cx);
     }
 

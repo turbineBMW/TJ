@@ -200,6 +200,9 @@ pub enum AgentEvent {
     Started {
         version: Option<String>,
         permission_mode: Option<PermissionMode>,
+        /// The slash commands this session accepts (built-ins, custom commands, skills).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        commands: Vec<SlashCommand>,
     },
     /// The session id and model are known. Arrives with every new conversation turn.
     SessionInfo {
@@ -211,6 +214,20 @@ pub enum AgentEvent {
     /// A new block of assistant text begins; following deltas belong to it.
     TextStarted,
     TextDelta(String),
+    /// What a slash command that runs inside Claude Code (`/context`, `/cost`, `/effort high`)
+    /// printed. It isn't streamed and no model wrote it.
+    CommandOutput {
+        command: String,
+        text: String,
+    },
+    /// `/clear` ran: the agent forgot the conversation and starts a new session.
+    ConversationReset,
+    /// The conversation was compacted into a summary (`/compact`, or automatically).
+    Compacted {
+        /// Tokens in the context before compacting.
+        pre_tokens: Option<u64>,
+        manual: bool,
+    },
     /// A tool call, with its complete input.
     ToolStarted {
         id: String,
@@ -285,6 +302,17 @@ pub enum AgentEvent {
         code: Option<i32>,
         stderr: String,
     },
+}
+
+/// A slash command the agent accepts, as `claude` lists it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    /// Without the slash: `compact`, `code-review`, `plugin:skill`.
+    pub name: String,
+    pub description: String,
+    /// What goes after the name (`[instructions]`); empty when it takes nothing.
+    #[serde(default)]
+    pub argument_hint: String,
 }
 
 /// A model the agent offers, as `claude` lists it.
