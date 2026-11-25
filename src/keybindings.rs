@@ -67,6 +67,7 @@ pub static COMMANDS: &[Command] = &[
     command!("previous_project", "Previous project", Projects, WS, ["ctrl-alt-p"], workspace::PreviousProject),
     command!("new_thread", "New thread in this project", Projects, WS, ["ctrl-shift-o"], workspace::NewThread),
     command!("find", "Find a project or thread", Projects, WS, ["ctrl-space"], workspace::OpenSwitcher),
+    command!("open_github", "Open the project's GitHub tab", Projects, WS, ["ctrl-shift-g"], workspace::OpenGitHub),
     command!("settings", "Open settings", Window, WS, ["ctrl-,"], workspace::OpenSettings),
     command!("toggle_sidebar", "Show or hide the sidebar", Window, WS, ["ctrl-shift-s"], workspace::ToggleSidebar),
     command!("new_tab", "New terminal tab", Panes, PANES, ["ctrl-shift-t"], panes::NewTab),

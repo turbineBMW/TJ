@@ -1,5 +1,6 @@
 //! The window: a full-height sidebar of projects and threads, and the project's panes, where
-//! the agent (the picked thread with its status column), terminals and the review are tabs.
+//! the agent (the picked thread with its status column), terminals, the review and the
+//! project's GitHub page are tabs.
 //! Laid out like a GNOME app: no title bar; the headers move it.
 
 use std::{collections::HashMap, path::PathBuf, time::Duration};
@@ -16,6 +17,7 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use crate::agent::{AgentEvent, claude::SessionOptions};
 use crate::agent_slot::{AgentSlot, AgentSlotEvent};
 use crate::changes::{ProjectChanges, ReviewView, Summarizer};
+use crate::github_view::{GitHubEvent, GitHubView};
 use crate::panes::{FLOAT_HEIGHT, FLOAT_INSET, PaneEvent, Panes, Start};
 use crate::settings::Settings;
 use crate::store::SplitDirection;
@@ -37,7 +39,10 @@ const _: () = assert!(HEADER_HEIGHT == FLOAT_HEIGHT + 2.0 * FLOAT_INSET);
 pub const CONTEXT: &str = "Workspace";
 
 // Window-wide commands. Their keys are in `keybindings::COMMANDS`, and settings can change them.
-gpui_kit::actions!(workspace, [ToggleSidebar, NextProject, PreviousProject, NewThread, OpenSwitcher, OpenSettings]);
+gpui_kit::actions!(
+    workspace,
+    [ToggleSidebar, NextProject, PreviousProject, NewThread, OpenSwitcher, OpenSettings, OpenGitHub]
+);
 /// The agent mark at the end of a thread's row in the sidebar.
 const MARK_SIZE: f32 = 14.0;
 /// An idle thread's Claude process (about 300 MB) is stopped after this long; the next
@@ -65,6 +70,8 @@ pub struct Launch {
     pub no_summaries: bool,
     /// Open the review of the project's changes at launch (test hook).
     pub review: bool,
+    /// Open the project's GitHub tab at launch (test hook).
+    pub github: bool,
 }
 
 pub struct Workspace {
@@ -79,6 +86,8 @@ pub struct Workspace {
     agents: HashMap<String, Entity<AgentSlot>>,
     /// Per project: the review of its changes, shown in a tab.
     reviews: HashMap<String, Entity<ReviewView>>,
+    /// Per project: its GitHub page, shown in a tab.
+    githubs: HashMap<String, Entity<GitHubView>>,
     /// The thread the header follows (the one last shown or focused).
     active: Option<String>,
     /// The status column shown or hidden by hand; `None` follows the window's width.
@@ -137,6 +146,7 @@ impl Workspace {
             panes: HashMap::new(),
             agents: HashMap::new(),
             reviews: HashMap::new(),
+            githubs: HashMap::new(),
             active: None,
             status_choice: None,
             shell: launch.shell,
@@ -192,6 +202,9 @@ impl Workspace {
         }
         if launch.review {
             this.open_review(None, window, cx);
+        }
+        if launch.github {
+            this.open_github(window, cx);
         }
         this.find_icons(cx);
         // Save each terminal's current directory when the window closes.
@@ -607,6 +620,7 @@ impl Workspace {
         self.panes.remove(project_id);
         self.agents.remove(project_id);
         self.reviews.remove(project_id);
+        self.githubs.remove(project_id);
         self.changes.remove(project_id);
         self.show_archived.remove(project_id);
         if let Some(gone) = self.active.take_if(|id| project.threads.iter().any(|t| &t.id == id)) {
@@ -1129,6 +1143,15 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Show the project's GitHub tab.
+    fn open_github(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self.active_project().map(|p| p.id.clone()) else { return };
+        if let Some(panes) = self.project_panes(&project_id, None, window, cx) {
+            panes.update(cx, |p, cx| p.show_github(window, cx));
+        }
+        cx.notify();
+    }
+
     /// A project's panes, restored from its saved layout on first use. `start` is the thread
     /// to show in the agent tab.
     fn project_panes(
@@ -1153,6 +1176,17 @@ impl Workspace {
             .entry(project.id.clone())
             .or_insert_with(|| cx.new(|cx| ReviewView::new(changes.clone(), no_summaries, cx)))
             .clone();
+        let github = cx.new(|cx| GitHubView::new(project.path.clone(), project.github_account.clone(), window, cx));
+        let github_project = project.id.clone();
+        self._subscriptions.push(cx.subscribe(&github, move |this, _, event: &GitHubEvent, _| match event {
+            GitHubEvent::AccountChosen(login) => {
+                if let Some(project) = this.state.project_mut(&github_project) {
+                    project.github_account = login.clone();
+                }
+                this.save();
+            }
+        }));
+        self.githubs.insert(project.id.clone(), github.clone());
         let agent = cx.new(|cx| AgentSlot::new(project.path.clone(), changes.clone(), cx));
         self._subscriptions.push(cx.subscribe_in(
             &agent,
@@ -1170,6 +1204,7 @@ impl Workspace {
                 project.layout.as_ref(),
                 agent,
                 review,
+                github,
                 Start { thread: start, terminal: false },
                 shell,
                 window,
@@ -1633,6 +1668,14 @@ impl Workspace {
             .when(has_panes, |el| {
                 el.child(
                     chip(
+                        "header-github",
+                        IconName::Github,
+                        crate::keybindings::tooltip("Pull requests and branches on GitHub", "open_github", cx).into(),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.open_github(window, cx))),
+                )
+                .child(
+                    chip(
                         "header-split-right",
                         IconName::Columns2,
                         crate::keybindings::tooltip("Split right", "split_right", cx).into(),
@@ -1794,6 +1837,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &PreviousProject, window, cx| this.step_project(-1, window, cx)))
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread_here(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSwitcher, window, cx| this.open_switcher(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenGitHub, window, cx| this.open_github(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .size_full()
             .text_color(fg)
@@ -2240,6 +2284,32 @@ mod tests {
         workspace.update_in(cx, |w, window, cx| w.remove_project(&project_id, window, cx));
         assert!(!copy.exists());
         assert!(chosen.exists(), "the original is never touched");
+    }
+
+    #[gpui_kit::test]
+    fn the_github_button_opens_the_projects_github_tab_and_remembers_its_account(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from("header-github"), cx);
+        });
+        let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
+        assert!(panes.read_with(cx, |p, _| p.github_is_showing()), "the GitHub page opens as a tab");
+        assert!(panes.read_with(cx, |p, cx| p.snapshot(cx)).is_some_and(|l| matches!(
+            l,
+            crate::store::PaneLayout::Pane { ref tabs, .. } if tabs.contains(&crate::store::TabState::GitHub)
+        )));
+        // Opening it again shows the same tab instead of another.
+        workspace.update_in(cx, |w, window, cx| w.open_github(window, cx));
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2]);
+
+        // An account picked in the tab is kept for the project.
+        let github = workspace.read_with(cx, |w, _| w.githubs.values().next().cloned().unwrap());
+        github.update(cx, |_, cx| cx.emit(crate::github_view::GitHubEvent::AccountChosen(Some("work-login".into()))));
+        assert_eq!(State::load(&paths).unwrap().projects[0].github_account.as_deref(), Some("work-login"));
+        github.update(cx, |_, cx| cx.emit(crate::github_view::GitHubEvent::AccountChosen(None)));
+        assert_eq!(State::load(&paths).unwrap().projects[0].github_account, None);
     }
 
     #[gpui_kit::test]
