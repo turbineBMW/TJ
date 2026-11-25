@@ -263,6 +263,8 @@ pub struct ProjectChanges {
     refresh_again: bool,
     /// While a review is open: who writes summaries, and the user's requests for context.
     auto_summarize: Option<(Summarizer, Vec<String>)>,
+    /// The one file the review shows (and summarizes), or `None` for all of them.
+    pub focus: Option<String>,
 }
 
 impl ProjectChanges {
@@ -278,6 +280,7 @@ impl ProjectChanges {
             refreshing: false,
             refresh_again: false,
             auto_summarize: None,
+            focus: None,
         };
         this.refresh(cx);
         this
@@ -285,6 +288,33 @@ impl ProjectChanges {
 
     pub fn summary(&self, file: &FileChange) -> Option<&str> {
         self.summaries.get(&file.fingerprint()).map(String::as_str)
+    }
+
+    /// The files the review shows: the focused one, or all of them.
+    pub fn shown(&self) -> impl Iterator<Item = &FileChange> {
+        self.changes.files.iter().filter(|f| self.focus.as_ref().is_none_or(|p| &f.path == p))
+    }
+
+    /// Show one file in the review (`None`: all of them). Only what's shown gets summarized.
+    pub fn set_focus(&mut self, focus: Option<String>, cx: &mut Context<Self>) {
+        self.focus = focus;
+        self.show_diff(cx);
+        if let Some((summarizer, requests)) = self.auto_summarize.clone() {
+            self.summarize_missing(summarizer, requests, cx);
+        }
+        cx.notify();
+    }
+
+    fn show_diff(&self, cx: &mut Context<Self>) {
+        let files: Vec<DiffFile> = self
+            .changes
+            .files
+            .iter()
+            .zip(&self.changes.diff_files)
+            .filter(|(f, _)| self.focus.as_ref().is_none_or(|p| &f.path == p))
+            .map(|(_, d)| d.clone())
+            .collect();
+        self.diff.update(cx, |diff, cx| diff.set_files(files, cx));
     }
 
     /// Re-read git in the background. Calls made while a refresh runs fold into one more.
@@ -302,8 +332,8 @@ impl ProjectChanges {
                 match result {
                     Ok(changes) => {
                         this.error = None;
-                        this.diff.update(cx, |diff, cx| diff.set_files(changes.diff_files.clone(), cx));
                         this.changes = changes;
+                        this.show_diff(cx);
                     }
                     Err(err) => this.error = Some(format!("{err:#}")),
                 }
@@ -326,11 +356,15 @@ impl ProjectChanges {
         }
     }
 
-    /// Write summaries for files that don't have one for their current version.
+    /// Shown files without a summary for their current version.
+    fn missing(&self) -> Vec<FileChange> {
+        self.shown().filter(|f| !self.summaries.contains_key(&f.fingerprint())).cloned().collect()
+    }
+
+    /// Write summaries for the shown files that don't have one for their current version.
     pub fn summarize_missing(&mut self, summarizer: Summarizer, requests: Vec<String>, cx: &mut Context<Self>) {
         let Summarizer::Claude { config_dir } = summarizer else { return };
-        let missing: Vec<FileChange> =
-            self.changes.files.iter().filter(|f| !self.summaries.contains_key(&f.fingerprint())).cloned().collect();
+        let missing = self.missing();
         if missing.is_empty() || self.summarizing {
             return;
         }
@@ -353,6 +387,13 @@ impl ProjectChanges {
                             if let Some(summary) = by_path.get(&file.path) {
                                 this.summaries.insert(file.fingerprint(), summary.clone());
                             }
+                        }
+                        // Files asked for while this ran (another file picked, say) are next.
+                        let sent: HashSet<u64> = missing.iter().map(FileChange::fingerprint).collect();
+                        if let Some((summarizer, requests)) = this.auto_summarize.clone()
+                            && this.missing().iter().any(|f| !sent.contains(&f.fingerprint()))
+                        {
+                            this.summarize_missing(summarizer, requests, cx);
                         }
                     }
                     Err(err) => this.error = Some(format!("Summaries failed: {err:#}")),
@@ -379,8 +420,13 @@ impl ReviewView {
         Self { changes, no_summaries, _observe: observe }
     }
 
-    pub fn file_count(&self, cx: &App) -> usize {
-        self.changes.read(cx).changes.files.len()
+    /// The tab's title: the file shown, or how many.
+    pub fn title(&self, cx: &App) -> String {
+        let model = self.changes.read(cx);
+        match &model.focus {
+            Some(path) => format!("Review · {}", path.rsplit('/').next().unwrap_or(path)),
+            None => format!("Review · {}", model.changes.files.len()),
+        }
     }
 }
 
@@ -399,26 +445,29 @@ impl Render for ReviewView {
         let (muted, border, danger, secondary, bg) =
             (theme.muted_foreground, theme.border, theme.danger, theme.secondary, theme.background);
         let summaries: HashMap<String, Option<String>> =
-            model.changes.files.iter().map(|f| (f.path.clone(), model.summary(f).map(str::to_owned))).collect();
+            model.shown().map(|f| (f.path.clone(), model.summary(f).map(str::to_owned))).collect();
         let summarizing = model.summarizing;
         let no_summaries = self.no_summaries;
         let mode = model.diff.read(cx).mode();
         let diff_state = model.diff.clone();
         let annotations: Vec<DiffAnnotation> = model
-            .changes
-            .files
-            .iter()
+            .shown()
             .enumerate()
             .map(|(ix, f)| DiffAnnotation::file(SharedString::from(format!("summary-{ix}")), f.path.clone()))
             .collect();
-        let heading = format!(
-            "{} files changed · +{} −{}",
-            model.changes.files.len(),
-            model.changes.additions(),
-            model.changes.deletions()
-        );
+        let shown: Vec<&FileChange> = model.shown().collect();
+        let (additions, deletions): (usize, usize) =
+            shown.iter().fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
+        let heading = match &model.focus {
+            Some(path) => format!("{path} · +{additions} −{deletions}"),
+            None => format!("{} files changed · +{additions} −{deletions}", shown.len()),
+        };
         let error = model.error.clone();
-        let empty = model.changes.files.is_empty();
+        let empty = shown.is_empty();
+        let empty_text = match &model.focus {
+            Some(path) => format!("{path} has no uncommitted changes."),
+            None => "No uncommitted changes.".into(),
+        };
 
         let diff = Diff::new(&diff_state).syntax_highlight(true).annotations(annotations).render_annotation(
             move |annotation, _window, _cx| {
@@ -459,7 +508,7 @@ impl Render for ReviewView {
             )
             .when_some(error, |el, error| el.child(div().px_3().py_1().text_sm().text_color(danger).child(error)))
             .child(if empty {
-                div().p_4().text_sm().text_color(muted).child("No uncommitted changes.").into_any_element()
+                div().p_4().text_sm().text_color(muted).child(empty_text).into_any_element()
             } else {
                 div().flex_1().min_h_0().child(diff).into_any_element()
             })

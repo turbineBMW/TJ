@@ -341,7 +341,8 @@ impl AgentSlot {
             .children(rows)
     }
 
-    /// The project's uncommitted changes; a dot marks files this thread edited.
+    /// The project's uncommitted changes; a dot marks files this thread edited. A file opens
+    /// the review of just that file; **View all** (with more than one) opens all of them.
     fn changes_list(&self, view: &Entity<ThreadView>, card: Hsla, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let touched = crate::changes::touched_relative(&self.project_dir, &view.read(cx).touched);
         let model = self.changes.read(cx);
@@ -400,29 +401,28 @@ impl AgentSlot {
                 .id("changes")
                 .max_h(relative(0.4))
                 .child(
-                    h_flex()
-                        .px_3()
-                        .py_1()
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(format!("Changes · {} files ·", model.changes.files.len()))
-                                .child(div().text_color(added).child(format!("+{}", model.changes.additions())))
-                                .child(div().text_color(deleted).child(format!("−{}", model.changes.deletions()))),
-                        )
-                        .child(div().flex_1())
-                        .child(
+                    h_flex().px_3().py_1().gap_2().child(
+                        h_flex()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("Changes · {} files ·", model.changes.files.len()))
+                            .child(div().text_color(added).child(format!("+{}", model.changes.additions())))
+                            .child(div().text_color(deleted).child(format!("−{}", model.changes.deletions()))),
+                    ),
+                )
+                .child(div().id("changes-list").pb_1().overflow_y_scroll().children(rows))
+                .when(model.changes.files.len() > 1, |el| {
+                    el.child(
+                        h_flex().px_3().pb_1().child(
                             Button::new("review-changes")
                                 .xsmall()
                                 .ghost()
-                                .label("Review")
+                                .label("View all")
                                 .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentSlotEvent::OpenReview(None)))),
                         ),
-                )
-                .child(div().id("changes-list").pb_1().overflow_y_scroll().children(rows)),
+                    )
+                }),
         )
     }
 }

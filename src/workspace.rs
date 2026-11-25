@@ -1057,10 +1057,12 @@ impl Workspace {
         )
     }
 
-    /// Show the review tab (scrolled to `path`, if given), with summaries being written.
+    /// Show the review tab with summaries being written: just `path`, if given, or every file.
     fn open_review(&mut self, path: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(changes) = self.project_changes(cx) else { return };
-        let Some(review) = self.project_review(cx) else { return };
+        if self.project_review(cx).is_none() {
+            return;
+        }
         let summarizer = if self.no_summaries {
             Summarizer::Off
         } else {
@@ -1071,13 +1073,11 @@ impl Workspace {
         };
         let requests = self.active_thread().map(|t| t.read(cx).recent_requests(3)).unwrap_or_default();
         changes.update(cx, |c, cx| {
+            // Focus first, so turning summaries on doesn't start on every file.
+            c.set_focus(path, cx);
             c.set_auto_summarize(Some((summarizer, requests)), cx);
             c.refresh(cx);
         });
-        if let Some(path) = &path {
-            let diff = review.read(cx).changes.read(cx).diff.clone();
-            diff.update(cx, |d, cx| d.scroll_to_file(path, cx));
-        }
         let Some(project_id) = self.active_project().map(|p| p.id.clone()) else { return };
         if let Some(panes) = self.project_panes(&project_id, None, window, cx) {
             panes.update(cx, |p, cx| p.show_review(window, cx));
@@ -2199,7 +2199,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_a_changed_file_opens_the_review_tab_and_closing_it_returns(cx: &mut TestAppContext) {
+    fn clicking_a_changed_file_opens_its_review_and_view_all_shows_every_file(cx: &mut TestAppContext) {
         let (window, workspace, _, project) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         let run = |args: &[&str]| {
@@ -2209,26 +2209,39 @@ mod tests {
         };
         run(&["init", "-q"]);
         std::fs::write(project.join("notes.md"), "a new file\n").unwrap();
+        std::fs::write(project.join("todo.md"), "another\n").unwrap();
 
         // Changes are read in the background; wait for them to arrive.
         let changes = workspace.update(cx, |w, cx| w.project_changes(cx).unwrap());
         cx.run_until_parked();
         for _ in 0..200 {
-            if changes.read_with(cx, |c, _| !c.changes.files.is_empty()) {
+            if changes.read_with(cx, |c, _| c.changes.files.len() == 2) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
             cx.run_until_parked();
         }
         assert_eq!(changes.read_with(cx, |c, _| c.changes.files[0].path.clone()), "notes.md");
+        let shown = |cx: &mut VisualTestContext| {
+            changes.read_with(cx, |c, cx| (c.focus.clone(), c.shown().count(), c.diff.read(cx).files().len()))
+        };
 
         // The status column (and its file list) shows even while the thread is on its intro.
+        // A file opens the review of just that file.
         cx.update(|window, cx| {
             window.render_frame(cx);
             window.click(SharedString::from("change-0"), cx);
         });
         let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
         assert!(panes.read_with(cx, |p, _| p.review_is_showing()), "the review opens as a tab");
+        assert_eq!(shown(cx), (Some("notes.md".into()), 1, 1));
+
+        // View all shows (and summarizes) every file.
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from("review-changes"), cx);
+        });
+        assert_eq!(shown(cx), (None, 2, 2));
 
         // Ctrl+Shift+W closes it like any tab, and the conversation shows again.
         cx.update(|window, cx| {
