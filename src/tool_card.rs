@@ -1,10 +1,11 @@
 //! How a tool call looks in the transcript. Each tool has an icon, and its family (shell,
 //! reading, editing, web, ...) gives it a colour from the theme's terminal palette, so cards
-//! follow the Omarchy theme. The header shows the tool, a one-line summary and a spinner, check
-//! or cross; the body is shaped for the tool (a little terminal for Bash, a diff for Edit) and
-//! scrolls once it reaches half the window.
+//! follow the Omarchy theme. The header shows the tool, a one-line summary, a button that adds
+//! the call to the prompt, and a spinner, check or cross; the body is shaped for the tool (a
+//! little terminal for Bash, a diff for Edit) and scrolls once it reaches half the window. A
+//! Bash card shows its first lines and how long the command took; the rest opens in a dialog.
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
@@ -172,34 +173,111 @@ pub struct Card<'a> {
     pub details: Option<AnyElement>,
     /// A Bash call's command and output, coloured.
     pub shell: Option<&'a ShellText>,
-    /// The body's scroll position; it also tells whether the body overflows.
+    /// How long the call took, once it's known.
+    pub took: Option<Duration>,
+    /// The body's scroll position.
     pub scroll: &'a ScrollHandle,
 }
+
+/// The most lines of command and output a Bash card shows; the rest opens in a dialog.
+pub const SHELL_LINES: usize = 30;
+/// Lines kept for the output when the command alone would fill the card.
+const SHELL_OUTPUT_LINES: usize = 10;
 
 /// A Bash call's command and what it printed, coloured once and kept with the row.
 #[derive(Clone)]
 pub struct ShellText {
     command: Highlighted,
     output: Option<Highlighted>,
+    /// What the card shows when the whole text is longer than `SHELL_LINES`.
+    short: Option<Short>,
     failed: bool,
+}
+
+/// The first lines of a long command and its output.
+#[derive(Clone)]
+struct Short {
+    command: Highlighted,
+    command_cut: bool,
+    output: Option<Highlighted>,
+    /// Lines left out.
+    hidden: usize,
 }
 
 impl ShellText {
     pub fn new(command: &str) -> Self {
-        ShellText { command: Highlighted::command(clean(command)), output: None, failed: false }
+        let mut shell =
+            ShellText { command: Highlighted::command(clean(command)), output: None, short: None, failed: false };
+        shell.shorten();
+        shell
     }
 
     pub fn finish(&mut self, output: &str, failed: bool) {
         let output = clean(output);
         self.output = (!output.trim().is_empty()).then(|| Highlighted::output(output));
         self.failed = failed;
+        self.shorten();
+    }
+
+    /// Lines the card leaves out; they're shown in the dialog.
+    pub fn hidden_lines(&self) -> usize {
+        self.short.as_ref().map_or(0, |short| short.hidden)
+    }
+
+    fn shorten(&mut self) {
+        let command = self.command.text.as_ref();
+        let output = self.output.as_ref().map(|o| o.text.as_ref()).unwrap_or_default();
+        let (c, o) = (command.lines().count(), output.lines().count());
+        let short = (c + o > SHELL_LINES).then(|| {
+            // A long script leaves room for the start of what it printed.
+            let keep_c = c.min(SHELL_LINES - o.min(SHELL_OUTPUT_LINES));
+            let keep_o = o.min(SHELL_LINES - keep_c);
+            Short {
+                command: Highlighted::command(first_lines(command, keep_c)),
+                command_cut: keep_c < c,
+                output: (keep_o > 0).then(|| Highlighted::output(first_lines(output, keep_o))),
+                hidden: c + o - keep_c - keep_o,
+            }
+        });
+        self.short = short;
     }
 }
 
-/// Whether a card's body is taller than the space it gets, going by its last layout.
-pub fn overflows(scroll: &ScrollHandle) -> bool {
-    scroll.max_offset().y > px(1.)
+fn first_lines(text: &str, count: usize) -> String {
+    text.lines().take(count).collect::<Vec<_>>().join("\n")
 }
+
+/// "Took 40ms", "Took 2.4s", "Took 1m 12s", "Took 1h 3m".
+pub fn took_label(took: Duration) -> String {
+    let secs = took.as_secs();
+    match secs {
+        0 if took.as_millis() < 100 => format!("Took {}ms", took.as_millis()),
+        0..60 => format!("Took {:.1}s", took.as_secs_f32()),
+        60..3600 => format!("Took {}m {}s", secs / 60, secs % 60),
+        _ => format!("Took {}h {}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
+/// What the prompt carries when a card is added to it: which call the user is asking about.
+/// Claude already has the call and its output, so the command is enough to point at it.
+pub fn quote(name: &str, input: &Value, summary: &str) -> String {
+    let what = match summary.trim() {
+        "" => format!("About your earlier {} call:", title(name)),
+        summary => format!("About your earlier {} call ({summary}):", title(name)),
+    };
+    match input.get("command").and_then(Value::as_str).filter(|_| name == "Bash") {
+        Some(command) => {
+            let command = clean(command);
+            let cut = command.lines().count() > QUOTE_LINES;
+            let shown = first_lines(&command, QUOTE_LINES);
+            format!("{what}\n```\n$ {shown}{}\n```", if cut { "\n…" } else { "" })
+        }
+        None => what,
+    }
+}
+
+/// The most lines of a command a quote repeats.
+const QUOTE_LINES: usize = 12;
 
 /// A picture a tool returned, with its size so small ones aren't blown up.
 pub struct Picture {
@@ -311,16 +389,26 @@ const OUTPUT_LIMIT: usize = 60_000;
 /// The most diff or file lines a card draws one by one.
 const LINE_LIMIT: usize = 600;
 
-pub fn render(
-    card: Card,
-    window: &Window,
-    cx: &App,
-    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    on_collapse: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    // A shell card too big for its space opens in a dialog from its header, so it gets its own
-    // button to fold away.
-    let opens_dialog = card.shell.is_some() && card.expanded && overflows(card.scroll);
+/// The corner radius of a card's parts, inside its one-pixel border.
+const INNER_RADIUS: Pixels = px(5.);
+
+/// What a card's clicks do.
+pub struct Actions<T, E, Q> {
+    /// The header of any card but a Bash one: open or fold the card.
+    pub toggle: T,
+    /// "Click to expand" under a long Bash card: open all of it in a dialog.
+    pub expand: E,
+    /// The header's button: add the call to the prompt, to ask about it.
+    pub quote: Q,
+}
+
+pub fn render<T, E, Q>(card: Card, window: &Window, cx: &App, actions: Actions<T, E, Q>) -> AnyElement
+where
+    T: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    E: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    Q: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+{
+    let Actions { toggle, expand, quote } = actions;
     let (family, icon) = kind(card.name);
     let look = look(family, cx);
     let theme = cx.theme();
@@ -339,8 +427,8 @@ pub fn render(
         .px_3()
         .py_1p5()
         .bg(look.header_bg)
-        .cursor_pointer()
-        .on_click(on_toggle)
+        // A Bash card stays open: its body is short, and the rest is in the dialog.
+        .when(card.shell.is_none(), |el| el.cursor_pointer().on_click(toggle))
         .child(Icon::new(icon).small().text_color(look.accent))
         .child(
             div()
@@ -362,44 +450,50 @@ pub fn render(
                 .child(card.summary.clone()),
         )
         .when_some(card.label.clone(), |el, label| el.child(div().text_xs().text_color(look.dim).child(label)))
-        .when(opens_dialog, |el| {
-            el.child(Icon::new(IconName::Maximize2).xsmall().text_color(look.dim)).child(
-                div()
-                    .id(SharedString::from(format!("tool-fold-{}", card.ix)))
-                    .test_support()
-                    .flex_shrink_0()
-                    .rounded_sm()
-                    .p_0p5()
-                    .hover(|el| el.bg(look.text.opacity(0.12)))
-                    .on_click(move |event, window, cx| {
-                        cx.stop_propagation();
-                        on_collapse(event, window, cx);
-                    })
-                    .child(Icon::new(IconName::ChevronsDownUp).xsmall().text_color(look.dim)),
-            )
-        })
+        .child(
+            div()
+                .id(SharedString::from(format!("tool-ask-{}", card.ix)))
+                .test_support()
+                .flex_shrink_0()
+                .rounded_sm()
+                .p_0p5()
+                .cursor_pointer()
+                .hover(|el| el.bg(look.text.opacity(0.12)))
+                .tooltip(|window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new("Add to the prompt, to ask about it").build(window, cx)
+                })
+                .on_click(move |event, window, cx| {
+                    cx.stop_propagation();
+                    quote(event, window, cx);
+                })
+                .child(Icon::new(IconName::MessageSquarePlus).xsmall().text_color(look.subtle)),
+        )
         .child(div().flex_shrink_0().child(mark));
 
     let body = if !card.expanded {
         None
     } else if let Some(details) = card.details {
         Some(details)
+    } else if let Some(shell) = card.shell {
+        Some(shell_card_body(&card, shell, &look, expand))
     } else {
         tool_body(&card, &look, mono.clone())
     };
+    // The border's corners are round, so the parts that touch them are too.
+    let header_ends = card.now.is_none() && body.is_none();
 
     v_flex()
         .rounded_md()
-        .overflow_hidden()
         .border_1()
         .border_color(look.border)
-        .child(header)
+        .child(header.rounded_t(INNER_RADIUS).when(header_ends, |el| el.rounded_b(INNER_RADIUS)))
         .when_some(card.now.clone(), |el, now| {
             el.child(
                 div()
                     .px_3()
                     .pb_1p5()
                     .bg(look.header_bg)
+                    .when(body.is_none(), |el| el.rounded_b(INNER_RADIUS))
                     .text_xs()
                     .text_color(look.dim)
                     .overflow_hidden()
@@ -414,10 +508,13 @@ pub fn render(
                     .id(SharedString::from(format!("tool-body-{}", card.ix)))
                     .border_t_1()
                     .border_color(look.border)
+                    .rounded_b(INNER_RADIUS)
                     .when_some(look.body_bg, |el, bg| el.bg(bg))
-                    .max_h(window.viewport_size().height * 0.5)
-                    .overflow_y_scroll()
-                    .track_scroll(card.scroll)
+                    // A Bash card is already cut to its first lines; scrolling would hide the
+                    // line that opens the rest.
+                    .when(card.shell.is_none(), |el| {
+                        el.max_h(window.viewport_size().height * 0.5).overflow_y_scroll().track_scroll(card.scroll)
+                    })
                     .px_3()
                     .py_2()
                     .text_xs()
@@ -425,6 +522,40 @@ pub fn render(
                     .child(body),
             )
         })
+        .into_any_element()
+}
+
+/// A Bash card's body: the first lines of the command and its output, a line that opens the
+/// rest, any pictures, and how long the command took.
+fn shell_card_body(
+    card: &Card,
+    shell: &ShellText,
+    look: &Look,
+    on_expand: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let text = match &shell.short {
+        Some(short) => shell_body(&short.command, short.command_cut, short.output.as_ref(), shell.failed, look),
+        None => shell_body(&shell.command, false, shell.output.as_ref(), shell.failed, look),
+    };
+    let hidden = shell.hidden_lines();
+    let hover = look.text;
+    v_flex()
+        .gap_2()
+        .child(text)
+        .when(hidden > 0, |el| {
+            el.child(
+                div()
+                    .id(SharedString::from(format!("tool-expand-{}", card.ix)))
+                    .test_support()
+                    .cursor_pointer()
+                    .text_color(look.dim)
+                    .hover(move |el| el.text_color(hover))
+                    .on_click(on_expand)
+                    .child(format!("… {hidden} more line{} · Click to expand", if hidden == 1 { "" } else { "s" })),
+            )
+        })
+        .children(card.pictures.iter().map(|p| picture_block(p, look)))
+        .when_some(card.took, |el, took| el.child(div().text_color(look.dim.opacity(0.8)).child(took_label(took))))
         .into_any_element()
 }
 
@@ -439,7 +570,6 @@ fn tool_body(card: &Card, look: &Look, mono: SharedString) -> Option<AnyElement>
     let error_only = |out: Option<String>| out.filter(|_| failed).map(|o| output_block(o, look.error));
 
     let parts: Vec<AnyElement> = match card.name {
-        "Bash" if card.shell.is_some() => vec![shell_body(card.shell?, look)],
         "Edit" => {
             let old = str_field("old_string").unwrap_or_default();
             let new = str_field("new_string").unwrap_or_default();
@@ -511,35 +641,48 @@ fn tool_body(card: &Card, look: &Look, mono: SharedString) -> Option<AnyElement>
         v_flex()
             .gap_2()
             .children(parts.into_iter().enumerate().map(|(i, part)| {
-                div()
-                    .when(i + 1 < count && card.name != "Bash", |el| el.pb_2().border_b_1().border_color(look.border))
-                    .child(part)
+                div().when(i + 1 < count, |el| el.pb_2().border_b_1().border_color(look.border)).child(part)
             }))
             .into_any_element(),
     )
 }
 
-/// A command after a `$`, then what it printed, both coloured.
-fn shell_body(shell: &ShellText, look: &Look) -> AnyElement {
+/// A command after a `$`, then what it printed, both coloured. `command_cut` marks a command
+/// whose last lines are left out.
+fn shell_body(
+    command: &Highlighted,
+    command_cut: bool,
+    output: Option<&Highlighted>,
+    failed: bool,
+    look: &Look,
+) -> AnyElement {
     v_flex()
         .gap_2()
         .child(
-            h_flex()
-                .items_start()
-                .gap_2()
-                .child(div().flex_shrink_0().text_color(look.dim).child("$"))
-                .child(div().flex_1().min_w_0().text_color(look.text).child(shell.command.styled(&look.palette))),
+            h_flex().items_start().gap_2().child(div().flex_shrink_0().text_color(look.dim).child("$")).child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(look.text)
+                    .child(command.styled(&look.palette))
+                    .when(command_cut, |el| el.child(div().text_color(look.dim).child("…"))),
+            ),
         )
-        .when_some(shell.output.as_ref(), |el, output| {
-            el.child(
-                div().text_color(if shell.failed { look.error } else { look.dim }).child(output.styled(&look.palette)),
-            )
+        .when_some(output, |el, output| {
+            el.child(div().text_color(if failed { look.error } else { look.dim }).child(output.styled(&look.palette)))
         })
         .into_any_element()
 }
 
 /// A Bash card opened in a dialog: the whole command and output, scrolling inside it.
-pub fn shell_dialog(dialog: Dialog, summary: &str, shell: &ShellText, window: &mut Window, cx: &mut App) -> Dialog {
+pub fn shell_dialog(
+    dialog: Dialog,
+    summary: &str,
+    shell: &ShellText,
+    took: Option<Duration>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Dialog {
     let look = look(Family::Shell, cx);
     let theme = cx.theme();
     let width = (window.viewport_size().width * 0.85).min(px(1400.));
@@ -566,7 +709,10 @@ pub fn shell_dialog(dialog: Dialog, summary: &str, shell: &ShellText, window: &m
             .p_4()
             .text_sm()
             .font_family(theme.mono_font_family.clone())
-            .child(shell_body(shell, &look)),
+            .child(shell_body(&shell.command, false, shell.output.as_ref(), shell.failed, &look))
+            .when_some(took, |el, took| {
+                el.child(div().pt_2().text_color(look.dim.opacity(0.8)).child(took_label(took)))
+            }),
     )
 }
 
@@ -742,7 +888,10 @@ fn first_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     // Named imports: `super::*` would bring in gpui's `test` attribute in place of the standard one.
-    use super::{Diff, Family, Path, clean, header_summary, kind, line_diff, opens_by_default, title};
+    use super::{
+        Diff, Duration, Family, Path, SHELL_LINES, ShellText, clean, header_summary, kind, line_diff, opens_by_default,
+        quote, title, took_label,
+    };
     use serde_json::json;
 
     #[test]
@@ -788,6 +937,50 @@ mod tests {
     fn colour_codes_and_tabs_are_cleaned_from_output() {
         assert_eq!(clean("\u{1b}[31mred\u{1b}[0m\tx\r\n"), "red    x");
         assert_eq!(clean("\u{1b}]0;title\u{7}ok"), "ok");
+    }
+
+    #[test]
+    fn a_bash_card_shows_thirty_lines_and_counts_the_rest() {
+        let lines = |n: usize| (1..=n).map(|i| format!("line {i}\n")).collect::<String>();
+        let shown = |shell: &ShellText| {
+            let short = shell.short.as_ref().expect("cut short");
+            short.command.text.lines().count() + short.output.as_ref().map_or(0, |o| o.text.lines().count())
+        };
+        // Short text is shown whole.
+        let mut shell = ShellText::new("echo hi");
+        shell.finish(&lines(SHELL_LINES - 1), false);
+        assert_eq!(shell.hidden_lines(), 0);
+        // Long output is cut after the command.
+        shell.finish(&lines(300), false);
+        assert_eq!((shown(&shell), shell.hidden_lines()), (SHELL_LINES, 271));
+        // A long script is cut too, and leaves room for the start of its output.
+        let mut shell = ShellText::new(&lines(100));
+        assert_eq!((shown(&shell), shell.hidden_lines()), (SHELL_LINES, 70));
+        shell.finish(&lines(50), false);
+        let short = shell.short.as_ref().unwrap();
+        assert!(short.command_cut);
+        assert_eq!(short.output.as_ref().unwrap().text.lines().count(), 10);
+        assert_eq!((shown(&shell), shell.hidden_lines()), (SHELL_LINES, 120));
+    }
+
+    #[test]
+    fn how_long_a_call_took_reads_in_seconds_minutes_and_hours() {
+        assert_eq!(took_label(Duration::from_millis(2_440)), "Took 2.4s");
+        assert_eq!(took_label(Duration::from_millis(40)), "Took 40ms");
+        assert_eq!(took_label(Duration::from_secs(72)), "Took 1m 12s");
+        assert_eq!(took_label(Duration::from_secs(3_790)), "Took 1h 3m");
+    }
+
+    #[test]
+    fn a_quoted_call_names_the_tool_and_repeats_a_bash_command() {
+        let bash = json!({ "command": "git status\ngit diff" });
+        assert_eq!(
+            quote("Bash", &bash, "Check the tree"),
+            "About your earlier Bash call (Check the tree):\n```\n$ git status\ngit diff\n```"
+        );
+        let long = json!({ "command": "x\n".repeat(30) });
+        assert!(quote("Bash", &long, "").ends_with("x\n…\n```"));
+        assert_eq!(quote("Read", &json!({}), "src/a.rs"), "About your earlier Read call (src/a.rs):");
     }
 
     #[test]

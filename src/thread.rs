@@ -150,6 +150,10 @@ struct ToolRow {
     status: ToolStatus,
     output: Option<String>,
     expanded: bool,
+    /// When the call began running (after its approval, if it needed one); none when replayed.
+    started: Option<std::time::Instant>,
+    /// How long the call ran.
+    took: Option<std::time::Duration>,
     /// When this call started a subagent: what it's doing and what it did.
     subagent: Option<Subagent>,
 }
@@ -208,6 +212,16 @@ struct Attachment {
     preview: Arc<gpui_kit::Image>,
 }
 
+/// A tool call added to the prompt box, so the next message asks about it.
+struct Quote {
+    tool_id: String,
+    /// The chip: the tool's icon, its name and its one-line summary.
+    icon: gpui_kit::assets::IconName,
+    label: String,
+    /// What the message carries (`tool_card::quote`).
+    text: String,
+}
+
 /// The `@file` picker, open while a mention is being typed.
 struct MentionPicker {
     matches: Vec<String>,
@@ -261,6 +275,8 @@ pub struct ThreadView {
     files_dir: Option<PathBuf>,
     /// Images that go with the next message.
     attachments: Vec<Attachment>,
+    /// Tool calls the next message asks about.
+    quotes: Vec<Quote>,
     mention: Option<MentionPicker>,
     /// The project's files, for the picker; listed again each time a mention starts.
     project_files: Option<Arc<Vec<String>>>,
@@ -349,6 +365,7 @@ impl ThreadView {
             prompt,
             files_dir: setup.transcript.as_deref().map(crate::composer::files_dir),
             attachments: Vec::new(),
+            quotes: Vec::new(),
             mention: None,
             project_files: None,
             listing_files: false,
@@ -632,12 +649,16 @@ impl ThreadView {
 
     // ---------- commands ----------
 
-    /// Send what's in the prompt box, with any attached images.
+    /// Send what's in the prompt box, after any tool calls it asks about and with any
+    /// attached images.
     pub fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.prompt.read(cx).value().trim().to_string();
-        if text.is_empty() && self.attachments.is_empty() {
+        let typed = self.prompt.read(cx).value().trim().to_string();
+        if typed.is_empty() && self.attachments.is_empty() && self.quotes.is_empty() {
             return;
         }
+        let mut parts: Vec<String> = self.quotes.drain(..).map(|quote| quote.text).collect();
+        parts.extend((!typed.is_empty()).then_some(typed));
+        let text = parts.join("\n\n");
         let attachments = std::mem::take(&mut self.attachments);
         self.mention = None;
         self.prompt.update(cx, |p, cx| p.set_value("", window, cx));
@@ -899,6 +920,29 @@ impl ThreadView {
         }
     }
 
+    /// Add the tool call in row `ix` to the prompt box (once), and put the keyboard there.
+    fn quote_tool(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Row::Tool(tool)) = self.rows.get(ix) else { return };
+        if !self.quotes.iter().any(|quote| quote.tool_id == tool.id) {
+            let summary = tool_card::header_summary(&tool.name, &tool.input, &tool.summary, &self.project_dir());
+            self.quotes.push(Quote {
+                tool_id: tool.id.clone(),
+                icon: tool_card::kind(&tool.name).1,
+                label: format!("{} · {}", tool_card::title(&tool.name), truncate(&summary, 60)),
+                text: tool_card::quote(&tool.name, &tool.input, &summary),
+            });
+        }
+        self.prompt.update(cx, |p, cx| p.focus(window, cx));
+        cx.notify();
+    }
+
+    fn remove_quote(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.quotes.len() {
+            self.quotes.remove(ix);
+            cx.notify();
+        }
+    }
+
     /// Save attached images next to the transcript, so a reopened thread still shows them.
     /// Gives the saved file names (none when the thread isn't saved).
     fn save_images(&self, attachments: &[Attachment]) -> Vec<String> {
@@ -1011,16 +1055,52 @@ impl ThreadView {
             .children(self.render_mention_picker(cx))
     }
 
-    /// Thumbnails of the images that go with the next message, each with a remove button.
+    /// What goes with the next message, each with a remove button: the tool calls it asks
+    /// about as chips, and thumbnails of its images.
     fn render_attachments(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.attachments.is_empty() {
+        if self.attachments.is_empty() && self.quotes.is_empty() {
             return None;
         }
+        use gpui_kit::{assets::IconName, component::Icon};
         let (border, bg) = (cx.theme().border, cx.theme().background);
+        let (chip, muted) = (cx.theme().primary.opacity(0.16), cx.theme().muted_foreground);
         Some(
             h_flex()
                 .flex_wrap()
+                .items_end()
                 .gap_2()
+                .children(self.quotes.iter().enumerate().map(|(ix, quote)| {
+                    h_flex()
+                        .gap_1p5()
+                        .max_w_full()
+                        .pl_2()
+                        .pr_1()
+                        .py_0p5()
+                        .rounded_md()
+                        .bg(chip)
+                        .text_sm()
+                        .child(Icon::new(quote.icon).xsmall())
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(quote.label.clone()),
+                        )
+                        .child(
+                            div()
+                                .id(("remove-quote", ix))
+                                .test_support()
+                                .flex_shrink_0()
+                                .rounded_sm()
+                                .p_0p5()
+                                .cursor_pointer()
+                                .hover(move |el| el.bg(muted.opacity(0.2)))
+                                .child(Icon::new(IconName::X).xsmall().text_color(muted))
+                                .on_click(cx.listener(move |this, _, _, cx| this.remove_quote(ix, cx))),
+                        )
+                }))
                 .children(self.attachments.iter().enumerate().map(|(ix, a)| {
                     div()
                         .relative()
@@ -1247,6 +1327,12 @@ impl ThreadView {
         };
         row.outcome = Some(outcome.clone());
         let request = row.request.clone();
+        // The call starts running now; the wait for this answer isn't part of how long it took.
+        if let Some(tool_ix) = request.tool_use_id.as_deref().and_then(|id| self.tool_row(id))
+            && let Row::Tool(tool) = &mut self.rows[tool_ix]
+        {
+            tool.started = tool.started.map(|_| std::time::Instant::now());
+        }
         self.write(Record::Decision { request_id: request.id.clone(), outcome: outcome.clone() });
         if let Decision::Answer { answers } = &decision {
             for (question, answer) in answers {
@@ -1276,18 +1362,15 @@ impl ThreadView {
         self.remeasure(ix, cx);
     }
 
-    /// A tool card's header opens or folds the card; a Bash card too big for its space opens
-    /// in a dialog instead, where all of it can be read.
-    fn click_tool_header(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open a Bash card in a dialog, where all of its command and output can be read.
+    fn expand_tool(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Row::Tool(tool)) = self.rows.get(ix) else { return };
-        if let Some(shell) = tool.shell.clone().filter(|_| tool.expanded && tool_card::overflows(&tool.scroll)) {
-            let summary = tool_card::header_summary(&tool.name, &tool.input, &tool.summary, &self.project_dir());
-            window.open_dialog(cx, move |dialog, window, cx| {
-                tool_card::shell_dialog(dialog, &summary, &shell, window, cx)
-            });
-            return;
-        }
-        self.fold_tool(ix, cx);
+        let Some(shell) = tool.shell.clone() else { return };
+        let took = tool.took;
+        let summary = tool_card::header_summary(&tool.name, &tool.input, &tool.summary, &self.project_dir());
+        window.open_dialog(cx, move |dialog, window, cx| {
+            tool_card::shell_dialog(dialog, &summary, &shell, took, window, cx)
+        });
     }
 
     fn fold_tool(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -1301,10 +1384,18 @@ impl ThreadView {
         self.rows.iter().rposition(|r| matches!(r, Row::Tool(t) if t.id == tool_use_id))
     }
 
+    /// The Agent (or Task) call `tool_use_id`, which started a subagent. Claude Code reports a
+    /// long Bash command as a task too, with the same events and its description as the
+    /// "report"; those are left out, so the card keeps its command and output.
+    fn subagent_row(&self, tool_use_id: &str) -> Option<usize> {
+        self.tool_row(tool_use_id)
+            .filter(|&ix| matches!(&self.rows[ix], Row::Tool(t) if matches!(t.name.as_str(), "Agent" | "Task")))
+    }
+
     /// Update the subagent started by tool call `tool_use_id` (creating it if events arrive
     /// before its start was seen).
     fn with_subagent(&mut self, tool_use_id: &str, cx: &mut Context<Self>, update: impl FnOnce(&mut Subagent)) {
-        let Some(ix) = self.tool_row(tool_use_id) else { return };
+        let Some(ix) = self.subagent_row(tool_use_id) else { return };
         if let Row::Tool(tool) = &mut self.rows[ix] {
             let sub = tool.subagent.get_or_insert_with(Subagent::default);
             update(sub);
@@ -1418,6 +1509,16 @@ impl ThreadView {
         if let AgentEvent::ToolFinished { images, .. } = &mut event {
             self.save_tool_images(images);
         }
+        // A call's time is measured here and saved with it, so a reopened thread shows it too.
+        if let AgentEvent::ToolFinished { id, took_ms, .. } = &mut event
+            && took_ms.is_none()
+        {
+            let started = self.tool_row(id).and_then(|ix| match &self.rows[ix] {
+                Row::Tool(tool) => tool.started,
+                _ => None,
+            });
+            *took_ms = started.map(|at| at.elapsed().as_millis() as u64);
+        }
         match &event {
             // Process lifecycle and live usage aren't part of the conversation.
             AgentEvent::Started { .. } | AgentEvent::Exited { .. } | AgentEvent::Usage(_) => {}
@@ -1468,7 +1569,7 @@ impl ThreadView {
                 self.model = model.or(self.model.take());
             }
             AgentEvent::SubagentStarted { tool_use_id, description, agent_type } => {
-                if let Some(ix) = self.tool_row(&tool_use_id) {
+                if let Some(ix) = self.subagent_row(&tool_use_id) {
                     if let Row::Tool(tool) = &mut self.rows[ix] {
                         tool.status = ToolStatus::Running;
                         if !description.is_empty() {
@@ -1499,7 +1600,7 @@ impl ThreadView {
                 self.with_subagent(&tool_use_id, cx, |sub| sub.log.push(truncate(text.trim(), 600)));
             }
             AgentEvent::SubagentFinished { tool_use_id, status, summary } => {
-                if let Some(ix) = self.tool_row(&tool_use_id)
+                if let Some(ix) = self.subagent_row(&tool_use_id)
                     && let Row::Tool(tool) = &mut self.rows[ix]
                 {
                     tool.status = if status == "completed" { ToolStatus::Done } else { ToolStatus::Failed };
@@ -1589,12 +1690,14 @@ impl ThreadView {
                         status: ToolStatus::Running,
                         output: None,
                         expanded,
+                        started: (!self.replaying).then(std::time::Instant::now),
+                        took: None,
                         subagent: None,
                     }),
                     cx,
                 );
             }
-            AgentEvent::ToolFinished { id, output, is_error, images } => {
+            AgentEvent::ToolFinished { id, output, is_error, images, took_ms } => {
                 let images: Vec<_> = images.iter().filter_map(|image| self.tool_image(image)).collect();
                 if let Some(ix) = self.rows.iter().rposition(|r| matches!(r, Row::Tool(t) if t.id == id)) {
                     if let Row::Tool(tool) = &mut self.rows[ix] {
@@ -1610,6 +1713,7 @@ impl ThreadView {
                             return;
                         }
                         tool.status = if is_error { ToolStatus::Failed } else { ToolStatus::Done };
+                        tool.took = took_ms.map(std::time::Duration::from_millis);
                         if let Some(shell) = &mut tool.shell {
                             shell.finish(&output, is_error);
                         }
@@ -1849,11 +1953,15 @@ impl ThreadView {
                     expanded: tool.expanded,
                     details,
                     shell: tool.shell.as_ref(),
+                    took: tool.took,
                     scroll: &tool.scroll,
                 };
-                let toggle = cx.listener(move |this, _, window, cx| this.click_tool_header(ix, window, cx));
-                let fold = cx.listener(move |this, _, _, cx| this.fold_tool(ix, cx));
-                pad(div()).child(tool_card::render(card, window, cx, toggle, fold)).into_any_element()
+                let actions = tool_card::Actions {
+                    toggle: cx.listener(move |this, _, _, cx| this.fold_tool(ix, cx)),
+                    expand: cx.listener(move |this, _, window, cx| this.expand_tool(ix, window, cx)),
+                    quote: cx.listener(move |this, _, window, cx| this.quote_tool(ix, window, cx)),
+                };
+                pad(div()).child(tool_card::render(card, window, cx, actions)).into_any_element()
             }
             Row::Approval(ApprovalRow { kind: ApprovalKind::Question(card), outcome, .. }) => {
                 // The questions are answered in the modal over the conversation; this card
@@ -2807,44 +2915,126 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[gpui_kit::test]
-    fn a_bash_card_too_big_for_its_space_opens_in_a_dialog(cx: &mut TestAppContext) {
-        use gpui_kit::component::WindowExt as _;
-        let (window, thread) = open(cx);
-        let cx = &mut VisualTestContext::from_window(window, cx);
+    /// A thread that ran `echo short` (printing "ok") and `echo long` (printing 300 lines);
+    /// returns the two cards' rows.
+    fn two_bash_cards(thread: &Entity<ThreadView>, cx: &mut VisualTestContext) -> (usize, usize) {
         let long: String = (1..=300).map(|i| format!("line {i}\n")).collect();
         thread.update(cx, |t, cx| {
             t.send("Run two commands", cx);
             for (id, output) in [("short", "ok"), ("long", long.as_str())] {
-                let input = serde_json::json!({ "command": format!("echo {id}") });
+                let input = serde_json::json!({ "command": format!("echo {id}"), "description": format!("Say {id}") });
                 t.handle(AgentEvent::ToolStarted { id: id.into(), name: "Bash".into(), input }, cx);
-                let output = output.to_string();
-                t.handle(AgentEvent::ToolFinished { id: id.into(), output, is_error: false, images: Vec::new() }, cx);
+                t.handle(
+                    AgentEvent::ToolFinished {
+                        id: id.into(),
+                        output: output.to_string(),
+                        is_error: false,
+                        images: Vec::new(),
+                        took_ms: None,
+                    },
+                    cx,
+                );
             }
         });
-        let rows = thread.read_with(cx, |t, _| t.rows.len());
-        let (short, long) = (rows - 2, rows - 1);
-        let expanded = |ix: usize, cx: &mut VisualTestContext| {
-            thread.read_with(cx, |t, _| matches!(&t.rows[ix], Row::Tool(tool) if tool.expanded))
-        };
         cx.update(|window, cx| window.render_frame(cx));
+        let rows = thread.read_with(cx, |t, _| t.rows.len());
+        (rows - 2, rows - 1)
+    }
 
-        // A card that fits folds from its header.
-        cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("tool-{short}")), cx));
-        assert!(!expanded(short, cx));
-        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
-
-        // One that overflows opens in a dialog and stays open; its own button folds it.
-        cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("tool-{long}")), cx));
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-        assert!(expanded(long, cx));
-        cx.update(|window, cx| {
-            window.close_dialog(cx);
-            window.render_frame(cx);
-            window.click(gpui_kit::SharedString::from(format!("tool-fold-{long}")), cx);
+    #[gpui_kit::test]
+    fn a_long_bash_command_reported_as_a_task_keeps_its_output(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, cx| {
+            t.send("Build it", cx);
+            let input = serde_json::json!({ "command": "cargo build", "description": "Build the app" });
+            t.handle(AgentEvent::ToolStarted { id: "b".into(), name: "Bash".into(), input }, cx);
+            // Claude Code reports a command that runs a while as a task, like a subagent.
+            let description = "Build the app".to_string();
+            t.handle(AgentEvent::SubagentStarted { tool_use_id: "b".into(), description, agent_type: None }, cx);
+            let output = "Finished".to_string();
+            t.handle(
+                AgentEvent::ToolFinished { id: "b".into(), output, is_error: false, images: Vec::new(), took_ms: None },
+                cx,
+            );
+            let summary = Some("Build the app".to_string());
+            t.handle(AgentEvent::SubagentFinished { tool_use_id: "b".into(), status: "completed".into(), summary }, cx);
         });
-        assert!(!expanded(long, cx));
+        thread.read_with(cx, |t, _| {
+            let Some(Row::Tool(tool)) = t.rows.last() else { panic!("not a tool row") };
+            assert!(tool.subagent.is_none());
+            assert_eq!(tool.status, crate::tool_card::ToolStatus::Done);
+            assert_eq!(tool.output.as_deref(), Some("Finished"));
+            assert!(!t.plain.iter().any(|line| line.starts_with("(Subagent")));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_long_bash_card_is_cut_short_and_opens_in_a_dialog(cx: &mut TestAppContext) {
+        use gpui_kit::component::WindowExt as _;
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (short, long) = two_bash_cards(&thread, cx);
+        let tool = |ix: usize, cx: &mut VisualTestContext| {
+            thread.read_with(cx, |t, _| match &t.rows[ix] {
+                Row::Tool(tool) => (tool.expanded, tool.shell.as_ref().unwrap().hidden_lines(), tool.took.is_some()),
+                _ => panic!("not a tool row"),
+            })
+        };
+        // Both are timed; only the long one leaves lines out (its command, then 29 of 300).
+        assert_eq!(tool(short, cx), (true, 0, true));
+        assert_eq!(tool(long, cx), (true, 271, true));
+
+        // The header neither folds a Bash card nor opens the dialog.
+        for ix in [short, long] {
+            cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("tool-{ix}")), cx));
+            assert!(tool(ix, cx).0);
+        }
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+
+        // "Click to expand" under the cut text opens all of it.
+        cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("tool-expand-{long}")), cx));
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(tool(long, cx).0);
+    }
+
+    #[gpui_kit::test]
+    fn a_tool_card_is_added_to_the_prompt_and_sent_with_the_question(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (short, long) = two_bash_cards(&thread, cx);
+        let click = |id: String, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                window.click(gpui_kit::SharedString::from(id), cx);
+                window.render_frame(cx);
+            });
+        };
+        let labels = |cx: &mut VisualTestContext| {
+            thread.read_with(cx, |t, _| t.quotes.iter().map(|q| q.label.clone()).collect::<Vec<_>>())
+        };
+
+        // The header's button adds the call once, and gives the prompt box the keyboard.
+        click(format!("tool-ask-{short}"), cx);
+        click(format!("tool-ask-{short}"), cx);
+        click(format!("tool-ask-{long}"), cx);
+        assert_eq!(labels(cx), ["Bash · Say short", "Bash · Say long"]);
+        assert!(cx.update(|window, cx| thread.read(cx).prompt_focus(cx).is_focused(window)));
+
+        // A chip's own button takes it out again.
+        cx.update(|window, cx| window.click(("remove-quote", 1usize), cx));
+        assert_eq!(labels(cx), ["Bash · Say short"]);
+
+        // The message names the call before what was typed.
+        thread.update_in(cx, |t, window, cx| {
+            t.prompt.update(cx, |p, cx| p.set_value("Why did it print that?", window, cx));
+            t.submit(window, cx);
+        });
+        let sent = thread.read_with(cx, |t, _| t.plain.last().cloned().unwrap());
+        assert_eq!(
+            sent,
+            "User: About your earlier Bash call (Say short):\n```\n$ echo short\n```\n\nWhy did it print that?"
+        );
+        assert!(labels(cx).is_empty());
     }
 
     #[gpui_kit::test]
@@ -2869,6 +3059,7 @@ mod tests {
                     output: String::new(),
                     is_error: false,
                     images: vec![image],
+                    took_ms: None,
                 },
                 cx,
             );

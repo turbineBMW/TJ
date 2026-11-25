@@ -475,6 +475,7 @@ impl Parser {
                         output: tool_output(b.get("content")),
                         images: tool_images(b.get("content")),
                         is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                        took_ms: None,
                     })
                 })
                 .collect(),
