@@ -72,6 +72,22 @@ const MODEL_MENU_WIDTH: f32 = 400.0;
 
 /// The widest the conversation and composer get, so lines stay readable in a wide window.
 const MAX_CONVERSATION_WIDTH: f32 = 860.0;
+/// The stop button's square, at the top of its breath.
+const STOP_SIZE: f32 = 10.0;
+/// How far (pixels) the crest of the spinner verb's wave lifts a letter.
+const WAVE_LIFT: f32 = 2.5;
+
+/// The spinner verb `steps` into a turn, as Claude Code shows it under the conversation, with
+/// the wave lifting its letters one at a time.
+fn spinner_line(seed: u64, steps: u64, color: Hsla) -> impl IntoElement {
+    let text = format!("{}…", crate::working::verb(seed, steps));
+    let letters = text.chars().count();
+    h_flex().id("spinner-verb").test_support().text_sm().text_color(color).children(
+        text.chars()
+            .zip(crate::working::wave(steps, letters))
+            .map(|(letter, lift)| div().relative().top(px(-WAVE_LIFT * lift)).child(letter.to_string())),
+    )
+}
 
 /// Who the thread is and where it keeps its transcript.
 #[derive(Clone, Default)]
@@ -312,6 +328,9 @@ pub struct ThreadView {
     /// The assistant text row that deltas go to.
     current_text: Option<usize>,
     pub status: Status,
+    /// While the agent works: the animation step it started at, and the seed for its spinner
+    /// verbs.
+    working: Option<(u64, u64)>,
     pub mode: PermissionMode,
     pub session_id: Option<String>,
     pub model: Option<String>,
@@ -388,6 +407,7 @@ impl ThreadView {
             _pump: None,
             current_text: None,
             status: Status::Idle,
+            working: None,
             mode,
             session_id: None,
             model: None,
@@ -2103,17 +2123,28 @@ impl ThreadView {
 }
 
 impl Render for ThreadView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.render_view(cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_view(window, cx)
     }
 }
 
 impl ThreadView {
-    fn render_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let bg = theme.background;
+    fn render_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let bg = cx.theme().background;
         let this = cx.entity();
-        let running = self.status != Status::Idle;
+        // While the agent works (not while it waits on the user), the stop button breathes and
+        // a spinner verb waves under the conversation.
+        let working = if self.status == Status::Running {
+            let step = crate::working::tick(window, cx);
+            let (start, seed) = *self.working.get_or_insert_with(|| (step, crate::working::seed()));
+            Some((step, step.saturating_sub(start), seed))
+        } else {
+            self.working = None;
+            None
+        };
+        let breath = working.map(|(step, _, _)| crate::working::breath(step));
+        let accent = cx.theme().primary;
+        let spinner = working.map(|(_, steps, seed)| spinner_line(seed, steps, accent));
 
         let transcript = MessageScroller::new("transcript", self.scroller.clone(), move |ix, window, cx| {
             this.update(cx, |thread, cx| {
@@ -2263,7 +2294,7 @@ impl ThreadView {
             .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)));
 
         let card =
-            self.render_composer_card(attach, account_menu, mode_menu, model_menu, running, cx).into_any_element();
+            self.render_composer_card(attach, account_menu, mode_menu, model_menu, breath, cx).into_any_element();
         if self.is_fresh() {
             return self.render_intro(card, cx).into_any_element();
         }
@@ -2272,6 +2303,15 @@ impl ThreadView {
             .size_full()
             .bg(bg)
             .child(div().flex_1().min_h_0().child(transcript))
+            .when_some(spinner, |el, spinner| {
+                el.child(
+                    h_flex()
+                        .w_full()
+                        .justify_center()
+                        // Lined up with the messages' text.
+                        .child(div().w_full().max_w(px(MAX_CONVERSATION_WIDTH)).px_4().pt_1().pb_2().child(spinner)),
+                )
+            })
             .child(
                 h_flex()
                     .w_full()
@@ -2285,13 +2325,14 @@ impl ThreadView {
 
     /// The prompt card: attachments, the prompt, and a row of menus with a round send button
     /// (a stop button while the agent works). The same card on the start screen and in a session.
+    /// `breath` is how big the stop button's square is drawn while the agent works.
     fn render_composer_card(
         &self,
         attach: impl IntoElement,
         account_menu: impl IntoElement,
         mode_menu: impl IntoElement,
         model_menu: impl IntoElement,
-        running: bool,
+        breath: Option<f32>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -2308,11 +2349,14 @@ impl ThreadView {
             .justify_center()
             .text_color(accent_fg)
             .cursor_pointer();
-        let send = if running {
+        let send = if self.status != Status::Idle {
             button
                 .id("stop")
                 .bg(accent)
-                .child(div().size(px(10.)).rounded(px(2.)).bg(accent_fg))
+                .child({
+                    let side = STOP_SIZE * breath.unwrap_or(1.0);
+                    div().flex_none().size(px(side)).rounded(px(2.)).bg(accent_fg)
+                })
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
         } else {
             button
