@@ -76,7 +76,14 @@ pub static COMMANDS: &[Command] = &[
     command!("split_right", "Split right", Panes, PANES, ["ctrl-alt-h"], panes::SplitRight),
     command!("split_down", "Split down", Panes, PANES, ["ctrl-alt-v"], panes::SplitDown),
     command!("focus_next_pane", "Focus the next pane", Panes, PANES, ["ctrl-shift-a"], panes::FocusNextPane),
-    command!("focus_pane_left", "Focus the pane to the left", Panes, PANES, ["ctrl-alt-s", "ctrl-alt-left"], panes::FocusPaneLeft),
+    command!(
+        "focus_pane_left",
+        "Focus the pane to the left",
+        Panes,
+        PANES,
+        ["ctrl-alt-s", "ctrl-alt-left"],
+        panes::FocusPaneLeft
+    ),
     command!(
         "focus_pane_right",
         "Focus the pane to the right",
@@ -86,7 +93,14 @@ pub static COMMANDS: &[Command] = &[
         panes::FocusPaneRight
     ),
     command!("focus_pane_up", "Focus the pane above", Panes, PANES, ["ctrl-alt-e", "ctrl-alt-up"], panes::FocusPaneUp),
-    command!("focus_pane_down", "Focus the pane below", Panes, PANES, ["ctrl-alt-d", "ctrl-alt-down"], panes::FocusPaneDown),
+    command!(
+        "focus_pane_down",
+        "Focus the pane below",
+        Panes,
+        PANES,
+        ["ctrl-alt-d", "ctrl-alt-down"],
+        panes::FocusPaneDown
+    ),
     // Shift turns `=` into `+` and `-` into `_` on most layouts; either spelling grows or shrinks.
     command!("grow_pane", "Grow the pane", Panes, PANES, ["ctrl-shift-=", "ctrl-shift-+"], panes::GrowPane),
     command!("shrink_pane", "Shrink the pane", Panes, PANES, ["ctrl-shift--", "ctrl-shift-_"], panes::ShrinkPane),
