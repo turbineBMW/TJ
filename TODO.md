@@ -4,12 +4,24 @@ What's missing or rough, roughly in priority order. ROADMAP.md has the direction
 
 ## Agent
 
-- [x] **Claude's questions and plans.** AskUserQuestion has its own card (pick options, multi-select, or type an answer); ExitPlanMode shows the plan with Start, accepting edits / Start, asking first / Keep planning.
+- [x] **Claude's questions and plans.** AskUserQuestion opens a modal over the conversation, answered question by question from the keyboard (or mouse); ExitPlanMode shows the plan with Start, accepting edits / Start, asking first / Keep planning.
 - [x] **Subagent activity.** The Agent tool's row shows what its (background) subagent is doing, its tool calls, counts and report.
 - [x] **Model picker.** Model and effort from a dropdown next to Send, listed by `claude` for the account, switchable mid-session, with project defaults.
 - [x] **Attachments and `@file` mentions** in the prompt box: an `@` file picker with chips, and images pasted, dropped or picked.
 - [x] **Account-switch handoff** sends a summary for long conversations (word for word when short), and survives a restart.
 - [ ] **Other agent backends** (Codex, pi) through the `AgentSession` interface.
+
+## Keyboard
+
+TJ should work entirely from the keyboard (ROADMAP.md, "Keyboard rules"). Still mouse-only:
+
+- [ ] Approval cards: Approve, Approve for session, Decline, Cancel turn.
+- [ ] The plan card: Start, accepting edits / Start, asking first / Keep planning.
+- [ ] Moving between projects and threads in the sidebar, and opening a project's history.
+- [ ] The account, mode and model menus under the prompt box.
+- [ ] Thread and project right-click menus (rename, archive, delete, remove, project picture).
+- [ ] Opening and folding tool cards, and opening the review from the changes list.
+- [ ] Settings (⚙).
 
 ## Threads and projects
 

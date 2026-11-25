@@ -1,14 +1,14 @@
 //! A conversation with an agent: the transcript, approval cards, and the prompt box.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::HashSet,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -25,6 +25,10 @@ use crate::agent::{
 use crate::overview::{self, Overview};
 use crate::store::{Record, TranscriptWriter};
 use crate::tool_card::{self, ToolStatus};
+
+mod questions;
+use questions::QuestionCard;
+pub use questions::bindings as question_bindings;
 
 /// How often a long turn's overview is refreshed while it runs.
 const OVERVIEW_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -183,72 +187,6 @@ enum ApprovalKind {
     /// Boxed: a question card is much larger than the other transcript rows.
     Question(Box<QuestionCard>),
     Plan(Entity<TextViewState>),
-}
-
-struct Question {
-    question: String,
-    header: String,
-    /// (label, description)
-    options: Vec<(String, String)>,
-    multi: bool,
-}
-
-struct QuestionCard {
-    questions: Vec<Question>,
-    /// The options picked for each question.
-    picked: Vec<BTreeSet<usize>>,
-    /// An "Other" answer for each question, created on first render.
-    other: Vec<Option<Entity<InputState>>>,
-}
-
-impl QuestionCard {
-    fn parse(input: &Value) -> Option<Self> {
-        let questions: Vec<Question> = input
-            .get("questions")?
-            .as_array()?
-            .iter()
-            .filter_map(|q| {
-                Some(Question {
-                    question: q.get("question")?.as_str()?.to_string(),
-                    header: q.get("header").and_then(Value::as_str).unwrap_or_default().to_string(),
-                    options: q
-                        .get("options")?
-                        .as_array()?
-                        .iter()
-                        .filter_map(|o| {
-                            Some((
-                                o.get("label")?.as_str()?.to_string(),
-                                o.get("description").and_then(Value::as_str).unwrap_or_default().to_string(),
-                            ))
-                        })
-                        .collect(),
-                    multi: q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
-                })
-            })
-            .collect();
-        (!questions.is_empty()).then(|| Self {
-            picked: vec![BTreeSet::new(); questions.len()],
-            other: (0..questions.len()).map(|_| None).collect(),
-            questions,
-        })
-    }
-
-    /// Question text -> answer, when every question has one. An "Other" answer wins over picks.
-    fn answers(&self, cx: &App) -> Option<BTreeMap<String, String>> {
-        self.questions
-            .iter()
-            .enumerate()
-            .map(|(qi, q)| {
-                let other = self.other[qi].as_ref().map(|o| o.read(cx).value().trim().to_string()).unwrap_or_default();
-                let answer = if !other.is_empty() {
-                    other
-                } else {
-                    self.picked[qi].iter().map(|oi| q.options[*oi].0.clone()).collect::<Vec<_>>().join(", ")
-                };
-                (!answer.is_empty()).then(|| (q.question.clone(), answer))
-            })
-            .collect()
-    }
 }
 
 // An approval row is several times larger than the others, but a transcript holds hundreds
@@ -1378,24 +1316,6 @@ impl ThreadView {
         self.remeasure(ix, cx);
     }
 
-    /// Pick (or, for a multi-select, toggle) option `oi` of question `qi` on card `ix`.
-    pub fn pick(&mut self, ix: usize, qi: usize, oi: usize, cx: &mut Context<Self>) {
-        if let Some(Row::Approval(ApprovalRow { kind: ApprovalKind::Question(card), outcome: None, .. })) =
-            self.rows.get_mut(ix)
-            && let (Some(q), Some(picked)) = (card.questions.get(qi), card.picked.get_mut(qi))
-        {
-            if q.multi {
-                if !picked.remove(&oi) {
-                    picked.insert(oi);
-                }
-            } else {
-                picked.clear();
-                picked.insert(oi);
-            }
-        }
-        self.remeasure(ix, cx);
-    }
-
     /// Send the question card's answers, if every question has one.
     pub fn submit_answers(&mut self, ix: usize, cx: &mut Context<Self>) {
         let answers = match self.rows.get(ix) {
@@ -1705,7 +1625,7 @@ impl ThreadView {
             AgentEvent::PermissionRequested(request) => {
                 self.current_text = None;
                 let kind = match request.tool_name.as_str() {
-                    "AskUserQuestion" => QuestionCard::parse(&request.input)
+                    "AskUserQuestion" => QuestionCard::parse(&request.input, cx)
                         .map(|card| ApprovalKind::Question(Box::new(card)))
                         .unwrap_or(ApprovalKind::Tool),
                     "ExitPlanMode" => match request.input.get("plan").and_then(Value::as_str) {
@@ -1845,19 +1765,13 @@ impl ThreadView {
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if let Some(Row::Approval(row)) = self.rows.get_mut(ix)
             && row.outcome.is_none()
+            && row.feedback.is_none()
         {
-            if row.feedback.is_none() {
-                let hint = match row.kind {
-                    ApprovalKind::Plan(_) => "Optional: what should change in the plan?",
-                    _ => "Optional: tell Claude why, or what to do instead",
-                };
-                row.feedback = Some(cx.new(|cx| InputState::new(window, cx).placeholder(hint)));
-            }
-            if let ApprovalKind::Question(card) = &mut row.kind {
-                for other in card.other.iter_mut().filter(|o| o.is_none()) {
-                    *other = Some(cx.new(|cx| InputState::new(window, cx).placeholder("Or type your own answer")));
-                }
-            }
+            let hint = match row.kind {
+                ApprovalKind::Plan(_) => "Optional: what should change in the plan?",
+                _ => "Optional: tell Claude why, or what to do instead",
+            };
+            row.feedback = Some(cx.new(|cx| InputState::new(window, cx).placeholder(hint)));
         }
         let theme = cx.theme();
         let (border, muted, secondary, accent) = (theme.border, theme.muted_foreground, theme.secondary, theme.primary);
@@ -1942,72 +1856,40 @@ impl ThreadView {
                 pad(div()).child(tool_card::render(card, window, cx, toggle, fold)).into_any_element()
             }
             Row::Approval(ApprovalRow { kind: ApprovalKind::Question(card), outcome, .. }) => {
+                // The questions are answered in the modal over the conversation; this card
+                // keeps them in the transcript, and opens the modal again once it's closed.
                 let pending = outcome.is_none();
-                let complete = card.answers(cx).is_some();
                 let fg = theme.foreground;
-                let questions = card.questions.iter().enumerate().map(|(qi, q)| {
-                    let options = q.options.iter().enumerate().map(|(oi, (label, description))| {
-                        let picked = card.picked[qi].contains(&oi);
-                        let mark = match (q.multi, picked) {
-                            (true, true) => "☑",
-                            (true, false) => "☐",
-                            (false, true) => "●",
-                            (false, false) => "○",
-                        };
-                        h_flex()
-                            .id(SharedString::from(format!("option-{ix}-{qi}-{oi}")))
-                            .test_support()
-                            .gap_2()
-                            .items_start()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .when(pending, |el| el.cursor_pointer().hover(|el| el.bg(secondary)))
-                            .when(picked, |el| el.bg(secondary))
-                            .on_click(cx.listener(move |this, _, _, cx| this.pick(ix, qi, oi, cx)))
-                            .child(div().text_color(if picked { accent } else { muted }).child(mark))
-                            .child(
-                                v_flex()
-                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(label.clone()))
-                                    .when(!description.is_empty(), |el| {
-                                        el.child(div().text_xs().text_color(muted).child(description.clone()))
-                                    }),
+                let questions = card.questions.iter().map(|q| {
+                    h_flex()
+                        .gap_2()
+                        .when(!q.header.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .px_1p5()
+                                    .rounded_sm()
+                                    .bg(secondary)
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(q.header.clone()),
                             )
-                    });
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .when(!q.header.is_empty(), |el| {
-                                    el.child(
-                                        div()
-                                            .px_1p5()
-                                            .rounded_sm()
-                                            .bg(secondary)
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .child(q.header.clone()),
-                                    )
-                                })
-                                .child(div().text_sm().text_color(fg).child(q.question.clone())),
-                        )
-                        .children(options)
-                        .when(pending, |el| {
-                            el.when_some(card.other[qi].as_ref(), |el, o| {
-                                el.child(Input::new(o).small()).child(crate::caret::overlay(o))
-                            })
                         })
+                        .child(div().text_sm().text_color(fg).child(q.question.clone()))
                 });
                 pad(div())
                     .child(
                         v_flex()
-                            .gap_3()
+                            .gap_2()
                             .p_3()
                             .rounded_md()
                             .border_1()
                             .border_color(if pending { accent } else { border })
-                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Claude is asking"))
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(if pending {
+                                "Claude is asking"
+                            } else {
+                                "Claude asked"
+                            }))
                             .children(questions)
                             .map(|el| match outcome {
                                 Some(outcome) => el.child(div().text_sm().text_color(muted).child(outcome.clone())),
@@ -2018,10 +1900,9 @@ impl ThreadView {
                                             Button::new(SharedString::from(format!("answer-{ix}")))
                                                 .primary()
                                                 .small()
-                                                .label("Answer")
-                                                .disabled(!complete)
+                                                .label("Answer…")
                                                 .on_click(
-                                                    cx.listener(move |this, _, _, cx| this.submit_answers(ix, cx)),
+                                                    cx.listener(move |this, _, _, cx| this.open_questions(ix, cx)),
                                                 ),
                                         )
                                         .child(
@@ -2369,7 +2250,9 @@ impl ThreadView {
             return self.render_intro(card, cx).into_any_element();
         }
 
+        let questions = self.render_questions(window, cx);
         v_flex()
+            .relative()
             .size_full()
             .bg(bg)
             .child(div().flex_1().min_h_0().child(transcript))
@@ -2390,6 +2273,7 @@ impl ThreadView {
                     // Same width and inset as the messages above, so the edges line up.
                     .child(div().w_full().max_w(px(MAX_CONVERSATION_WIDTH)).px_3().child(card)),
             )
+            .children(questions)
             .into_any_element()
     }
 
@@ -3087,28 +2971,23 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn a_question_is_answered_by_picking_an_option(cx: &mut TestAppContext) {
+    fn a_lone_question_is_sent_when_an_option_is_clicked(cx: &mut TestAppContext) {
         let (window, thread) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         let ix = first_card(&thread, fixture("2.1.331-question.jsonl"), cx);
-        cx.update(|window, cx| {
-            window.click(gpui_kit::SharedString::from(format!("option-{ix}-0-1")), cx);
-            window.render_frame(cx);
-            window.click(gpui_kit::SharedString::from(format!("answer-{ix}")), cx);
-        });
+        cx.update(|window, cx| window.click(gpui_kit::SharedString::from("question-option-0-1"), cx));
         let expected = std::collections::BTreeMap::from([(
             "Which colour do you prefer for a button?".to_string(),
             "Blue".to_string(),
         )]);
         assert_eq!(responses(&thread, cx), vec![Decision::Answer { answers: expected }]);
         assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)).as_deref(), Some("Answered: Blue"));
+        let prompt_focused = cx.update(|window, cx| thread.read(cx).prompt_focus(cx).is_focused(window));
+        assert!(prompt_focused, "the prompt box gets the keyboard back");
     }
 
-    #[gpui_kit::test]
-    fn multi_select_and_other_answers_are_combined_and_required(cx: &mut TestAppContext) {
-        let (window, thread) = open(cx);
-        let cx = &mut VisualTestContext::from_window(window, cx);
-        let request = crate::agent::PermissionRequest {
+    fn two_questions() -> AgentEvent {
+        AgentEvent::PermissionRequested(crate::agent::PermissionRequest {
             id: "q1".into(),
             tool_name: "AskUserQuestion".into(),
             tool_use_id: None,
@@ -3122,30 +3001,89 @@ mod tests {
             suggestions: Vec::new(),
             reason: None,
             no_standing_grant: false,
-        };
-        let ix = first_card(&thread, vec![AgentEvent::PermissionRequested(request)], cx);
-        cx.update(|window, cx| {
-            window.click(gpui_kit::SharedString::from(format!("option-{ix}-0-0")), cx);
-            window.click(gpui_kit::SharedString::from(format!("option-{ix}-0-1")), cx);
-            window.render_frame(cx);
-        });
-        // The second question isn't answered yet, so nothing can be sent.
-        thread.update(cx, |t, cx| t.submit_answers(ix, cx));
-        assert!(responses(&thread, cx).is_empty());
+        })
+    }
 
-        cx.update(|window, cx| {
-            let other = thread.read_with(cx, |t, _| match &t.rows[ix] {
-                super::Row::Approval(super::ApprovalRow { kind: super::ApprovalKind::Question(card), .. }) => {
-                    card.other[1].clone().unwrap()
-                }
-                _ => panic!("not a question card"),
-            });
-            other.update(cx, |o, cx| o.set_value("release/2.0", window, cx));
-        });
-        thread.update(cx, |t, cx| t.submit_answers(ix, cx));
+    fn current_question(thread: &Entity<ThreadView>, ix: usize, cx: &mut VisualTestContext) -> usize {
+        thread.read_with(cx, |t, _| match &t.rows[ix] {
+            super::Row::Approval(super::ApprovalRow { kind: super::ApprovalKind::Question(card), .. }) => card.current,
+            _ => panic!("not a question card"),
+        })
+    }
+
+    fn frame(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    #[gpui_kit::test]
+    fn questions_are_answered_from_the_keyboard(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let ix = first_card(&thread, vec![two_questions()], cx);
+        frame(cx);
+        // Space ticks options of a multi-select; Enter finishes it and opens the next question.
+        cx.simulate_keystrokes("space down space");
+        frame(cx);
+        cx.simulate_keystrokes("enter");
+        frame(cx);
+        assert_eq!(current_question(&thread, ix, cx), 1);
+        // Down past the options lands in the "Other" field, where typing (spaces included) works.
+        cx.simulate_keystrokes("down down");
+        frame(cx);
+        cx.simulate_input("release 2.0");
+        frame(cx);
+        assert!(responses(&thread, cx).is_empty(), "nothing is sent while typing");
+        cx.simulate_keystrokes("enter");
+        frame(cx);
+        assert_eq!(current_question(&thread, ix, cx), 2, "both answered: the review step");
+        // Back to the first question and forward again, then Enter sends.
+        cx.simulate_keystrokes("left");
+        frame(cx);
+        assert_eq!(current_question(&thread, ix, cx), 1);
+        cx.simulate_keystrokes("right");
+        frame(cx);
+        assert_eq!(current_question(&thread, ix, cx), 2);
+        cx.simulate_keystrokes("enter");
         let expected = std::collections::BTreeMap::from([
             ("Which checks?".to_string(), "Tests, Lint".to_string()),
-            ("Which branch?".to_string(), "release/2.0".to_string()),
+            ("Which branch?".to_string(), "release 2.0".to_string()),
+        ]);
+        assert_eq!(responses(&thread, cx), vec![Decision::Answer { answers: expected }]);
+    }
+
+    #[gpui_kit::test]
+    fn number_keys_pick_and_escape_closes_the_modal_until_it_is_reopened(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let ix = first_card(&thread, vec![two_questions()], cx);
+        frame(cx);
+        cx.simulate_keystrokes("2 enter");
+        frame(cx);
+        assert_eq!(current_question(&thread, ix, cx), 1);
+
+        // Escape from the "Other" field goes back to the options; from there it closes.
+        cx.simulate_keystrokes("up");
+        frame(cx);
+        cx.simulate_keystrokes("escape");
+        frame(cx);
+        let modal_open = cx.update(|window, _| window.try_find("question-modal").is_some());
+        assert!(modal_open, "the first Escape only leaves the field");
+        cx.simulate_keystrokes("escape");
+        frame(cx);
+        let modal_open = cx.update(|window, _| window.try_find("question-modal").is_some());
+        assert!(!modal_open, "the second closes the modal");
+        assert!(responses(&thread, cx).is_empty(), "closing doesn't answer");
+        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)), None, "the question still waits");
+
+        // The card in the conversation opens it again, with the answers so far.
+        cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("answer-{ix}")), cx));
+        frame(cx);
+        cx.simulate_keystrokes("1");
+        frame(cx);
+        cx.simulate_keystrokes("enter");
+        let expected = std::collections::BTreeMap::from([
+            ("Which checks?".to_string(), "Lint".to_string()),
+            ("Which branch?".to_string(), "main".to_string()),
         ]);
         assert_eq!(responses(&thread, cx), vec![Decision::Answer { answers: expected }]);
     }
