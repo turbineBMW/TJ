@@ -163,15 +163,34 @@ pub enum Decision {
     },
 }
 
-/// A usage window on a subscription, such as the 5-hour or 7-day limit.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// A usage limit on the account: a subscription's 5-hour or weekly window, or a spending limit.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageWindow {
-    /// The agent's name for the window, e.g. `five_hour` or `seven_day`.
+    /// `five_hour`, `seven_day`, `spend_monthly` (a spending limit for that period), or the
+    /// server's own name for a meter TJ doesn't know, with `:scope` for a scoped one.
     pub id: String,
     /// Fraction used, 0.0 to 1.0.
     pub utilization: f64,
     /// Unix seconds when the window resets.
     pub resets_at: Option<i64>,
+    /// The server's reading of it: `normal`, `warning` or `critical`.
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// What a scoped window is for, such as a model ("Fable").
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// For a spending limit: what's been spent and the cap.
+    #[serde(default)]
+    pub spend: Option<Spend>,
+}
+
+/// Money spent against a limit, in the currency's units (dollars, not cents).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Spend {
+    pub used: f64,
+    /// `None` when there's no cap.
+    pub limit: Option<f64>,
+    pub currency: String,
 }
 
 /// What happened in the session, in order.
@@ -216,6 +235,8 @@ pub enum AgentEvent {
         id: String,
     },
     Usage(Vec<UsageWindow>),
+    /// The account's plan, such as `max` or `enterprise`.
+    Plan(String),
     /// How full the context is: tokens in the latest request, and the model's window.
     Context {
         tokens: Option<u64>,
@@ -326,6 +347,10 @@ pub trait AgentSession {
     fn set_model(&self, model: Option<&str>) -> anyhow::Result<()>;
     /// Change effort for the rest of the session; `None` goes back to the model's default.
     fn set_effort(&self, effort: Option<&str>) -> anyhow::Result<()>;
+    /// Ask again for the account's usage limits; they arrive as [`AgentEvent::Usage`].
+    fn request_usage(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// An agent that plays back a fixed list of events and records what the UI sends it.

@@ -10,7 +10,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, button::Button, button
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::changes::{ChangeKind, ProjectChanges};
-use crate::thread::{self, ThreadView};
+use crate::thread::ThreadView;
 
 /// How wide the status column is.
 pub const STATUS_WIDTH: f32 = 340.0;
@@ -39,6 +39,7 @@ pub struct AgentSlot {
 impl AgentSlot {
     pub fn new(project_dir: PathBuf, changes: Entity<ProjectChanges>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&changes, |_, _, cx| cx.notify());
+        let usage = cx.observe_global::<crate::usage::Usage>(|_, cx| cx.notify());
         Self {
             thread: None,
             project_dir,
@@ -47,7 +48,7 @@ impl AgentSlot {
             // Until it's measured, assume there's room.
             width: px(f32::MAX),
             _thread_subscription: None,
-            _subscriptions: vec![observe],
+            _subscriptions: vec![observe, usage],
         }
     }
 
@@ -180,49 +181,180 @@ impl AgentSlot {
         )
     }
 
-    /// The agent's numbers, pinned to the bottom of the column: context, usage windows, cost
-    /// and model.
+    /// The agent's numbers, pinned to the bottom of the column: the account's usage limits as
+    /// meters (a subscription's 5-hour and weekly windows, or a spending limit), the context
+    /// window, and what the thread has cost. The model is left to the prompt card.
     fn metrics(&self, view: &Entity<ThreadView>, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = view.read(cx);
-        let mut stats = Vec::new();
-        if let (Some(tokens), Some(window)) = (t.context_tokens, t.context_window) {
-            let percent = tokens as f64 / window.max(1) as f64 * 100.0;
-            stats.push(format!("ctx {} / {} · {percent:.0}%", compact(tokens), compact(window)));
-        }
-        for window in &t.usage {
-            let name = match window.id.as_str() {
-                "five_hour" => "5h",
-                "seven_day" => "7d",
-                other => other,
+        let account = crate::usage::Usage::get(cx, &t.account_id).cloned().unwrap_or_default();
+        let (account_name, cost, context) = (t.account_name.clone(), t.cost_usd, (t.context_tokens, t.context_window));
+        let theme = cx.theme();
+        let (muted, fg, border) = (theme.muted_foreground, theme.foreground, theme.border);
+        let (warning, danger, primary) = (theme.warning, theme.danger, theme.primary);
+        let mono = theme.mono_font_family.clone();
+        let (ansi, _, _) = crate::terminal::palette(cx);
+        let now = chrono::Utc::now().timestamp();
+
+        // A meter's colour: its own hue while there's room, then the server's (or our) warning.
+        let tone = |hue: Hsla, fraction: f64, severity: Option<&str>| match severity {
+            Some("critical") => danger,
+            _ if fraction >= 0.9 => danger,
+            Some("warning") => warning,
+            _ if fraction >= 0.75 => warning,
+            _ => hue,
+        };
+        let bar = |fraction: f64, color: Hsla| {
+            let fraction = fraction.clamp(0.0, 1.0) as f32;
+            let hot = color == danger || color == warning;
+            div().h(px(6.)).w_full().rounded_full().bg(muted.opacity(0.18)).child(
+                div()
+                    .h_full()
+                    .rounded_full()
+                    .w(relative(fraction))
+                    .when(fraction > 0.0, |el| el.min_w(px(6.)))
+                    .bg(linear_gradient(90., linear_color_stop(color.opacity(0.55), 0.), linear_color_stop(color, 1.)))
+                    .when(hot, |el| {
+                        el.shadow(vec![BoxShadow {
+                            color: color.opacity(0.6),
+                            offset: point(px(0.), px(0.)),
+                            blur_radius: px(6.),
+                            spread_radius: px(0.),
+                            inset: false,
+                        }])
+                    }),
+            )
+        };
+        let meter = |emoji: &'static str,
+                     name: String,
+                     value: String,
+                     note: Option<String>,
+                     fraction: Option<f64>,
+                     color: Hsla| {
+            v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .text_xs()
+                        .child(div().w(px(18.)).child(emoji))
+                        .child(div().text_color(fg).font_weight(FontWeight::MEDIUM).child(name))
+                        .child(div().flex_1())
+                        .children(note.map(|note| div().text_color(muted).child(note)))
+                        .child(
+                            div()
+                                .font_family(mono.clone())
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if fraction.is_some() { color } else { fg })
+                                .child(value),
+                        ),
+                )
+                .children(fraction.map(|f| bar(f, color)))
+        };
+
+        let mut rows = Vec::new();
+        for (ix, window) in account.windows.iter().filter(|w| crate::usage::shown(w)).enumerate() {
+            let (emoji, name) = crate::usage::label(window);
+            // A window that has reset since it was reported has nothing used yet.
+            let reset = window.resets_at.is_some_and(|at| at <= now);
+            let fraction = if reset { 0.0 } else { window.utilization };
+            let hue = match window.id.as_str() {
+                "five_hour" => ansi[14],
+                "seven_day" => ansi[13],
+                id if id.starts_with("spend_") => ansi[10],
+                _ => [ansi[12], ansi[11], ansi[6]][ix % 3],
             };
-            stats.push(format!("{name} {:.0}%", window.utilization * 100.0));
+            let color = tone(hue, fraction, if reset { None } else { window.severity.as_deref() });
+            let resets = window.resets_at.and_then(|at| crate::usage::resets_in(at, now));
+            let (value, note) = match &window.spend {
+                Some(spend) => {
+                    let used = crate::usage::money(spend.used, &spend.currency);
+                    match spend.limit {
+                        Some(limit) => (
+                            format!("{:.0}%", fraction * 100.0),
+                            Some(format!("{used} / {}", crate::usage::money(limit, &spend.currency))),
+                        ),
+                        None => (used, resets),
+                    }
+                }
+                None => (format!("{:.0}%", fraction * 100.0), resets),
+            };
+            let capped = window.spend.as_ref().is_none_or(|s| s.limit.is_some());
+            rows.push(meter(emoji, name, value, note, capped.then_some(fraction), color).into_any_element());
         }
-        if t.cost_usd > 0.0 {
+        if let (Some(tokens), Some(window)) = context {
+            let fraction = tokens as f64 / window.max(1) as f64;
+            rows.push(
+                meter(
+                    "🧠",
+                    "Context".into(),
+                    format!("{:.0}%", fraction * 100.0),
+                    Some(format!("{} / {}", compact(tokens), compact(window))),
+                    Some(fraction),
+                    tone(ansi[12], fraction, None),
+                )
+                .into_any_element(),
+            );
+        }
+        if cost > 0.0 {
             // On a subscription this is Claude's estimate, not a charge.
-            let approx = if t.usage.is_empty() { "" } else { "≈" };
-            stats.push(if t.cost_usd < 1.0 {
-                format!("{approx}${:.3}", t.cost_usd)
-            } else {
-                format!("{approx}${:.2}", t.cost_usd)
-            });
+            let approx = if account.is_subscription() { "≈" } else { "" };
+            let amount = if cost < 1.0 { format!("{approx}${cost:.3}") } else { format!("{approx}${cost:.2}") };
+            let note = account.is_subscription().then(|| "estimate".to_string());
+            rows.push(meter("💵", "This thread".into(), amount, note, None, fg).into_any_element());
         }
-        if let Some(model) = &t.model {
-            stats.push(thread::short_model(model));
-        }
-        if stats.is_empty() {
+        if rows.is_empty() && account.plan.is_none() {
             return None;
         }
-        let theme = cx.theme();
+
+        let plan = account.plan.as_deref().map(|plan| match plan {
+            "max" => "Max".to_string(),
+            "pro" => "Pro".to_string(),
+            "team" => "Team".to_string(),
+            "enterprise" => "Enterprise".to_string(),
+            other => other.to_string(),
+        });
+        let badge = h_flex()
+            .gap_1()
+            .px_1p5()
+            .rounded_full()
+            .bg(primary.opacity(0.14))
+            .border_1()
+            .border_color(primary.opacity(0.35))
+            .text_xs()
+            .text_color(primary)
+            .child("👤")
+            .child(account_name)
+            .children(plan.map(|plan| div().font_weight(FontWeight::SEMIBOLD).child(format!("· {plan}"))));
+        let quiet = account
+            .windows
+            .is_empty()
+            .then(|| div().text_xs().text_color(muted).child("No usage limits reported for this account yet."));
         Some(
-            div()
+            v_flex()
+                .id("metrics")
+                .test_support()
                 .flex_none()
+                .gap_2()
                 .px_3()
-                .py_2()
+                .pt_2()
+                .pb_3()
                 .border_t_1()
-                .border_color(theme.border)
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(stats.join("  ·  "))
+                .border_color(border)
+                .bg(linear_gradient(
+                    180.,
+                    linear_color_stop(primary.opacity(0.0), 0.),
+                    linear_color_stop(primary.opacity(0.06), 1.),
+                ))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div().flex_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(muted).child("USAGE"),
+                        )
+                        .child(badge),
+                )
+                .children(quiet)
+                .children(rows)
                 .into_any_element(),
         )
     }
