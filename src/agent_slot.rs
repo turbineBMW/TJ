@@ -15,8 +15,8 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use crate::changes::{ChangeKind, ProjectChanges};
 use crate::thread::ThreadView;
 
-/// How wide the status column is.
-pub const STATUS_WIDTH: f32 = 340.0;
+/// How wide the status column is: as wide as the sidebar, so the two sides match.
+pub const STATUS_WIDTH: f32 = crate::workspace::SIDEBAR_WIDTH;
 
 pub enum AgentSlotEvent {
     /// Open the review, scrolled to this file if given.
