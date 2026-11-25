@@ -7206,6 +7206,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "base64",
+ "chrono",
  "gpui-kit",
  "image",
  "miniz_oxide 0.8.9",

@@ -10,6 +10,7 @@ mod demo;
 mod grow;
 mod handoff;
 mod highlight;
+mod history;
 mod images;
 mod keymap;
 mod omarchy;

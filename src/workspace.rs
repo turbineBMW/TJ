@@ -23,13 +23,20 @@ use crate::panes::{PaneEvent, Panes, Start};
 use crate::settings::Settings;
 use crate::store::SplitDirection;
 use crate::store::{self, Accounts, Paths, State};
-use crate::thread::{self, Backend, MenuContext, Status, ThreadAction, ThreadChanged, ThreadSetup, ThreadView};
+use crate::thread::{
+    self, Backend, MenuContext, Status, ThreadAction, ThreadChanged, ThreadSent, ThreadSetup, ThreadView,
+};
 use gpui_kit::assets::IconName;
 
 const SIDEBAR_WIDTH: f32 = 264.0;
 const HEADER_HEIGHT: f32 = 46.0;
 /// The agent mark at the end of a thread's row in the sidebar.
 const MARK_SIZE: f32 = 14.0;
+/// An idle thread's Claude process (about 300 MB) is stopped after this long; the next
+/// message resumes the session in a new one.
+const IDLE_STOP: Duration = Duration::from_secs(10 * 60);
+/// At most this many idle Claude processes are kept, the most recently used.
+const IDLE_KEEP: usize = 3;
 
 /// How the workspace starts.
 #[derive(Default)]
@@ -89,6 +96,8 @@ pub struct Workspace {
     /// Per project: the icon found in its folder, once looked for (`None` inside: there isn't one).
     found_icons: HashMap<String, Option<PathBuf>>,
     _subscriptions: Vec<Subscription>,
+    /// Checks every minute for Claude processes idle long enough to stop.
+    _idle_check: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -152,7 +161,16 @@ impl Workspace {
             opacity_slider,
             glide_slider,
             _subscriptions: vec![slider_events, glide_events],
+            _idle_check: None,
         };
+        this._idle_check = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(60)).await;
+                if this.update(cx, |w: &mut Workspace, cx| w.stop_idle_processes(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
 
         // Open the requested folder, or the current one when there are no projects yet.
         let folder = launch.project.or_else(|| this.state.projects.is_empty().then(thread::default_cwd));
@@ -249,9 +267,17 @@ impl Workspace {
             let id = thread_id.to_string();
             self._subscriptions.push(cx.subscribe(&thread, move |this, _, _: &ThreadChanged, cx| {
                 this.sync_thread(&id, cx);
+                // A turn that just ended may put one idle process over the limit.
+                this.stop_idle_processes(cx);
                 if let Some(changes) = this.state.thread(&id).and_then(|(p, _)| this.changes.get(&p.id)).cloned() {
                     changes.update(cx, |c, cx| c.refresh(cx));
                 }
+                cx.notify();
+            }));
+            let id = thread_id.to_string();
+            self._subscriptions.push(cx.subscribe(&thread, move |this, _, _: &ThreadSent, cx| {
+                this.state.touch_thread(&id);
+                this.save();
                 cx.notify();
             }));
             let id = thread_id.to_string();
@@ -354,7 +380,7 @@ impl Workspace {
     }
 
     /// Show a thread in its project's agent tab, in place of the one there.
-    fn open_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.ensure_thread(thread_id, window, cx) else { return };
         let Some(project_id) = self.state.thread(thread_id).map(|(p, _)| p.id.clone()) else { return };
         self.active = Some(thread_id.to_string());
@@ -561,6 +587,50 @@ impl Workspace {
             Some(id) => self.open_thread(&id, window, cx),
             None => self.state.selected_thread = None,
         }
+    }
+
+    // ---------- idle processes ----------
+
+    /// Stop the Claude processes [`processes_to_stop`] picks, to free their memory.
+    fn stop_idle_processes(&mut self, cx: &mut Context<Self>) {
+        let idle: Vec<(String, Duration, bool)> = self
+            .threads
+            .iter()
+            .filter_map(|(id, t)| t.read(cx).idle_for().map(|d| (id.clone(), d, self.active.as_ref() == Some(id))))
+            .collect();
+        for id in processes_to_stop(idle) {
+            if let Some(thread) = self.threads.get(&id) {
+                thread.update(cx, |t, _| t.stop_idle_process());
+            }
+        }
+    }
+
+    // ---------- history ----------
+
+    /// A thread the sidebar lists even past its first few: the open one, one being renamed,
+    /// and one working or waiting for the user, so none of those is lost in the history.
+    fn pinned(&self, meta: &store::ThreadMeta, cx: &App) -> bool {
+        self.active.as_deref() == Some(meta.id.as_str())
+            || self.renaming.as_ref().is_some_and(|(id, _)| *id == meta.id)
+            || self.threads.get(&meta.id).is_some_and(|t| t.read(cx).status != Status::Idle)
+    }
+
+    /// The project's threads the sidebar doesn't list, last touched first. Only their saved
+    /// details: a thread's conversation is read when it's opened.
+    pub(crate) fn history(&self, project_id: &str, cx: &App) -> Vec<store::ThreadMeta> {
+        let Some(project) = self.state.project(project_id) else { return Vec::new() };
+        store::split_threads(&project.threads, |t| self.pinned(t, cx)).1.into_iter().cloned().collect()
+    }
+
+    fn open_history(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.state.project(project_id).map(|p| p.name.clone()) else { return };
+        let workspace = cx.entity().downgrade();
+        let id = project_id.to_string();
+        let view = cx.new(|cx| crate::history::HistoryView::new(workspace, id, window, cx));
+        let title = SharedString::from(format!("{name} history"));
+        let shown = view.clone();
+        window.open_dialog(cx, move |dialog, _, _| dialog.w(px(560.)).title(title.clone()).child(shown.clone()));
+        view.update(cx, |v, cx| v.focus(window, cx));
     }
 
     fn new_thread(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1137,7 +1207,9 @@ impl Workspace {
         let mut projects = Vec::new();
         for project in &self.state.projects {
             let project_id = project.id.clone();
-            let open: Vec<_> = project.threads.iter().filter(|t| !t.archived).map(|t| thread_row(t, cx)).collect();
+            let (shown, history) = store::split_threads(&project.threads, |t| self.pinned(t, cx));
+            let history = history.len();
+            let open: Vec<_> = shown.into_iter().map(|t| thread_row(t, cx)).collect();
             let archived: Vec<&store::ThreadMeta> = project.threads.iter().filter(|t| t.archived).collect();
             let showing_archived = self.show_archived.contains(&project.id);
             let archived_rows: Vec<_> =
@@ -1160,6 +1232,7 @@ impl Workspace {
                 }
             };
             let toggle_id = project.id.clone();
+            let history_id = project.id.clone();
             projects.push(
                 v_flex()
                     .pb_2()
@@ -1198,6 +1271,28 @@ impl Workspace {
                             .context_menu(header_menu),
                     )
                     .children(open)
+                    .when(history > 0, |el| {
+                        el.child(
+                            h_flex()
+                                .id(SharedString::from(format!("history-{}", project.id)))
+                                .test_support()
+                                .gap_1p5()
+                                .mx_2()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(muted)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(accent_bg.opacity(0.6)))
+                                .child(gpui_kit::component::Icon::new(IconName::Clock).xsmall())
+                                .child(div().flex_1().child("History"))
+                                .child(format!("{history} more"))
+                                .on_click(
+                                    cx.listener(move |this, _, window, cx| this.open_history(&history_id, window, cx)),
+                                ),
+                        )
+                    })
                     .when(!archived.is_empty(), |el| {
                         el.child(
                             div()
@@ -1490,6 +1585,23 @@ impl Render for Workspace {
     }
 }
 
+/// Which idle Claude processes to stop, given each thread's id, how long its process has been
+/// idle, and whether it's the thread on screen: any idle for [`IDLE_STOP`], then the longest
+/// idle past the [`IDLE_KEEP`] used last. The thread on screen is only stopped by time.
+fn processes_to_stop(mut idle: Vec<(String, Duration, bool)>) -> Vec<String> {
+    idle.sort_by_key(|(_, for_, _)| *for_);
+    let mut kept = 0;
+    let mut stop = Vec::new();
+    for (id, for_, shown) in idle {
+        if for_ < IDLE_STOP && (shown || kept < IDLE_KEEP) {
+            kept += 1;
+        } else {
+            stop.push(id);
+        }
+    }
+    stop
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Launch, Workspace};
@@ -1738,6 +1850,62 @@ mod tests {
         assert!(workspace.read_with(cx, |w, _| w.show_archived.contains(&project_id)));
         workspace.update_in(cx, |w, window, cx| w.set_archived(&second, false, window, cx));
         assert!(!State::load(&paths).unwrap().projects[0].threads.iter().any(|t| t.archived));
+    }
+
+    #[test]
+    fn idle_processes_past_the_time_or_the_limit_are_stopped() {
+        use super::processes_to_stop;
+        use std::time::Duration;
+        let min = |m: u64| Duration::from_secs(m * 60);
+        let idle = |list: &[(&str, u64, bool)]| {
+            let mut stop =
+                processes_to_stop(list.iter().map(|(id, m, shown)| (id.to_string(), min(*m), *shown)).collect());
+            stop.sort();
+            stop
+        };
+        assert!(idle(&[("a", 1, false), ("b", 2, false), ("c", 3, false)]).is_empty());
+        assert_eq!(idle(&[("a", 1, false), ("b", 12, false)]), vec!["b"], "idle too long");
+        assert_eq!(
+            idle(&[("a", 1, false), ("b", 2, false), ("c", 3, false), ("d", 4, false), ("e", 5, false)]),
+            vec!["d", "e"],
+            "past the three used last"
+        );
+        // The thread on screen is kept past the limit, but not past the time.
+        assert_eq!(idle(&[("a", 1, false), ("b", 2, false), ("c", 3, false), ("d", 4, true)]), Vec::<String>::new());
+        assert_eq!(idle(&[("a", 1, false), ("d", 11, true)]), vec!["d"]);
+    }
+
+    #[gpui_kit::test]
+    fn older_threads_are_opened_from_the_history(cx: &mut TestAppContext) {
+        let (window, workspace, _, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (project_id, oldest) =
+            workspace.read_with(cx, |w, _| (w.state.projects[0].id.clone(), w.active.clone().unwrap()));
+        for _ in 0..6 {
+            workspace.update_in(cx, |w, window, cx| w.new_thread(&project_id, window, cx));
+        }
+        let history = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |w, cx| w.history(&project_id, cx).into_iter().map(|t| t.id).collect::<Vec<_>>())
+        };
+        // Seven threads: the sidebar lists five, the history the two oldest.
+        assert_eq!(history(cx).len(), 2);
+        assert!(history(cx).contains(&oldest));
+
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from(format!("history-{project_id}")), cx);
+            window.render_frame(cx);
+        });
+        assert!(cx.update(gpui_kit::component::WindowExt::has_active_dialog));
+        cx.update(|window, cx| {
+            window.click(SharedString::from(format!("history-thread-{oldest}")), cx);
+            window.render_frame(cx);
+        });
+        assert!(!cx.update(gpui_kit::component::WindowExt::has_active_dialog), "opening one closes the history");
+        assert_eq!(workspace.read_with(cx, |w, _| w.active.clone()), Some(oldest.clone()));
+        // While it's open the sidebar lists it, so the history no longer does.
+        assert!(!history(cx).contains(&oldest));
+        assert_eq!(history(cx).len(), 1);
     }
 
     #[gpui_kit::test]

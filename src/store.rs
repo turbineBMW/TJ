@@ -221,6 +221,29 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+/// How many of a project's threads the sidebar lists; the rest are in its history.
+pub const SIDEBAR_THREADS: usize = 5;
+
+/// A project's unarchived threads, split into those the sidebar lists and those only its
+/// history shows. The sidebar takes the first [`SIDEBAR_THREADS`], plus any later one `pinned`
+/// keeps there (the open thread, one working or waiting for the user). History is newest
+/// first by when each thread was last touched.
+pub fn split_threads(
+    threads: &[ThreadMeta],
+    pinned: impl Fn(&ThreadMeta) -> bool,
+) -> (Vec<&ThreadMeta>, Vec<&ThreadMeta>) {
+    let (mut shown, mut history) = (Vec::new(), Vec::new());
+    for (ix, meta) in threads.iter().filter(|t| !t.archived).enumerate() {
+        if ix < SIDEBAR_THREADS || pinned(meta) {
+            shown.push(meta);
+        } else {
+            history.push(meta);
+        }
+    }
+    history.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
+    (shown, history)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -384,6 +407,18 @@ impl State {
             },
         );
         Some(id)
+    }
+
+    /// The user just messaged the thread: it was touched now and goes to the top of its
+    /// project, so the sidebar's short list is always the threads used last.
+    pub fn touch_thread(&mut self, thread_id: &str) {
+        let Some(project) = self.projects.iter_mut().find(|p| p.threads.iter().any(|t| t.id == thread_id)) else {
+            return;
+        };
+        let ix = project.threads.iter().position(|t| t.id == thread_id).unwrap();
+        let mut meta = project.threads.remove(ix);
+        meta.updated_at = now();
+        project.threads.insert(0, meta);
     }
 
     /// Forget a thread. Its files are deleted separately ([`Paths::delete_thread_files`]).
@@ -564,6 +599,37 @@ mod tests {
         let text = fs::read_to_string(paths.state_file()).unwrap();
         assert!(text.contains("\"acceptEdits\""));
         assert_eq!(State::load(&paths).unwrap(), state);
+    }
+
+    #[test]
+    fn the_sidebar_lists_five_threads_and_history_holds_the_rest() {
+        let mut state = State::default();
+        let project = state.add_project(&temp_dir("split")).id.clone();
+        // Eight threads; the newest is first. Each was touched one second after the last.
+        let ids: Vec<String> = (0..8).map(|_| state.new_thread(&project).unwrap()).collect();
+        for (n, id) in ids.iter().enumerate() {
+            state.thread_mut(id).unwrap().updated_at = n as u64;
+        }
+        state.thread_mut(&ids[3]).unwrap().archived = true;
+        let threads = &state.project(&project).unwrap().threads;
+        let names = |list: Vec<&ThreadMeta>| list.into_iter().map(|t| t.id.clone()).collect::<Vec<_>>();
+
+        let (shown, history) = split_threads(threads, |_| false);
+        assert_eq!(names(shown), vec![ids[7].clone(), ids[6].clone(), ids[5].clone(), ids[4].clone(), ids[2].clone()]);
+        assert_eq!(names(history), vec![ids[1].clone(), ids[0].clone()], "archived threads are in neither");
+
+        // A pinned thread from history stays in the sidebar, after the five.
+        let (shown, history) = split_threads(threads, |t| t.id == ids[0]);
+        assert_eq!(shown.len(), 6);
+        assert_eq!(shown[5].id, ids[0]);
+        assert_eq!(names(history), vec![ids[1].clone()]);
+
+        // Messaging a thread from history brings it back to the top.
+        state.touch_thread(&ids[0]);
+        let threads = &state.project(&project).unwrap().threads;
+        assert_eq!(threads[0].id, ids[0]);
+        assert!(threads[0].updated_at > 7);
+        assert_eq!(names(split_threads(threads, |_| false).1), vec![ids[2].clone(), ids[1].clone()]);
     }
 
     #[test]

@@ -34,6 +34,11 @@ pub struct ThreadChanged;
 
 impl EventEmitter<ThreadChanged> for ThreadView {}
 
+/// The user sent the thread a message, so it moves to the top of its project.
+pub struct ThreadSent;
+
+impl EventEmitter<ThreadSent> for ThreadView {}
+
 /// Something the composer's menus ask the workspace to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ThreadAction {
@@ -325,6 +330,13 @@ pub struct ThreadView {
     backend: Option<Backend>,
     agent: Option<Box<dyn AgentSession>>,
     _pump: Option<Task<()>>,
+    /// Background work the running process started (shells, subagents, monitors). Stopping
+    /// the process would end it, so a process with any is never stopped for being idle.
+    background: HashSet<String>,
+    /// When the process last did something or was sent something.
+    last_active: std::time::Instant,
+    /// The "newer than tested" warning was shown; a resumed process doesn't repeat it.
+    version_warned: bool,
     /// The assistant text row that deltas go to.
     current_text: Option<usize>,
     pub status: Status,
@@ -405,6 +417,9 @@ impl ThreadView {
             backend: Some(backend),
             agent: None,
             _pump: None,
+            background: HashSet::new(),
+            last_active: std::time::Instant::now(),
+            version_warned: false,
             current_text: None,
             status: Status::Idle,
             working: None,
@@ -701,6 +716,7 @@ impl ThreadView {
         let (images, previews): (Vec<_>, Vec<_>) = attachments.into_iter().map(|a| (a.image, a.preview)).unzip();
         self.push_prompt_row(text, previews, cx);
         self.write(Record::Prompt { text: text.to_string(), images: saved });
+        cx.emit(ThreadSent);
         if self.title.is_none() {
             self.title = Some(if text.is_empty() { "Image".into() } else { title_from(text) });
         }
@@ -730,6 +746,7 @@ impl ThreadView {
         }
         self.handoff = None;
         self.status = Status::Running;
+        self.last_active = std::time::Instant::now();
         self.start_overview_ticker(cx);
         cx.emit(ThreadChanged);
         cx.notify();
@@ -1418,6 +1435,56 @@ impl ThreadView {
         Ok(self.agent.as_deref().expect("agent was just set"))
     }
 
+    /// Note work the process keeps doing after its turn ends.
+    fn track_background(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::ToolStarted { id, name, input } => {
+                if name == "Monitor" || input.get("run_in_background").and_then(Value::as_bool) == Some(true) {
+                    self.background.insert(id.clone());
+                }
+            }
+            // A background subagent reports when it's done; a background shell doesn't, so its
+            // process stays until TJ quits.
+            AgentEvent::SubagentFinished { tool_use_id, .. } => {
+                self.background.remove(tool_use_id);
+            }
+            AgentEvent::Exited { .. } => self.background.clear(),
+            _ => {}
+        }
+    }
+
+    /// How long the Claude process has had nothing to do, when stopping it now loses nothing:
+    /// the turn is over, nothing waits on the user or runs in the background. `None` when there
+    /// is no process to stop.
+    pub fn idle_for(&self) -> Option<std::time::Duration> {
+        let stoppable = self.agent.is_some()
+            && matches!(self.backend, Some(Backend::Claude(_)))
+            && self.status == Status::Idle
+            && self.background.is_empty()
+            && self.queued.is_none()
+            && self.summarizing.is_none()
+            && !self.has_pending_approval();
+        stoppable.then(|| self.last_active.elapsed())
+    }
+
+    /// Stop the idle Claude process to free its memory. The conversation stays on screen, and
+    /// the next message resumes the session in a new process with the thread's current model,
+    /// effort, mode and account.
+    pub fn stop_idle_process(&mut self) {
+        if self.idle_for().is_none() {
+            return;
+        }
+        // Dropping the session kills the process; with the pump gone its exit isn't reported.
+        self.agent = None;
+        self._pump = None;
+        self.current_text = None;
+    }
+
+    #[cfg(test)]
+    pub fn has_agent(&self) -> bool {
+        self.agent.is_some()
+    }
+
     #[cfg(test)]
     /// Use a scripted agent that is already running (tests).
     pub fn attach_scripted(&mut self, agent: ScriptedAgent) {
@@ -1436,6 +1503,10 @@ impl ThreadView {
             AgentEvent::Started { .. } | AgentEvent::Exited { .. } | AgentEvent::Usage(_) => {}
             AgentEvent::TextDelta(text) if !self.replaying => self.pending_text.push_str(text),
             _ => self.write(Record::Event { event: event.clone() }),
+        }
+        if !self.replaying {
+            self.last_active = std::time::Instant::now();
+            self.track_background(&event);
         }
         let status_before = self.status;
         let session_before = self.session_id.clone();
@@ -1457,7 +1528,8 @@ impl ThreadView {
         }
         match event {
             AgentEvent::Started { version, permission_mode } => {
-                if let Some(version) = version.filter(|v| claude::is_newer_than_tested(v)) {
+                if let Some(version) = version.filter(|v| !self.version_warned && claude::is_newer_than_tested(v)) {
+                    self.version_warned = true;
                     self.notice(
                         NoticeKind::Warning,
                         format!(
@@ -2682,6 +2754,34 @@ mod tests {
         assert!(prompt.contains("Claude: It opens the window."));
         assert!(prompt.ends_with("And store.rs?"));
         assert!(!thread.read_with(cx, |t, _| t.has_pending_handoff()), "the handoff is sent once");
+    }
+
+    #[gpui_kit::test]
+    fn an_idle_process_is_stopped_only_when_nothing_runs_in_it(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let finished = || AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, error: None };
+        thread.update(cx, |t, cx| {
+            // Only a Claude process is stopped; the scripted agent stands in for its session.
+            t.backend = Some(Backend::Claude(Default::default()));
+            t.send("Look around", cx);
+            assert_eq!(t.idle_for(), None, "a turn is running");
+            let input = serde_json::json!({ "description": "survey", "run_in_background": true });
+            t.handle(AgentEvent::ToolStarted { id: "bg".into(), name: "Agent".into(), input }, cx);
+            t.handle(finished(), cx);
+            assert_eq!(t.idle_for(), None, "a background subagent still works in the process");
+            t.stop_idle_process();
+            assert!(t.has_agent(), "so it isn't stopped");
+
+            t.handle(
+                AgentEvent::SubagentFinished { tool_use_id: "bg".into(), status: "completed".into(), summary: None },
+                cx,
+            );
+            assert!(t.idle_for().is_some());
+            t.stop_idle_process();
+            assert!(!t.has_agent());
+            assert_eq!(t.idle_for(), None, "nothing left to stop");
+        });
     }
 
     /// A thread with one exchange that has just switched to Work, with the summary still
