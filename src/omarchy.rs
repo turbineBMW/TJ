@@ -234,16 +234,18 @@ impl Palette {
         }
     }
 
-    /// The palette as a gpui-kit theme. The window's surfaces are Chrome's for the theme, as
-    /// Omarchy themes Chromium ([`chrome_colors`]): the frame (sidebar, top bar, tabs not on
-    /// show), the content and the tab on show, and the address bar's colour for fields and
-    /// cards. The rest follows Bubo's libadwaita mapping: hairlines at the lowest opacity that
-    /// still reads, and a light theme's foreground turned into ink.
+    /// The palette as a gpui-kit theme. The content is the theme's own background, as in its
+    /// terminal; around it the surfaces are Chrome's for the theme, as Omarchy themes Chromium
+    /// ([`chrome_colors`]): the frame (sidebar, top bar, tabs not on show), the tab on show,
+    /// and the address bar's colour for fields and cards. The rest follows Bubo's libadwaita
+    /// mapping: hairlines at the lowest opacity that still reads, and a light theme's
+    /// foreground turned into ink.
     fn theme_config(&self, name: &str, font_family: Option<&str>) -> ThemeConfig {
         let c = |key: &str, fallback: &str| self.get(key, fallback);
         let seed = c("background", "#1d1d20");
         let window = chrome_colors(&seed, self.light);
-        let bg = window.as_ref().map_or_else(|| seed.clone(), |w| w.base.clone());
+        let bg = seed.clone();
+        let shown_tab = window.as_ref().map_or_else(|| seed.clone(), |w| w.base.clone());
         let fg = c("foreground", "#d0cfcc");
         let fg = if self.light { ink(&fg, &bg) } else { fg };
         let accent = c("accent", "blue");
@@ -293,7 +295,7 @@ impl Palette {
         set("tab_bar.background", chrome.clone());
         set("tab.background", chrome.clone());
         set("tab.foreground", tab_fg);
-        set("tab.active.background", bg.clone());
+        set("tab.active.background", shown_tab);
         set("tab.active.foreground", fg.clone());
         set("title_bar.border", border.clone());
         set("popover.background", if self.light { raised } else { chrome.clone() });
@@ -686,9 +688,9 @@ blue = "#509475"
         assert_eq!(config["mode"], "dark");
         assert_eq!(config["font.family"], "Noto Sans");
         assert_eq!(colors["primary.background"], "#509475");
-        // The surfaces are Chrome's for the theme's background (#111c18).
+        // The content is the theme's background; the surfaces around it are Chrome's for it.
         let chrome = chrome_colors("#111c18", false).unwrap();
-        assert_eq!(colors["background"], chrome.base.as_str());
+        assert_eq!(colors["background"], "#111c18");
         assert_eq!(colors["tab.active.background"], chrome.base.as_str());
         assert_eq!(colors["sidebar.background"], chrome.header.as_str());
         assert_eq!(colors["tab.background"], chrome.header.as_str());

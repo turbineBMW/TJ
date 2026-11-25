@@ -1,7 +1,7 @@
 //! Terminal spike: alacritty_terminal does the PTY and VT parsing, and this
 //! view draws its grid with gpui text runs and turns key presses into bytes.
 
-use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, ops::Range, path::PathBuf, sync::Arc};
 
 use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, Notify, OnResize, WindowSize},
@@ -81,6 +81,8 @@ pub struct TerminalView {
     focus: FocusHandle,
     size: GridSize,
     cell: Size<Pixels>,
+    /// The monospace family `cell` was measured in; another one (Settings) measures again.
+    cell_font: SharedString,
     title: Option<String>,
     exited: bool,
     /// The shell's process id, for reading its working directory.
@@ -179,6 +181,7 @@ impl TerminalView {
                 focus: cx.focus_handle(),
                 size,
                 cell,
+                cell_font: cx.theme().mono_font_family.clone(),
                 title: None,
                 exited: false,
                 pid,
@@ -259,12 +262,17 @@ impl TerminalView {
         self.notifier.notify(bytes);
     }
 
-    /// Moving to a screen with another scale changes the pixel sizes apps were told.
-    fn sync_scale(&mut self, scale: f32) {
-        if scale == self.scale {
+    /// Another monospace font (Settings) or another display scale (the window moved screens)
+    /// gives cells of another size: measure them, and tell apps the new pixel sizes. The grid
+    /// gets its new columns from the next layout.
+    fn sync_cell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let scale = window.scale_factor();
+        if cx.theme().mono_font_family == self.cell_font && scale == self.scale {
             return;
         }
+        self.cell_font = cx.theme().mono_font_family.clone();
         self.scale = scale;
+        self.cell = cell_size(window, cx);
         {
             let mut g = self.geometry.lock().unwrap();
             g.scale = scale;
@@ -380,11 +388,25 @@ fn mono_font(cx: &App) -> Font {
     font(cx.theme().mono_font_family.clone())
 }
 
+/// A cell is a whole number of device pixels each way, as in VTE and Alacritty, so every
+/// glyph starts on a pixel and its stems stay sharp (a fractional width puts each letter at
+/// another fraction of a pixel, and the rasterizer smears it across two).
 fn cell_size(window: &mut Window, cx: &App) -> Size<Pixels> {
     let font_id = window.text_system().resolve_font(&mono_font(cx));
     let width =
-        window.text_system().advance(font_id, px(FONT_SIZE), 'm').map(|s| s.width).unwrap_or(px(FONT_SIZE * 0.6));
-    size(width, px((FONT_SIZE * LINE_HEIGHT).round()))
+        window.text_system().advance(font_id, px(FONT_SIZE), 'm').map(|s| s.width.into()).unwrap_or(FONT_SIZE * 0.6);
+    let scale = window.scale_factor();
+    let device = |v: f32| px((v * scale).round().max(1.0) / scale);
+    size(device(width), device(FONT_SIZE * LINE_HEIGHT))
+}
+
+/// `v` moved to the nearest device pixel.
+fn snap(v: Pixels, scale: f32) -> Pixels {
+    px((f32::from(v) * scale).round() / scale)
+}
+
+fn snap_point(p: gpui_kit::Point<Pixels>, scale: f32) -> gpui_kit::Point<Pixels> {
+    point(snap(p.x, scale), snap(p.y, scale))
 }
 
 /// The size the PTY reports to apps. Cells are in device pixels, so image tools send pictures
@@ -535,6 +557,118 @@ fn rgb_to_hsla(c: Rgb) -> Hsla {
     Rgba { r: c.r as f32 / 255.0, g: c.g as f32 / 255.0, b: c.b as f32 / 255.0, a: 1.0 }.into()
 }
 
+/// One row of the grid, ready to paint. Its text is shaped as a line, so the font's shaping
+/// still applies, but each cell's glyphs are drawn at the cell's own column rather than where
+/// the font's advances would put them: cells are whole device pixels, so every glyph lands on
+/// a pixel (sharp, as in VTE), and wide characters keep the columns after them in place.
+#[derive(Default)]
+struct GridLine {
+    text: String,
+    /// The fonts to shape `text` in (bold and italic runs); their colours aren't used.
+    runs: Vec<TextRun>,
+    /// Each cell's first byte in `text`, its column and its colour, in order.
+    cells: Vec<(usize, usize, Hsla)>,
+    backgrounds: Vec<(Range<usize>, Hsla)>,
+    /// Colour, and whether it's a curly underline.
+    underlines: Vec<(Range<usize>, (Hsla, bool))>,
+    strikethroughs: Vec<(Range<usize>, Hsla)>,
+}
+
+/// Where text sits in a cell, measured once for the monospace font.
+#[derive(Clone, Copy)]
+struct LineMetrics {
+    ascent: Pixels,
+    descent: Pixels,
+}
+
+impl LineMetrics {
+    fn of(font: &Font, window: &Window) -> Self {
+        let text = window.text_system();
+        let id = text.resolve_font(font);
+        // The font's descent is below the baseline, so negative; lines measure it as a distance.
+        Self { ascent: text.ascent(id, px(FONT_SIZE)), descent: text.descent(id, px(FONT_SIZE)).abs() }
+    }
+}
+
+/// Add `cols` to the last span when it carries on from it with the same value.
+fn push_span<T: PartialEq>(spans: &mut Vec<(Range<usize>, T)>, cols: Range<usize>, value: T) {
+    match spans.last_mut() {
+        Some((last, v)) if last.end == cols.start && *v == value => last.end = cols.end,
+        _ => spans.push((cols, value)),
+    }
+}
+
+impl GridLine {
+    fn push(&mut self, col: usize, ch: char, zerowidth: Option<&[char]>, color: Hsla, font: Font) {
+        let start = self.text.len();
+        self.text.push(ch);
+        if let Some(extra) = zerowidth {
+            self.text.extend(extra.iter());
+        }
+        self.cells.push((start, col, color));
+        let len = self.text.len() - start;
+        match self.runs.last_mut() {
+            Some(last) if last.font == font => last.len += len,
+            _ => self.runs.push(TextRun {
+                len,
+                font,
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }),
+        }
+    }
+
+    /// Paint the row with its top-left corner at `origin`, which must be on a device pixel.
+    fn paint(&self, origin: gpui_kit::Point<Pixels>, cell: Size<Pixels>, m: LineMetrics, window: &mut Window) {
+        let span = |cols: &Range<usize>| (origin.x + cell.width * cols.start as f32, cell.width * cols.len() as f32);
+        for (cols, color) in &self.backgrounds {
+            let (x, width) = span(cols);
+            window.paint_quad(fill(Bounds::new(point(x, origin.y), size(width, cell.height)), *color));
+        }
+
+        let scale = window.scale_factor();
+        let baseline = snap(origin.y + (cell.height - m.ascent - m.descent) / 2. + m.ascent, scale);
+        if !self.text.trim().is_empty() {
+            let font_size = px(FONT_SIZE);
+            let shaped = window.text_system().shape_line(self.text.clone().into(), font_size, &self.runs, None);
+            // A cell's first glyph goes at its column; any more (combining marks) keep their
+            // offset from it.
+            let (mut current, mut first_x) = (usize::MAX, px(0.));
+            for run in &shaped.runs {
+                for glyph in &run.glyphs {
+                    let ix = self.cells.partition_point(|c| c.0 <= glyph.index).saturating_sub(1);
+                    let (_, col, color) = self.cells[ix];
+                    if ix != current {
+                        (current, first_x) = (ix, glyph.position.x);
+                    }
+                    let x = origin.x + cell.width * col as f32 + (glyph.position.x - first_x);
+                    let at = point(x, baseline + glyph.position.y);
+                    let _ = if glyph.is_emoji {
+                        window.paint_emoji(at, run.font_id, glyph.id, font_size)
+                    } else {
+                        window.paint_glyph(at, run.font_id, glyph.id, font_size, color)
+                    };
+                }
+            }
+        }
+
+        let padding = (cell.height - m.ascent - m.descent) / 2.;
+        let underline_y = origin.y + padding + m.ascent + m.descent * 0.618;
+        for (cols, (color, wavy)) in &self.underlines {
+            let (x, width) = span(cols);
+            let style = UnderlineStyle { thickness: px(1.0), color: Some(*color), wavy: *wavy };
+            window.paint_underline(point(x, underline_y), width, &style);
+        }
+        for (cols, color) in &self.strikethroughs {
+            let (x, width) = span(cols);
+            let style = StrikethroughStyle { thickness: px(1.0), color: Some(*color) };
+            window.paint_strikethrough(point(x, baseline - m.ascent * 0.3), width, &style);
+        }
+    }
+}
+
 struct Palette<'a> {
     colors: &'a Colors,
     ansi: [Rgb; 16],
@@ -631,7 +765,8 @@ impl TerminalView {
         let quad = canvas(
             |_, _, _| {},
             move |bounds, _, window, _| {
-                let at = Bounds::new(look.bounds.origin + bounds.origin, look.bounds.size);
+                let origin = snap_point(bounds.origin, window.scale_factor());
+                let at = Bounds::new(look.bounds.origin + origin, look.bounds.size);
                 crate::caret::paint(at, ink, window)
             },
         )
@@ -642,18 +777,21 @@ impl TerminalView {
         let mut out = vec![quad.into_any_element()];
         let block = !matches!(cursor.shape, CursorShape::Beam | CursorShape::Underline);
         if block && !look.gliding && c != ' ' && c != '\0' {
-            out.push(
-                div()
-                    .absolute()
-                    .left(x)
-                    .top(y)
-                    .font(font.clone())
-                    .text_size(px(FONT_SIZE))
-                    .line_height(cell.height)
-                    .text_color(bg.opacity(alpha))
-                    .child(c.to_string())
-                    .into_any_element(),
-            );
+            let mut line = GridLine::default();
+            line.push(cursor.point.column.0, c, None, bg.opacity(alpha), font.clone());
+            let metrics = LineMetrics::of(font, window);
+            let char_under = canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let origin = snap_point(bounds.origin, window.scale_factor());
+                    line.paint(point(origin.x, origin.y + y), cell, metrics, window);
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full();
+            out.push(char_under.into_any_element());
         }
         out
     }
@@ -863,7 +1001,7 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_scale(window.scale_factor());
+        self.sync_cell(window, cx);
         let (ansi, fg, bg) = terminal_colors(cx);
         let base_font = mono_font(cx);
         let focused = self.focus.is_focused(window);
@@ -877,9 +1015,10 @@ impl Render for TerminalView {
         let cursor_style = term.cursor_style();
         let mut cursor_cell: Option<(char, bool)> = None;
         let selection_bg = cx.theme().selection;
+        let metrics = LineMetrics::of(&base_font, window);
 
         let rows = self.size.rows;
-        let mut lines: Vec<(String, Vec<TextRun>)> = (0..rows).map(|_| (String::new(), Vec::new())).collect();
+        let mut lines: Vec<GridLine> = (0..rows).map(|_| GridLine::default()).collect();
         let mut image_cells: Vec<ImageCell> = Vec::new();
 
         for indexed in content.display_iter {
@@ -891,27 +1030,13 @@ impl Render for TerminalView {
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
-            let (text, runs) = &mut lines[row as usize];
+            let col = indexed.point.column.0;
+            let line = &mut lines[row as usize];
 
             // An image's cell: drawn below as part of its image, so no text or background.
             if let Some((id, image_row, image_col)) = crate::images::decode_cell(cell.c, cell.fg, cell.bg) {
-                image_cells.push(ImageCell {
-                    row: row as usize,
-                    col: indexed.point.column.0,
-                    id,
-                    image_row,
-                    image_col,
-                });
-                let start = text.len();
-                text.push(' ');
-                runs.push(TextRun {
-                    len: text.len() - start,
-                    font: base_font.clone(),
-                    color: fg,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                });
+                image_cells.push(ImageCell { row: row as usize, col, id, image_row, image_col });
+                line.push(col, ' ', None, fg, base_font.clone());
                 continue;
             }
 
@@ -932,13 +1057,20 @@ impl Render for TerminalView {
                 cursor_cell = Some((cell.c, cell.flags.contains(Flags::WIDE_CHAR)));
             }
 
-            let start = text.len();
-            let ch = if cell.flags.contains(Flags::HIDDEN) { ' ' } else { cell.c };
-            text.push(if ch == '\0' || ch == '\t' { ' ' } else { ch });
-            if let Some(extra) = cell.zerowidth() {
-                text.extend(extra.iter());
+            let cols = col..col + if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+            if let Some(color) = cell_bg {
+                push_span(&mut line.backgrounds, cols.clone(), color);
+            }
+            if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+                push_span(&mut line.underlines, cols.clone(), (cell_fg, cell.flags.contains(Flags::UNDERCURL)));
+            }
+            if cell.flags.contains(Flags::STRIKEOUT) {
+                push_span(&mut line.strikethroughs, cols.clone(), cell_fg);
             }
 
+            let ch = if cell.flags.contains(Flags::HIDDEN) { ' ' } else { cell.c };
+            let ch = if ch == '\0' || ch == '\t' { ' ' } else { ch };
+            let zerowidth = cell.zerowidth().filter(|_| ch != ' ');
             let mut run_font = base_font.clone();
             if cell.flags.contains(Flags::BOLD) {
                 run_font.weight = FontWeight::BOLD;
@@ -946,36 +1078,7 @@ impl Render for TerminalView {
             if cell.flags.contains(Flags::ITALIC) {
                 run_font.style = FontStyle::Italic;
             }
-            let underline = cell.flags.intersects(Flags::ALL_UNDERLINES).then(|| UnderlineStyle {
-                thickness: px(1.0),
-                color: Some(cell_fg),
-                wavy: cell.flags.contains(Flags::UNDERCURL),
-            });
-            let strikethrough = cell
-                .flags
-                .contains(Flags::STRIKEOUT)
-                .then(|| StrikethroughStyle { thickness: px(1.0), color: Some(cell_fg) });
-
-            let len = text.len() - start;
-            match runs.last_mut() {
-                Some(last)
-                    if last.color == cell_fg
-                        && last.background_color == cell_bg
-                        && last.font == run_font
-                        && last.underline == underline
-                        && last.strikethrough == strikethrough =>
-                {
-                    last.len += len
-                }
-                _ => runs.push(TextRun {
-                    len,
-                    font: run_font,
-                    color: cell_fg,
-                    background_color: cell_bg,
-                    underline,
-                    strikethrough,
-                }),
-            }
+            line.push(col, ch, zerowidth, cell_fg, run_font);
         }
         drop(term);
 
@@ -1053,12 +1156,19 @@ impl Render for TerminalView {
                 div()
                     .relative()
                     .size_full()
-                    .font(base_font)
-                    .text_size(px(FONT_SIZE))
-                    .line_height(cell.height)
-                    .children(lines.into_iter().map(|(text, runs)| {
-                        div().h(cell.height).whitespace_nowrap().child(StyledText::new(text).with_runs(runs))
-                    }))
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let origin = snap_point(bounds.origin, window.scale_factor());
+                                for (row, line) in lines.iter().enumerate() {
+                                    let top = point(origin.x, origin.y + cell.height * row as f32);
+                                    line.paint(top, cell, metrics, window);
+                                }
+                            },
+                        )
+                        .size_full(),
+                    )
                     .children(image_slices)
                     .children(cursor_overlay)
                     .child(measure),

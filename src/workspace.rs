@@ -1383,7 +1383,7 @@ impl Workspace {
     fn content_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (waiting, muted, fg) = (theme.warning, theme.muted_foreground, theme.foreground);
-        let (tab, tab_fg, page) = (theme.tab, theme.tab_foreground, theme.background);
+        let (tab, tab_fg, shown) = (theme.tab, theme.tab_foreground, theme.tab_active);
         let thread = self.active_thread().map(|t| t.read(cx));
         let title = thread.and_then(|t| t.title.clone()).unwrap_or_else(|| "New thread".into());
         // Work in progress shows in the sidebar and the composer; only a question for the user
@@ -1428,7 +1428,7 @@ impl Workspace {
                 // Solid, like the tabs not on show.
                 .bg(tab)
                 .text_color(tab_fg)
-                .hover(|el| el.bg(page).text_color(fg))
+                .hover(|el| el.bg(shown).text_color(fg))
                 .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
                 .child(Icon::new(icon).small())
         };
@@ -1639,8 +1639,8 @@ impl Render for Workspace {
         let theme = cx.theme();
         let (bg, fg, danger) = (theme.background, theme.foreground, theme.danger);
         // Around the content is the window's frame, like a browser's: the sidebar's colour,
-        // see-through with it. The top bar is part of it, and the content below is the page
-        // the shown tab opens into.
+        // see-through with it. The top bar is part of it, with the tabs floating on it, and the
+        // content below is the theme's own background.
         let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
         let frame = theme.sidebar.opacity(alpha);
 
