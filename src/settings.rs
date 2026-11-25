@@ -3,6 +3,7 @@
 //! As in the rest of the app family, how see-through the sidebar is belongs to the app,
 //! not to the theme: a switch (off by default) and an opacity (0.8 by default).
 
+use std::collections::BTreeMap;
 use std::fs;
 
 use serde::{Deserialize, Serialize};
@@ -21,11 +22,26 @@ pub struct Settings {
     /// blink, in milliseconds (0: it jumps and blinks on and off). An old `cursor_trail` is
     /// ignored.
     pub cursor_glide_ms: u32,
+    /// The UI font's family; `None` for the default (see `fonts`).
+    pub ui_font: Option<String>,
+    /// The monospace family, for code, tool output and the terminal; `None` for the default.
+    pub mono_font: Option<String>,
+    /// Shortcuts changed from their defaults: a command's id (see `keybindings::COMMANDS`) and
+    /// its keys; an empty list leaves it without one. Last, so TOML writes it as a table.
+    pub keybindings: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { follow_omarchy_theme: true, transparent_sidebar: false, sidebar_opacity: 0.8, cursor_glide_ms: 100 }
+        Self {
+            follow_omarchy_theme: true,
+            transparent_sidebar: false,
+            sidebar_opacity: 0.8,
+            cursor_glide_ms: 100,
+            ui_font: None,
+            mono_font: None,
+            keybindings: BTreeMap::new(),
+        }
     }
 }
 
@@ -68,10 +84,18 @@ mod tests {
     fn defaults_save_and_load() {
         let paths = Paths::in_dir(&std::env::temp_dir().join(format!("tj-settings-{}", new_id())));
         assert_eq!(Settings::load(&paths), Settings::default());
-        let settings =
-            Settings { transparent_sidebar: true, sidebar_opacity: 0.6, cursor_glide_ms: 150, ..Default::default() };
+        let mut settings = Settings {
+            transparent_sidebar: true,
+            sidebar_opacity: 0.6,
+            cursor_glide_ms: 150,
+            ui_font: Some("Noto Sans".into()),
+            mono_font: Some("JetBrainsMono Nerd Font".into()),
+            ..Default::default()
+        };
+        settings.keybindings.insert("find".into(), vec!["ctrl-alt-f".into()]);
+        settings.keybindings.insert("grow_pane".into(), vec![]);
         settings.save(&paths).unwrap();
-        assert_eq!(Settings::load(&paths), settings);
+        assert_eq!(Settings::load(&paths), settings, "changed keys and fonts round-trip, an unbound key too");
         let old = "cursor_glide_ms = 90\ncursor_trail = true\n";
         std::fs::write(paths.config_dir.join("settings.toml"), old).unwrap();
         assert_eq!(Settings::load(&paths).cursor_glide_ms, 90, "a file from before the trail went still loads");

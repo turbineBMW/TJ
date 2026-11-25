@@ -617,10 +617,11 @@ fn resolve_mode(colors: &HashMap<String, String>, light_mode_file: bool) -> bool
 }
 
 /// Apply the active Omarchy theme to the app, or TJ's dark default when it isn't followed
-/// (or there's no theme). `font_family` is kept either way.
-pub fn apply(cx: &mut gpui_kit::App, follow: bool, font_family: Option<&str>) {
+/// (or there's no theme), with the fonts settings pick (see `fonts::chosen`).
+pub fn apply(cx: &mut gpui_kit::App, follow: bool) {
     use gpui_kit::component::{Theme, ThemeMode};
-    let loaded = follow.then(|| load(&crate::store::home_dir(), font_family)).flatten();
+    let (ui_font, mono_font) = crate::fonts::chosen(cx);
+    let loaded = follow.then(|| load(&crate::store::home_dir(), Some(&ui_font))).flatten();
     match loaded {
         Some(loaded) => {
             Theme::change(if loaded.light { ThemeMode::Light } else { ThemeMode::Dark }, None, cx);
@@ -634,16 +635,18 @@ pub fn apply(cx: &mut gpui_kit::App, follow: bool, font_family: Option<&str>) {
             }
         }
     }
-    if let Some(font) = font_family {
-        Theme::global_mut(cx).font_family = font.to_string().into();
-    }
+    // Through `update`, so the Base layer's copy of the theme gets the fonts too.
+    Theme::update(cx, |theme| {
+        theme.font_family = ui_font;
+        theme.mono_font_family = mono_font;
+    });
     // TJ draws the text fields' caret itself, so it can glide (see `caret`).
     crate::caret::hide_native_caret(cx);
     cx.refresh_windows();
 }
 
 /// Re-apply the theme whenever Omarchy switches it (checked every two seconds).
-pub fn watch(cx: &mut gpui_kit::App, font_family: Option<String>) {
+pub fn watch(cx: &mut gpui_kit::App) {
     let home = crate::store::home_dir();
     let mut last = stamp(&home);
     cx.spawn(async move |cx| {
@@ -657,7 +660,7 @@ pub fn watch(cx: &mut gpui_kit::App, font_family: Option<String>) {
             cx.update(|cx| {
                 let follow = cx.try_global::<crate::settings::Settings>().is_none_or(|s| s.follow_omarchy_theme);
                 if follow {
-                    apply(cx, true, font_family.as_deref());
+                    apply(cx, true);
                 }
             });
         }

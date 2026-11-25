@@ -7,11 +7,13 @@ mod caret;
 mod changes;
 mod composer;
 mod demo;
+mod fonts;
 mod grow;
 mod handoff;
 mod highlight;
 mod history;
 mod images;
+mod keybindings;
 mod keymap;
 mod omarchy;
 mod overview;
@@ -19,7 +21,9 @@ mod panes;
 mod project_image;
 mod sample;
 mod settings;
+mod settings_view;
 mod store;
+mod switcher;
 mod terminal;
 mod thread;
 mod tool_card;
@@ -91,50 +95,12 @@ impl Args {
     }
 }
 
-/// The UI font: `TJ_UI_FONT`, else the desktop font from GNOME settings if it
-/// has a real bold face, else Noto Sans.
-///
-/// gpui on Linux ignores the weight axis of variable fonts, so a variable-only
-/// family such as Adwaita Sans renders **bold** as regular. gpui-kit's default
-/// `.SystemUIFont` has the same problem here.
-fn desktop_ui_font() -> Option<String> {
-    if let Ok(family) = std::env::var("TJ_UI_FONT") {
-        return Some(family);
-    }
-    let run = |cmd: &str, args: &[&str]| {
-        let out = std::process::Command::new(cmd).args(args).output().ok()?;
-        String::from_utf8(out.stdout).ok()
-    };
-    let desktop = run("gsettings", &["get", "org.gnome.desktop.interface", "font-name"]).and_then(|value| {
-        let value = value.trim().trim_matches('\'').to_string();
-        // "Adwaita Sans 11" -> "Adwaita Sans"
-        let family = match value.rsplit_once(' ') {
-            Some((family, size)) if size.parse::<f32>().is_ok() => family.to_string(),
-            _ => value,
-        };
-        (!family.is_empty()).then_some(family)
-    });
-    // A static bold face lives in its own file; a variable font's "Bold" instance shares the
-    // regular file. fontconfig reports both as style Bold, so compare files instead.
-    let has_static_bold = |family: &str| {
-        let matched = |pattern: String| run("fc-match", &["-f", "%{family}|%{file}", &pattern]);
-        match (matched(family.to_string()), matched(format!("{family}:bold"))) {
-            (Some(regular), Some(bold)) => bold.starts_with(family) && regular != bold,
-            _ => false,
-        }
-    };
-    desktop
-        .filter(|family| has_static_bold(family))
-        .or_else(|| has_static_bold("Noto Sans").then(|| "Noto Sans".to_string()))
-}
-
 fn main() {
     let args = Args::parse();
     // The icon SVGs (the full Lucide set) must be registered, or icons render blank.
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
         caret::init(cx);
-        keymap::init(cx);
         // gpui keeps running after its last window closes; TJ has only one, so quit with it.
         // Dropping the workspace also stops its claude processes.
         cx.on_window_closed(|cx, _| {
@@ -146,10 +112,13 @@ fn main() {
         let launch = args.launch();
         let paths = launch.paths.clone().unwrap_or_else(store::Paths::from_env);
         let settings = settings::Settings::load(&paths);
-        let font = desktop_ui_font();
-        omarchy::apply(cx, settings.follow_omarchy_theme, font.as_deref());
-        omarchy::watch(cx, font);
+        let follow = settings.follow_omarchy_theme;
+        fonts::init(cx);
         cx.set_global(settings);
+        omarchy::apply(cx, follow);
+        omarchy::watch(cx);
+        // After the settings: the app shortcuts take their keys from them.
+        keymap::init(cx);
 
         // GNOME-style: no title bar; the sidebar and content headers move the window.
         let options = WindowOptions {

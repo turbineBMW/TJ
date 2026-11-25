@@ -59,28 +59,6 @@ gpui_kit::actions!(
     ]
 );
 
-/// Vmux's pane and tab shortcuts, active anywhere in the main area.
-pub fn bindings() -> Vec<KeyBinding> {
-    let c = Some(CONTEXT);
-    vec![
-        KeyBinding::new("ctrl-shift-t", NewTab, c),
-        KeyBinding::new("ctrl-shift-w", CloseTab, c),
-        KeyBinding::new("ctrl-shift-e", SplitRight, c),
-        KeyBinding::new("ctrl-shift-o", SplitDown, c),
-        KeyBinding::new("ctrl-shift-a", FocusNextPane, c),
-        KeyBinding::new("ctrl-alt-left", FocusPaneLeft, c),
-        KeyBinding::new("ctrl-alt-right", FocusPaneRight, c),
-        KeyBinding::new("ctrl-alt-up", FocusPaneUp, c),
-        KeyBinding::new("ctrl-alt-down", FocusPaneDown, c),
-        KeyBinding::new("ctrl-shift-=", GrowPane, c),
-        KeyBinding::new("ctrl-shift-+", GrowPane, c),
-        KeyBinding::new("ctrl-shift--", ShrinkPane, c),
-        KeyBinding::new("ctrl-shift-_", ShrinkPane, c),
-        KeyBinding::new("ctrl-pagedown", NextTab, c),
-        KeyBinding::new("ctrl-pageup", PreviousTab, c),
-    ]
-}
-
 /// What a tab shows.
 #[derive(Clone)]
 pub enum Tab {
