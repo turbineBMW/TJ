@@ -8,7 +8,7 @@ use std::{
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -24,6 +24,7 @@ use crate::agent::{
 };
 use crate::overview::{self, Overview};
 use crate::store::{Record, TranscriptWriter};
+use crate::tool_card::{self, ToolStatus};
 
 /// How often a long turn's overview is refreshed while it runs.
 const OVERVIEW_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -109,16 +110,17 @@ enum NoticeKind {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ToolStatus {
-    Running,
-    Done,
-    Failed,
-}
-
 struct ToolRow {
     id: String,
     name: String,
+    /// The call's arguments, which the card's body lays out (the command, the edit, ...).
+    input: Value,
+    /// Pictures the tool returned, shown in the card.
+    images: Vec<tool_card::Picture>,
+    /// A Bash call's command and output, coloured once.
+    shell: Option<tool_card::ShellText>,
+    /// The card body's scroll position, and whether it overflows.
+    scroll: ScrollHandle,
     summary: String,
     status: ToolStatus,
     output: Option<String>,
@@ -938,6 +940,34 @@ impl ThreadView {
             .collect()
     }
 
+    /// Save the pictures a tool returned beside the transcript, keeping only their file names
+    /// in the event. Without a files folder (demos, tests) they stay in the event.
+    fn save_tool_images(&self, images: &mut [crate::agent::ToolImage]) {
+        use base64::Engine as _;
+        let Some(dir) = &self.files_dir else { return };
+        for image in images.iter_mut().filter(|i| i.file.is_none() && !i.data.is_empty()) {
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image.data) else { continue };
+            if std::fs::create_dir_all(dir).is_err() {
+                return;
+            }
+            let name = format!("{}.{}", uuid::Uuid::new_v4(), crate::composer::extension(&image.media_type));
+            if std::fs::write(dir.join(&name), bytes).is_ok() {
+                image.file = Some(name);
+                image.data.clear();
+            }
+        }
+    }
+
+    /// A tool's picture, from its saved file or the bytes still in the event.
+    fn tool_image(&self, image: &crate::agent::ToolImage) -> Option<tool_card::Picture> {
+        use base64::Engine as _;
+        let bytes = match &image.file {
+            Some(name) => std::fs::read(self.files_dir.as_ref()?.join(name)).ok()?,
+            None => base64::engine::general_purpose::STANDARD.decode(&image.data).ok()?,
+        };
+        tool_card::picture(&image.media_type, bytes)
+    }
+
     fn load_saved_image(&self, name: &str) -> Option<Arc<gpui_kit::Image>> {
         let bytes = std::fs::read(self.files_dir.as_ref()?.join(name)).ok()?;
         let format = image_format(&format!("image/{}", name.rsplit('.').next().unwrap_or("png")));
@@ -1271,6 +1301,27 @@ impl ThreadView {
         self.remeasure(ix, cx);
     }
 
+    /// A tool card's header opens or folds the card; a Bash card too big for its space opens
+    /// in a dialog instead, where all of it can be read.
+    fn click_tool_header(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Row::Tool(tool)) = self.rows.get(ix) else { return };
+        if let Some(shell) = tool.shell.clone().filter(|_| tool.expanded && tool_card::overflows(&tool.scroll)) {
+            let summary = tool_card::header_summary(&tool.name, &tool.input, &tool.summary, &self.project_dir());
+            window.open_dialog(cx, move |dialog, window, cx| {
+                tool_card::shell_dialog(dialog, &summary, &shell, window, cx)
+            });
+            return;
+        }
+        self.fold_tool(ix, cx);
+    }
+
+    fn fold_tool(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(Row::Tool(tool)) = self.rows.get_mut(ix) {
+            tool.expanded = !tool.expanded;
+        }
+        self.remeasure(ix, cx);
+    }
+
     fn tool_row(&self, tool_use_id: &str) -> Option<usize> {
         self.rows.iter().rposition(|r| matches!(r, Row::Tool(t) if t.id == tool_use_id))
     }
@@ -1356,7 +1407,10 @@ impl ThreadView {
 
     // ---------- events ----------
 
-    pub fn handle(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
+    pub fn handle(&mut self, mut event: AgentEvent, cx: &mut Context<Self>) {
+        if let AgentEvent::ToolFinished { images, .. } = &mut event {
+            self.save_tool_images(images);
+        }
         match &event {
             // Process lifecycle and live usage aren't part of the conversation.
             AgentEvent::Started { .. } | AgentEvent::Exited { .. } | AgentEvent::Usage(_) => {}
@@ -1507,22 +1561,36 @@ impl ThreadView {
                 };
                 self.plain.push(line);
                 self.plain_current = None;
+                let expanded = tool_card::opens_by_default(&name);
+                let shell = (name == "Bash").then(|| {
+                    tool_card::ShellText::new(input.get("command").and_then(Value::as_str).unwrap_or_default())
+                });
                 self.push_row(
                     Row::Tool(ToolRow {
                         id,
                         name,
+                        input,
+                        images: Vec::new(),
+                        shell,
+                        scroll: ScrollHandle::new(),
                         summary,
                         status: ToolStatus::Running,
                         output: None,
-                        expanded: false,
+                        expanded,
                         subagent: None,
                     }),
                     cx,
                 );
             }
-            AgentEvent::ToolFinished { id, output, is_error } => {
+            AgentEvent::ToolFinished { id, output, is_error, images } => {
+                let images: Vec<_> = images.iter().filter_map(|image| self.tool_image(image)).collect();
                 if let Some(ix) = self.rows.iter().rposition(|r| matches!(r, Row::Tool(t) if t.id == id)) {
                     if let Row::Tool(tool) = &mut self.rows[ix] {
+                        // A picture is the point of reading one, so its card opens.
+                        if !images.is_empty() {
+                            tool.expanded = true;
+                            tool.images = images;
+                        }
                         // A background subagent's call returns at once ("Async agent launched");
                         // the row stays working until the subagent itself finishes.
                         if tool.subagent.as_ref().is_some_and(|s| s.finished.is_none()) && !is_error {
@@ -1530,6 +1598,9 @@ impl ThreadView {
                             return;
                         }
                         tool.status = if is_error { ToolStatus::Failed } else { ToolStatus::Done };
+                        if let Some(shell) = &mut tool.shell {
+                            shell.finish(&output, is_error);
+                        }
                         if is_error {
                             self.plain.push(format!("({} failed: {})", tool.name, truncate(&output, 240)));
                             self.plain_current = None;
@@ -1730,17 +1801,11 @@ impl ThreadView {
                 pad(div()).py_2().child(TextView::new(body).selectable(true).stream_fade(true)).into_any_element()
             }
             Row::Tool(tool) => {
-                let (dot, status) = match tool.status {
-                    ToolStatus::Running => (muted, "running"),
-                    ToolStatus::Done => (theme.success, "done"),
-                    ToolStatus::Failed => (danger, "failed"),
-                };
                 let sub = tool.subagent.as_ref();
-                // A subagent's row says what it is and how far along it is.
-                let label = match sub {
-                    Some(sub) => {
-                        let mut parts =
-                            vec![if sub.finished.is_none() { "working".to_string() } else { status.to_string() }];
+                // A subagent's row says how far along it is.
+                let label = sub
+                    .map(|sub| {
+                        let mut parts = Vec::new();
                         if let Some(n) = sub.tool_uses {
                             parts.push(format!("{n} tool{}", if n == 1 { "" } else { "s" }));
                         }
@@ -1748,91 +1813,41 @@ impl ThreadView {
                             parts.push(format!("{}k tokens", t / 1000));
                         }
                         parts.join(" · ")
-                    }
-                    None => status.to_string(),
-                };
-                let name = match sub.and_then(|s| s.agent_type.clone()) {
-                    Some(agent_type) => format!("{} · {agent_type}", tool.name),
-                    None => tool.name.clone(),
+                    })
+                    .filter(|label| !label.is_empty());
+                let summary = match sub.and_then(|s| s.agent_type.clone()) {
+                    Some(agent_type) => format!("{agent_type} · {}", tool.summary),
+                    None => tool_card::header_summary(&tool.name, &tool.input, &tool.summary, &self.project_dir()),
                 };
                 let now = sub.and_then(|s| s.now.clone()).filter(|_| tool.status == ToolStatus::Running);
-                let details: Option<AnyElement> = if !tool.expanded {
-                    None
-                } else if let Some(sub) = sub {
-                    Some(
-                        v_flex()
-                            .gap_1()
-                            .children(sub.log.iter().map(|line| {
-                                div().text_xs().font_family(mono.clone()).text_color(muted).child(line.clone())
-                            }))
-                            .when_some(sub.summary.clone(), |el, summary| {
-                                el.child(div().pt_1().text_sm().child(summary))
-                            })
-                            .into_any_element(),
-                    )
-                } else {
-                    tool.output.clone().map(|output| {
-                        div()
-                            .text_xs()
-                            .font_family(mono.clone())
-                            .text_color(muted)
-                            .child(truncate(&output, 4000))
-                            .into_any_element()
-                    })
+                let details = sub.filter(|_| tool.expanded).map(|sub| {
+                    v_flex()
+                        .gap_1()
+                        .font_family(cx.theme().font_family.clone())
+                        .children(sub.log.iter().map(|line| {
+                            div().text_xs().font_family(mono.clone()).text_color(muted).child(line.clone())
+                        }))
+                        .when_some(sub.summary.clone(), |el, summary| el.child(div().pt_1().text_sm().child(summary)))
+                        .into_any_element()
+                });
+                let card = tool_card::Card {
+                    ix,
+                    name: &tool.name,
+                    input: &tool.input,
+                    summary,
+                    status: tool.status,
+                    output: tool.output.as_deref(),
+                    pictures: &tool.images,
+                    label,
+                    now,
+                    expanded: tool.expanded,
+                    details,
+                    shell: tool.shell.as_ref(),
+                    scroll: &tool.scroll,
                 };
-                pad(div())
-                    .child(
-                        v_flex()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .child(
-                                h_flex()
-                                    .id(SharedString::from(format!("tool-{ix}")))
-                                    .gap_2()
-                                    .px_3()
-                                    .py_1p5()
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(Row::Tool(tool)) = this.rows.get_mut(ix) {
-                                            tool.expanded = !tool.expanded;
-                                        }
-                                        this.remeasure(ix, cx);
-                                    }))
-                                    .child(div().size_2().rounded_full().bg(dot))
-                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(name))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .text_sm()
-                                            .font_family(mono.clone())
-                                            .text_color(muted)
-                                            .child(tool.summary.clone()),
-                                    )
-                                    .child(div().text_xs().text_color(muted).child(label)),
-                            )
-                            .when_some(now, |el, now| {
-                                el.child(
-                                    div()
-                                        .px_3()
-                                        .pb_1p5()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .child(format!("↳ {now}")),
-                                )
-                            })
-                            .when_some(details, |el, details| {
-                                el.child(div().border_t_1().border_color(border).px_3().py_2().child(details))
-                            }),
-                    )
-                    .into_any_element()
+                let toggle = cx.listener(move |this, _, window, cx| this.click_tool_header(ix, window, cx));
+                let fold = cx.listener(move |this, _, _, cx| this.fold_tool(ix, cx));
+                pad(div()).child(tool_card::render(card, window, cx, toggle, fold)).into_any_element()
             }
             Row::Approval(ApprovalRow { kind: ApprovalKind::Question(card), outcome, .. }) => {
                 let pending = outcome.is_none();
@@ -2762,6 +2777,93 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(b.2.as_deref(), Some("Approved"));
         assert_eq!(second.read_with(cx, |t, _| t.status), Status::Idle);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[gpui_kit::test]
+    fn a_bash_card_too_big_for_its_space_opens_in_a_dialog(cx: &mut TestAppContext) {
+        use gpui_kit::component::WindowExt as _;
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let long: String = (1..=300).map(|i| format!("line {i}\n")).collect();
+        thread.update(cx, |t, cx| {
+            t.send("Run two commands", cx);
+            for (id, output) in [("short", "ok"), ("long", long.as_str())] {
+                let input = serde_json::json!({ "command": format!("echo {id}") });
+                t.handle(AgentEvent::ToolStarted { id: id.into(), name: "Bash".into(), input }, cx);
+                let output = output.to_string();
+                t.handle(AgentEvent::ToolFinished { id: id.into(), output, is_error: false, images: Vec::new() }, cx);
+            }
+        });
+        let rows = thread.read_with(cx, |t, _| t.rows.len());
+        let (short, long) = (rows - 2, rows - 1);
+        let expanded = |ix: usize, cx: &mut VisualTestContext| {
+            thread.read_with(cx, |t, _| matches!(&t.rows[ix], Row::Tool(tool) if tool.expanded))
+        };
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // A card that fits folds from its header.
+        cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("tool-{short}")), cx));
+        assert!(!expanded(short, cx));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+
+        // One that overflows opens in a dialog and stays open; its own button folds it.
+        cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("tool-{long}")), cx));
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        assert!(expanded(long, cx));
+        cx.update(|window, cx| {
+            window.close_dialog(cx);
+            window.render_frame(cx);
+            window.click(gpui_kit::SharedString::from(format!("tool-fold-{long}")), cx);
+        });
+        assert!(!expanded(long, cx));
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn a_read_picture_is_saved_beside_the_transcript_and_shown_again(cx: &mut TestAppContext) {
+        use base64::Engine as _;
+        let path = std::env::temp_dir().join(format!("tj-picture-{}.jsonl", crate::store::new_id()));
+        let setup = super::ThreadSetup { transcript: Some(path.clone()), ..Default::default() };
+        let (window, _thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let png = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons/tj-32.png")).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let first = cx.update(|window, cx| {
+            cx.new(|cx| ThreadView::open(setup.clone(), Backend::Scripted(Vec::new()), window, cx))
+        });
+        first.update(cx, |t, cx| {
+            let input = serde_json::json!({ "file_path": "/p/icon.png" });
+            t.handle(AgentEvent::ToolStarted { id: "1".into(), name: "Read".into(), input }, cx);
+            let image = crate::agent::ToolImage { media_type: "image/png".into(), data: data.clone(), file: None };
+            t.handle(
+                AgentEvent::ToolFinished {
+                    id: "1".into(),
+                    output: String::new(),
+                    is_error: false,
+                    images: vec![image],
+                },
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // The transcript keeps a file name, not the picture.
+        let transcript = std::fs::read_to_string(&path).unwrap();
+        assert!(!transcript.contains(&data[..40]));
+        let files: Vec<_> = std::fs::read_dir(crate::composer::files_dir(&path)).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(files[0].path()).unwrap(), png);
+
+        let second =
+            cx.update(|window, cx| cx.new(|cx| ThreadView::open(setup, Backend::Scripted(Vec::new()), window, cx)));
+        let shown = |t: &ThreadView| match t.rows.last() {
+            Some(Row::Tool(tool)) => (tool.images.len(), tool.expanded),
+            _ => (0, false),
+        };
+        assert_eq!(first.read_with(cx, |t, _| shown(t)), (1, true));
+        assert_eq!(second.read_with(cx, |t, _| shown(t)), (1, true));
+        let _ = std::fs::remove_dir_all(crate::composer::files_dir(&path));
         let _ = std::fs::remove_file(path);
     }
 

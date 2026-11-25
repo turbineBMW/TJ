@@ -20,7 +20,7 @@ use std::{
 use anyhow::Context as _;
 use serde_json::{Value, json};
 
-use super::{AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, UsageWindow};
+use super::{AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, ToolImage, UsageWindow};
 
 /// The `claude` version the protocol handling was written and recorded against.
 pub const TESTED_VERSION: &str = "2.1.331";
@@ -473,6 +473,7 @@ impl Parser {
                     Some(AgentEvent::ToolFinished {
                         id: str_at(b, "tool_use_id")?,
                         output: tool_output(b.get("content")),
+                        images: tool_images(b.get("content")),
                         is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
                     })
                 })
@@ -577,6 +578,19 @@ impl Parser {
 
 fn blocks(message: &Value) -> impl Iterator<Item = &Value> {
     message["message"]["content"].as_array().into_iter().flatten()
+}
+
+/// The base64 image blocks in a tool result's content.
+fn tool_images(content: Option<&Value>) -> Vec<ToolImage> {
+    let Some(Value::Array(parts)) = content else { return Vec::new() };
+    parts
+        .iter()
+        .filter(|p| p["type"] == "image" && p["source"]["type"] == "base64")
+        .filter_map(|p| {
+            let source = |key: &str| p["source"].get(key).and_then(Value::as_str).map(str::to_owned);
+            Some(ToolImage { media_type: source("media_type")?, data: source("data")?, file: None })
+        })
+        .collect()
 }
 
 /// A tool result's content is either a string or a list of content blocks.
@@ -820,6 +834,20 @@ mod tests {
         );
         let turns = events.iter().filter(|e| matches!(e, AgentEvent::TurnFinished { .. })).count();
         assert_eq!(turns, 2, "Claude reports the subagent's result in a turn of its own");
+    }
+
+    #[test]
+    fn images_in_a_tool_result_come_with_it() {
+        // The shape Claude Code 2.1.331 sends for Read on a PNG.
+        let message = json!({ "type": "user", "message": { "content": [{
+            "type": "tool_result", "tool_use_id": "toolu_1",
+            "content": [{ "type": "image", "source": { "type": "base64", "data": "iVBORw0K", "media_type": "image/png" } }]
+        }]}});
+        let events = Parser.parse(&message);
+        let [AgentEvent::ToolFinished { id, output, images, .. }] = events.as_slice() else { panic!("{events:?}") };
+        assert_eq!(id, "toolu_1");
+        assert!(output.is_empty());
+        assert_eq!(images, &vec![ToolImage { media_type: "image/png".into(), data: "iVBORw0K".into(), file: None }]);
     }
 
     #[test]
