@@ -6,7 +6,7 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
@@ -813,7 +813,7 @@ impl Workspace {
             .content(move |_, _window, cx| {
                 let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
                 let muted = cx.theme().muted_foreground;
-                let (this_follow, this_transparent, this_trail) = (this.clone(), this.clone(), this.clone());
+                let (this_follow, this_transparent) = (this.clone(), this.clone());
                 let glide = match settings.cursor_glide_ms {
                     0 => "Off".to_string(),
                     ms => format!("{ms} ms"),
@@ -878,18 +878,6 @@ impl Workspace {
                             )
                             .child(Slider::new(&glide_slider)),
                     )
-                    .child(row(
-                        "Cursor trail",
-                        Some("The cursor stretches as it moves".into()),
-                        Switch::new("cursor-trail")
-                            .checked(settings.cursor_trail)
-                            .disabled(settings.cursor_glide_ms == 0)
-                            .on_change(move |checked, _, cx| {
-                                let checked = *checked;
-                                this_trail.update(cx, |w, cx| w.update_settings(cx, |s| s.cursor_trail = checked))
-                            })
-                            .into_any_element(),
-                    ))
             })
             .into_any_element()
     }
@@ -1473,13 +1461,14 @@ fn clear_stale_client_inset(window: &mut Window) {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         clear_stale_client_inset(window);
+        crate::caret::begin_frame(cx);
         let panes = self.active_project().and_then(|p| self.panes.get(&p.id)).cloned();
         let theme = cx.theme();
         let (bg, fg, danger) = (theme.background, theme.foreground, theme.danger);
 
         // The window itself is transparent: only the content area paints an opaque background,
         // so the sidebar can be see-through.
-        h_flex().size_full().text_color(fg).child(self.sidebar(cx)).child(
+        crate::caret::watch(h_flex()).size_full().text_color(fg).child(self.sidebar(cx)).child(
             v_flex()
                 .flex_1()
                 .min_w_0()
@@ -1577,15 +1566,51 @@ mod tests {
             window.click("settings-button", cx);
             window.render_frame(cx);
         });
-        workspace.update(cx, |w, cx| {
-            w.update_settings(cx, |s| {
-                s.cursor_glide_ms = 0;
-                s.cursor_trail = false;
-            })
-        });
-        let saved = crate::settings::Settings::load(&paths);
-        assert_eq!((saved.cursor_glide_ms, saved.cursor_trail), (0, false));
+        workspace.update(cx, |w, cx| w.update_settings(cx, |s| s.cursor_glide_ms = 0));
+        assert_eq!(crate::settings::Settings::load(&paths).cursor_glide_ms, 0);
         cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    /// The carets tell a key's move from a click's by what the window root reports.
+    #[gpui_kit::test]
+    fn the_caret_clock_sees_frames_keys_and_clicks(cx: &mut TestAppContext) {
+        use crate::caret::Clock;
+        use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+        let (window, workspace, _, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|_, cx| crate::caret::init(cx));
+        let clock =
+            |cx: &mut VisualTestContext| cx.update(|_, cx| cx.try_global::<Clock>().copied().unwrap_or_default());
+        cx.update(|window, cx| window.render_frame(cx));
+        let first = clock(cx).frame;
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(clock(cx).frame, first + 1, "each draw counts");
+
+        let id = workspace.read_with(cx, |w, _| w.active.clone().unwrap());
+        workspace.update_in(cx, |w, window, cx| w.start_rename(&id, window, cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        for keys in ["a", "left"] {
+            cx.update(|_, cx| cx.default_global::<Clock>().key = None);
+            cx.simulate_keystrokes(keys);
+            assert!(clock(cx).key.is_some(), "{keys} is seen");
+        }
+
+        let position = point(px(400.), px(300.));
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert!(clock(cx).pointer_down, "a press is seen");
+        cx.simulate_event(MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        assert!(!clock(cx).pointer_down && clock(cx).pointer.is_some(), "and its release");
     }
 
     #[gpui_kit::test]

@@ -17,21 +17,15 @@ pub struct Settings {
     pub transparent_sidebar: bool,
     /// 0.3 to 1.0; used while `transparent_sidebar` is on.
     pub sidebar_opacity: f32,
-    /// How long the cursor takes to glide to a new place, in milliseconds (0: it jumps).
+    /// How long the cursor takes to glide to a new place after a key, and each fade of its
+    /// blink, in milliseconds (0: it jumps and blinks on and off). An old `cursor_trail` is
+    /// ignored.
     pub cursor_glide_ms: u32,
-    /// The cursor stretches along its path as it moves, and snaps back.
-    pub cursor_trail: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self {
-            follow_omarchy_theme: true,
-            transparent_sidebar: false,
-            sidebar_opacity: 0.8,
-            cursor_glide_ms: 90,
-            cursor_trail: true,
-        }
+        Self { follow_omarchy_theme: true, transparent_sidebar: false, sidebar_opacity: 0.8, cursor_glide_ms: 100 }
     }
 }
 
@@ -74,15 +68,13 @@ mod tests {
     fn defaults_save_and_load() {
         let paths = Paths::in_dir(&std::env::temp_dir().join(format!("tj-settings-{}", new_id())));
         assert_eq!(Settings::load(&paths), Settings::default());
-        let settings = Settings {
-            transparent_sidebar: true,
-            sidebar_opacity: 0.6,
-            cursor_glide_ms: 150,
-            cursor_trail: false,
-            ..Default::default()
-        };
+        let settings =
+            Settings { transparent_sidebar: true, sidebar_opacity: 0.6, cursor_glide_ms: 150, ..Default::default() };
         settings.save(&paths).unwrap();
         assert_eq!(Settings::load(&paths), settings);
+        let old = "cursor_glide_ms = 90\ncursor_trail = true\n";
+        std::fs::write(paths.config_dir.join("settings.toml"), old).unwrap();
+        assert_eq!(Settings::load(&paths).cursor_glide_ms, 90, "a file from before the trail went still loads");
         assert_eq!(settings.sidebar_alpha(), 0.6);
         assert_eq!(Settings::default().sidebar_alpha(), 1.0, "off means opaque");
         assert_eq!(Settings { transparent_sidebar: true, sidebar_opacity: 0.0, ..settings }.sidebar_alpha(), 0.3);

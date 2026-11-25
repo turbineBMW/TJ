@@ -2333,7 +2333,8 @@ impl ThreadView {
             .children(self.render_attachments(cx))
             // Roomier on the start screen; in a session it grows with what's typed.
             .child(div().when(fresh, |el| el.min_h(px(64.))).child(self.prompt_box(false, cx)))
-            .child(crate::caret::overlay(&self.prompt))
+            // The prompt sits on the card, so typed letters grow in over its colour.
+            .child(crate::caret::overlay_growing(&self.prompt, card))
             .child(
                 h_flex()
                     .gap_1()
@@ -3204,6 +3205,28 @@ mod tests {
             focus.is_focused(window)
         });
         assert!(focused, "Tab moved focus out of the prompt box");
+    }
+
+    /// The prompt's growing letters match the field's own layout (font, size, place).
+    #[gpui_kit::test]
+    fn a_letter_typed_into_the_prompt_grows_in(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|_, cx| crate::caret::init(cx));
+        type_into_prompt(&thread, "", cx);
+        let prompt = thread.read_with(cx, |t, _| t.prompt.clone());
+        prompt.update_in(cx, |p, window, cx| p.set_value("hell", window, cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(cx.update(|_, cx| crate::caret::growing_letters(cx)), 0, "set by the app, not typed");
+        cx.simulate_keystrokes("end");
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("o");
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(prompt_text(&thread, cx), "hello");
+        assert_eq!(cx.update(|_, cx| crate::caret::growing_letters(cx)), 1, "the o grows in");
+        cx.simulate_keystrokes("backspace");
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(cx.update(|_, cx| crate::caret::growing_letters(cx)), 0, "and stops when it's deleted");
     }
 
     /// Focus the prompt box and type into it.

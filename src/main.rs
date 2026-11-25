@@ -7,6 +7,7 @@ mod caret;
 mod changes;
 mod composer;
 mod demo;
+mod grow;
 mod handoff;
 mod highlight;
 mod images;
@@ -130,6 +131,7 @@ fn main() {
     // The icon SVGs (the full Lucide set) must be registered, or icons render blank.
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
+        caret::init(cx);
         keymap::init(cx);
         // gpui keeps running after its last window closes; TJ has only one, so quit with it.
         // Dropping the workspace also stops its claude processes.
