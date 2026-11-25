@@ -27,7 +27,8 @@ use crate::thread::{
 };
 use gpui_kit::assets::IconName;
 
-const SIDEBAR_WIDTH: f32 = 264.0;
+/// How wide the sidebar is. The status column on the other side matches it.
+pub const SIDEBAR_WIDTH: f32 = 302.0;
 /// The status column folds away when it would leave the content narrower than this, unless it
 /// was shown by hand.
 const STATUS_FOLD_WIDTH: f32 = 640.0;
