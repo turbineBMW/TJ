@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use alacritty_terminal::tty::Shell;
+use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, button::Button};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, button::Button};
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::agent_slot::AgentSlot;
@@ -507,6 +508,94 @@ impl Panes {
         self.pane_ids().into_iter().find_map(|id| root.pane(id)?.tabs.iter().position(&matches).map(|ix| (id, ix)))
     }
 
+    /// Whether the tabs live in the top bar instead of a strip over the pane: when the project
+    /// is a single pane, so the shown tab can open straight into it.
+    pub fn tabs_in_header(&self) -> bool {
+        matches!(self.root, Some(Node::Pane(_)))
+    }
+
+    /// The single pane's tabs for the top bar, like a browser's: the shown one joins the
+    /// content below, the others float. `favicon` goes on the agent tab.
+    pub fn header_tabs(&self, this: Entity<Self>, favicon: Option<AnyElement>, cx: &App) -> Option<AnyElement> {
+        let Some(Node::Pane(pane)) = &self.root else { return None };
+        let theme = cx.theme();
+        let (fg, muted, page) = (theme.foreground, theme.muted_foreground, theme.background);
+        // Like Chrome's: the tabs not on show are the frame's colour, solid, so they float on a
+        // see-through frame; hovering one lifts it to the page's colour.
+        let (tab_bg, tab_fg) = (theme.tab, theme.tab_foreground);
+        let mut favicon = favicon;
+        let pane_id = pane.id;
+        let tabs = pane.tabs.iter().enumerate().map(|(ix, tab)| {
+            let (title, dot) = tab_label(tab, cx);
+            let active = ix == pane.active;
+            let id = tab.entity_id();
+            let icon = match tab {
+                Tab::Agent(_) => favicon.take(),
+                Tab::Terminal(_) => {
+                    Some(Icon::new(IconName::SquareTerminal).small().text_color(muted).into_any_element())
+                }
+                Tab::Review(_) => Some(Icon::new(IconName::FileDiff).small().text_color(muted).into_any_element()),
+            };
+            let (activate, close) = (this.clone(), this.clone());
+            h_flex()
+                .id(SharedString::from(format!("header-tab-{ix}")))
+                .test_support()
+                .relative()
+                .flex_shrink(1.)
+                .min_w(px(90.))
+                .max_w(px(240.))
+                .gap_2()
+                .px_3()
+                .text_sm()
+                .cursor_pointer()
+                .map(|el| {
+                    if active {
+                        // From the floating tabs' top down into the content, with its title
+                        // level with theirs.
+                        el.h(px(FLOAT_HEIGHT + FLOAT_INSET)).pb(px(FLOAT_INSET)).text_color(fg).child(tab_shape(page))
+                    } else {
+                        el.h(px(FLOAT_HEIGHT))
+                            .mb(px(FLOAT_INSET))
+                            .rounded_lg()
+                            .text_color(tab_fg)
+                            .bg(tab_bg)
+                            .hover(|el| el.bg(page).text_color(fg))
+                    }
+                })
+                .on_click(move |_, window, cx| activate.update(cx, |p, cx| p.activate_at((pane_id, ix), window, cx)))
+                .children(icon.map(|icon| div().flex_none().child(icon)))
+                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(title))
+                .when_some(dot, |el, color| el.child(div().flex_none().size_1p5().rounded_full().bg(color)))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("header-close-tab-{ix}")))
+                        .flex_none()
+                        .size(px(18.))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(muted)
+                        .hover(|el| el.bg(fg.opacity(0.12)).text_color(fg))
+                        .child(Icon::new(IconName::X).xsmall())
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            close.update(cx, |p, cx| p.close_entity(id, window, cx));
+                        }),
+                )
+        });
+        Some(
+            h_flex()
+                .h_full()
+                .min_w_0()
+                .flex_shrink(1.)
+                .items_end()
+                .gap(px(TAB_FLARE + 2.))
+                .children(tabs)
+                .into_any_element(),
+        )
+    }
+
     /// The tab count of each pane, in order.
     #[cfg(test)]
     pub fn shape(&self) -> Vec<usize> {
@@ -834,28 +923,10 @@ impl Panes {
         let theme = cx.theme();
         let (muted, fg, accent, hover, border) =
             (theme.muted_foreground, theme.foreground, theme.primary, theme.secondary, theme.border);
-        let (running, waiting) = (theme.warning, theme.primary);
         let focused = pane.id == self.focused;
         let pane_id = pane.id;
         let tabs = pane.tabs.iter().enumerate().map(|(ix, tab)| {
-            let (title, dot) = match tab {
-                Tab::Agent(agent) => match agent.read(cx).thread().map(|v| v.read(cx)) {
-                    Some(t) => {
-                        let dot = match t.status {
-                            Status::Idle => None,
-                            Status::Running => Some(running),
-                            Status::AwaitingApproval => Some(waiting),
-                        };
-                        (t.title.clone().unwrap_or_else(|| "New thread".into()), dot)
-                    }
-                    None => ("Agent".into(), None),
-                },
-                Tab::Terminal(term) => {
-                    let t = term.read(cx);
-                    (tab_title(t.title(), t.cwd()), None)
-                }
-                Tab::Review(review) => (format!("Review · {}", review.read(cx).file_count(cx)), None),
-            };
+            let (title, dot) = tab_label(tab, cx);
             let active = ix == pane.active;
             let id = tab.entity_id();
             h_flex()
@@ -904,7 +975,7 @@ impl Panes {
                 }),
             )
             // The tab strip only shows when there's more than one tab to switch between.
-            .when(pane.tabs.len() > 1, |el| {
+            .when(pane.tabs.len() > 1 && !self.tabs_in_header(), |el| {
                 el.child(
                     h_flex()
                         .h(px(30.))
@@ -918,6 +989,74 @@ impl Panes {
             .child(div().flex_1().min_h_0().children(content))
             .into_any_element()
     }
+}
+
+/// A tab's title, and the colour of its dot when its thread is working or waiting.
+fn tab_label(tab: &Tab, cx: &App) -> (String, Option<Hsla>) {
+    let theme = cx.theme();
+    match tab {
+        Tab::Agent(agent) => match agent.read(cx).thread().map(|v| v.read(cx)) {
+            Some(t) => {
+                let dot = match t.status {
+                    Status::Idle => None,
+                    Status::Running => Some(theme.warning),
+                    Status::AwaitingApproval => Some(theme.primary),
+                };
+                (t.title.clone().unwrap_or_else(|| "New thread".into()), dot)
+            }
+            None => ("Agent".into(), None),
+        },
+        Tab::Terminal(term) => {
+            let t = term.read(cx);
+            (tab_title(t.title(), t.cwd()), None)
+        }
+        Tab::Review(review) => (format!("Review · {}", review.read(cx).file_count(cx)), None),
+    }
+}
+
+/// The content's top corners, where it meets the top bar, like a browser's page. Views that
+/// paint their own background round it to match.
+pub const CONTENT_RADIUS: f32 = 10.0;
+
+/// How tall the top bar's floating things are (tabs not on show, round buttons), and the gap
+/// above and below them, so they sit in the middle of the bar, level with the sidebar's buttons.
+pub const FLOAT_HEIGHT: f32 = 30.0;
+pub const FLOAT_INSET: f32 = 8.0;
+
+/// How far the shown tab's foot curves out into the frame on each side.
+const TAB_FLARE: f32 = 8.0;
+/// The shown tab's top corners.
+const TAB_RADIUS: f32 = 10.0;
+
+/// The shown tab's shape, like a browser's: rounded at the top, its foot flaring out on both
+/// sides into the content below. It sits behind the tab and reaches [`TAB_FLARE`] past it.
+fn tab_shape(color: Hsla) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let (o, w, h) = (bounds.origin, bounds.size.width, bounds.size.height);
+            let (f, r) = (px(TAB_FLARE), px(TAB_RADIUS));
+            let at = |x: Pixels, y: Pixels| point(o.x + x, o.y + y);
+            let mut path = PathBuilder::fill();
+            path.move_to(at(px(0.), h));
+            path.curve_to(at(f, h - f), at(f, h));
+            path.line_to(at(f, r));
+            path.curve_to(at(f + r, px(0.)), at(f, px(0.)));
+            path.line_to(at(w - f - r, px(0.)));
+            path.curve_to(at(w - f, r), at(w - f, px(0.)));
+            path.line_to(at(w - f, h - f));
+            path.curve_to(at(w, h), at(w - f, h));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .bottom_0()
+    .left(px(-TAB_FLARE))
+    .right(px(-TAB_FLARE))
 }
 
 /// A short tab label: a path-like shell title shows its last folder ("~/Projects/TJ" -> "TJ");

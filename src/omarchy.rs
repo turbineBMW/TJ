@@ -234,23 +234,29 @@ impl Palette {
         }
     }
 
-    /// The palette as a gpui-kit theme. Same choices as Bubo's libadwaita mapping: chrome
-    /// (sidebar, title bar, popovers) one step off the content background, hairlines at the
-    /// lowest opacity that still reads, and a light theme's foreground turned into ink.
+    /// The palette as a gpui-kit theme. The window's surfaces are Chrome's for the theme, as
+    /// Omarchy themes Chromium ([`chrome_colors`]): the frame (sidebar, top bar, tabs not on
+    /// show), the content and the tab on show, and the address bar's colour for fields and
+    /// cards. The rest follows Bubo's libadwaita mapping: hairlines at the lowest opacity that
+    /// still reads, and a light theme's foreground turned into ink.
     fn theme_config(&self, name: &str, font_family: Option<&str>) -> ThemeConfig {
         let c = |key: &str, fallback: &str| self.get(key, fallback);
-        let bg = c("background", "#1d1d20");
+        let seed = c("background", "#1d1d20");
+        let window = chrome_colors(&seed, self.light);
+        let bg = window.as_ref().map_or_else(|| seed.clone(), |w| w.base.clone());
         let fg = c("foreground", "#d0cfcc");
         let fg = if self.light { ink(&fg, &bg) } else { fg };
         let accent = c("accent", "blue");
         let accent = if rgb(&accent).is_some() { accent } else { c("blue", "#3584e4") };
-        let chrome = c("dark_background", "background");
+        let chrome = window.as_ref().map_or_else(|| c("dark_background", "background"), |w| w.header.clone());
         let raised = c("lighter_background", "background");
         let selection = c("selection", "background");
         let muted = c("muted", "dark_foreground");
         let opacity = border_opacity(&fg, &[&bg, &chrome]);
         let tint = |base: &str, amount: f64| mix(base, &fg, amount).unwrap_or_else(|| base.to_string());
         let border = tint(&bg, opacity as f64 / 100.0);
+        let field = window.as_ref().map_or_else(|| tint(&bg, 0.06), |w| w.omnibox.clone());
+        let tab_fg = window.as_ref().map_or_else(|| muted.clone(), |w| w.on_surface_secondary.clone());
         let alpha = |color: &str, a: u8| format!("{color}{a:02x}");
 
         let mut colors = Map::new();
@@ -272,9 +278,9 @@ impl Palette {
         set("primary.foreground", readable_on(&accent).into());
         set("primary.hover.background", mix(&accent, &bg, 0.12).unwrap_or(accent.clone()));
         set("primary.active.background", mix(&accent, "#000000", 0.12).unwrap_or(accent.clone()));
-        set("secondary.background", tint(&bg, 0.06));
-        set("secondary.hover.background", tint(&bg, 0.10));
-        set("secondary.active.background", tint(&bg, 0.14));
+        set("secondary.background", field.clone());
+        set("secondary.hover.background", tint(&field, 0.05));
+        set("secondary.active.background", tint(&field, 0.09));
         set("secondary.foreground", fg.clone());
         set("sidebar.background", chrome.clone());
         set("sidebar.foreground", fg.clone());
@@ -284,6 +290,11 @@ impl Palette {
         set("sidebar.primary.background", accent.clone());
         set("sidebar.primary.foreground", readable_on(&accent).into());
         set("title_bar.background", chrome.clone());
+        set("tab_bar.background", chrome.clone());
+        set("tab.background", chrome.clone());
+        set("tab.foreground", tab_fg);
+        set("tab.active.background", bg.clone());
+        set("tab.active.foreground", fg.clone());
         set("title_bar.border", border.clone());
         set("popover.background", if self.light { raised } else { chrome.clone() });
         set("popover.foreground", fg.clone());
@@ -321,6 +332,54 @@ impl Palette {
         }
         serde_json::from_value(config).expect("the theme config is built from known keys")
     }
+}
+
+/// Chrome's window colours for a theme colour. Omarchy gives Chromium the theme's
+/// `background` as its theme colour; Chrome takes its hue and builds Material "tonal spot"
+/// palettes from it (primary chroma 40, secondary 16, neutral 6), then picks tones from them
+/// for a themed window (`ui/color/sys_color_mixer.cc`, `AddThemedSysColorOverrides`).
+#[derive(Debug, PartialEq)]
+struct ChromeColors {
+    /// The frame behind the tabs, and the tabs not on show (`kColorSysHeader`).
+    header: String,
+    /// The tab on show, the toolbar and the page (`kColorSysBase`).
+    base: String,
+    /// The address bar (`kColorSysOmniboxContainer`).
+    omnibox: String,
+    /// Text on the tab on show (`kColorSysOnSurface`) and on the others
+    /// (`kColorSysOnSurfaceSecondary`).
+    on_surface: String,
+    on_surface_secondary: String,
+}
+
+fn chrome_colors(seed: &str, light: bool) -> Option<ChromeColors> {
+    use material_colors::{color::Rgb, hct::Hct};
+    let (r, g, b) = rgb(seed)?;
+    let hue = Hct::new(Rgb::new(r, g, b)).get_hue();
+    let tone = |chroma: f64, tone: f64| {
+        let c: Rgb = Hct::from(hue, chroma, tone).into();
+        format!("#{:02x}{:02x}{:02x}", c.red, c.green, c.blue)
+    };
+    let (primary, secondary, neutral) = (40.0, 16.0, 6.0);
+    Some(if light {
+        // Surface4: the primary colour (tone 40) at 0x1E over the surface (neutral 99).
+        let omnibox = mix(&tone(neutral, 99.0), &tone(primary, 40.0), f64::from(0x1E) / 255.0)?;
+        ChromeColors {
+            header: tone(secondary, 90.0),
+            base: tone(neutral, 98.0),
+            omnibox,
+            on_surface: tone(neutral, 10.0),
+            on_surface_secondary: tone(secondary, 30.0),
+        }
+    } else {
+        ChromeColors {
+            header: tone(secondary, 12.0),
+            base: tone(secondary, 25.0),
+            omnibox: tone(secondary, 15.0),
+            on_surface: tone(neutral, 90.0),
+            on_surface_secondary: tone(secondary, 80.0),
+        }
+    })
 }
 
 /// `key = "value"` pairs, quotes and inline comments stripped. Keys and
@@ -606,7 +665,7 @@ pub fn watch(cx: &mut gpui_kit::App, font_family: Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Palette, terminal_from_alacritty};
+    use super::{Palette, chrome_colors, contrast, hsl, luminance, terminal_from_alacritty};
 
     const OSAKA_JADE: &str = r##"
 mode = "dark"
@@ -626,10 +685,31 @@ blue = "#509475"
         let colors = &config["colors"];
         assert_eq!(config["mode"], "dark");
         assert_eq!(config["font.family"], "Noto Sans");
-        assert_eq!(colors["background"], "#111c18");
         assert_eq!(colors["primary.background"], "#509475");
-        // Chrome is derived a quarter of the way to black when the theme leaves it out.
-        assert_eq!(colors["sidebar.background"], "#0d1512");
+        // The surfaces are Chrome's for the theme's background (#111c18).
+        let chrome = chrome_colors("#111c18", false).unwrap();
+        assert_eq!(colors["background"], chrome.base.as_str());
+        assert_eq!(colors["tab.active.background"], chrome.base.as_str());
+        assert_eq!(colors["sidebar.background"], chrome.header.as_str());
+        assert_eq!(colors["tab.background"], chrome.header.as_str());
+        assert_eq!(colors["secondary.background"], chrome.omnibox.as_str());
+    }
+
+    #[test]
+    fn chrome_colors_follow_chromes_tones_for_the_theme_colour() {
+        // Dark: the frame darkest, the address bar a step up, the page and the tab on show
+        // lightest; all in the theme colour's hue.
+        let dark = chrome_colors("#111c18", false).unwrap();
+        let l = |c: &str| luminance(c).unwrap();
+        assert!(l(&dark.header) < l(&dark.omnibox) && l(&dark.omnibox) < l(&dark.base), "{dark:?}");
+        let (h, ..) = hsl(&dark.base).unwrap();
+        let (seed_h, ..) = hsl("#111c18").unwrap();
+        assert!((h - seed_h).abs() * 360.0 < 20.0, "{dark:?}");
+        // Light: the page near white, the frame a tinted step darker.
+        let light = chrome_colors("#f7efe6", true).unwrap();
+        assert!(l(&light.base) > 0.9 && l(&light.header) < l(&light.base), "{light:?}");
+        assert!(contrast(&light.on_surface, &light.base).unwrap() > 12.0, "{light:?}");
+        assert!(chrome_colors("not a colour", false).is_none());
     }
 
     #[test]

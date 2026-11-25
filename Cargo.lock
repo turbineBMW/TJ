@@ -4264,6 +4264,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "material-colors"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57a5bf6a9d1cf6319a36cebc589b9a681a6b1c699e162f27c020877783579cc7"
+dependencies = [
+ "ahash",
+ "indexmap",
+ "serde",
+]
+
+[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7209,6 +7220,7 @@ dependencies = [
  "chrono",
  "gpui-kit",
  "image",
+ "material-colors",
  "miniz_oxide 0.8.9",
  "polling",
  "resvg 0.46.0",
