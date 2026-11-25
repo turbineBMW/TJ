@@ -1,5 +1,5 @@
-//! While an agent works, its mark in the sidebar and the stop button breathe: they shrink for a
-//! second and grow back for a second. Under the conversation, Claude Code's spinner verbs take
+//! While an agent works, its mark in the sidebar breathes: it shrinks for a second and grows
+//! back for a second. Under the conversation, Claude Code's spinner verbs take
 //! turns, with a wave running through each one's letters.
 //!
 //! Everything moves in steps on one shared clock, so it all changes on the same draw and one

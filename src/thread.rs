@@ -72,7 +72,7 @@ const MODEL_MENU_WIDTH: f32 = 400.0;
 
 /// The widest the conversation and composer get, so lines stay readable in a wide window.
 const MAX_CONVERSATION_WIDTH: f32 = 860.0;
-/// The stop button's square, at the top of its breath.
+/// The stop button's square.
 const STOP_SIZE: f32 = 10.0;
 /// How far (pixels) the crest of the spinner verb's wave lifts a letter.
 const WAVE_LIFT: f32 = 2.5;
@@ -2132,8 +2132,8 @@ impl ThreadView {
     fn render_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let bg = cx.theme().background;
         let this = cx.entity();
-        // While the agent works (not while it waits on the user), the stop button breathes and
-        // a spinner verb waves under the conversation.
+        // While the agent works (not while it waits on the user), a spinner verb waves under the
+        // conversation.
         let working = if self.status == Status::Running {
             let step = crate::working::tick(window, cx);
             let (start, seed) = *self.working.get_or_insert_with(|| (step, crate::working::seed()));
@@ -2142,7 +2142,6 @@ impl ThreadView {
             self.working = None;
             None
         };
-        let breath = working.map(|(step, _, _)| crate::working::breath(step));
         let accent = cx.theme().primary;
         let spinner = working.map(|(_, steps, seed)| spinner_line(seed, steps, accent));
 
@@ -2293,8 +2292,7 @@ impl ThreadView {
             .tooltip("Attach images or files (or paste or drop them here)")
             .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)));
 
-        let card =
-            self.render_composer_card(attach, account_menu, mode_menu, model_menu, breath, cx).into_any_element();
+        let card = self.render_composer_card(attach, account_menu, mode_menu, model_menu, cx).into_any_element();
         if self.is_fresh() {
             return self.render_intro(card, cx).into_any_element();
         }
@@ -2324,15 +2322,14 @@ impl ThreadView {
     }
 
     /// The prompt card: attachments, the prompt, and a row of menus with a round send button
-    /// (a stop button while the agent works). The same card on the start screen and in a session.
-    /// `breath` is how big the stop button's square is drawn while the agent works.
+    /// (a red stop button while the agent works). The same card on the start screen and in a
+    /// session.
     fn render_composer_card(
         &self,
         attach: impl IntoElement,
         account_menu: impl IntoElement,
         mode_menu: impl IntoElement,
         model_menu: impl IntoElement,
-        breath: Option<f32>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -2340,27 +2337,19 @@ impl ThreadView {
         let (accent, accent_fg) = (theme.primary, theme.primary_foreground);
         let can_send = self.agent.is_some() || self.backend.is_some();
         let fresh = self.is_fresh();
-        let button = div()
-            .flex_none()
-            .size_8()
-            .rounded_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_color(accent_fg)
-            .cursor_pointer();
+        let button = div().flex_none().size_8().rounded_full().flex().items_center().justify_center().cursor_pointer();
         let send = if self.status != Status::Idle {
+            // The theme's red, so stopping reads as stopping.
+            let (stop, stop_fg) = (theme.danger, theme.danger_foreground);
             button
                 .id("stop")
-                .bg(accent)
-                .child({
-                    let side = STOP_SIZE * breath.unwrap_or(1.0);
-                    div().flex_none().size(px(side)).rounded(px(2.)).bg(accent_fg)
-                })
+                .bg(stop)
+                .child(div().flex_none().size(px(STOP_SIZE)).rounded(px(2.)).bg(stop_fg))
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
         } else {
             button
                 .id("send")
+                .text_color(accent_fg)
                 .bg(if can_send { accent } else { muted })
                 .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::ArrowUp).small())
                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
