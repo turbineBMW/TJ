@@ -272,11 +272,12 @@ impl AgentSlot {
                 )
                 .when(touched.contains(&file.path), |el| el.child(div().size_1p5().rounded_full().bg(accent)))
                 .child(
-                    div()
+                    h_flex()
+                        .gap_1()
                         .text_xs()
                         .font_family(mono.clone())
-                        .text_color(muted)
-                        .child(format!("+{} −{}", file.additions, file.deletions)),
+                        .child(div().text_color(added).child(format!("+{}", file.additions)))
+                        .child(div().text_color(deleted).child(format!("−{}", file.deletions))),
                 )
         });
         Some(
@@ -290,12 +291,15 @@ impl AgentSlot {
                         .px_3()
                         .py_1()
                         .gap_2()
-                        .child(div().text_xs().text_color(muted).child(format!(
-                            "Changes · {} files · +{} −{}",
-                            model.changes.files.len(),
-                            model.changes.additions(),
-                            model.changes.deletions()
-                        )))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("Changes · {} files ·", model.changes.files.len()))
+                                .child(div().text_color(added).child(format!("+{}", model.changes.additions())))
+                                .child(div().text_color(deleted).child(format!("−{}", model.changes.deletions()))),
+                        )
                         .child(div().flex_1())
                         .child(
                             Button::new("review-changes")
