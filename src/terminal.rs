@@ -1046,6 +1046,7 @@ impl Render for TerminalView {
             .relative()
             .size_full()
             .overflow_hidden()
+            .rounded_t(px(crate::panes::CONTENT_RADIUS))
             .bg(bg)
             .p_2()
             .child(

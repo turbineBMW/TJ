@@ -6,7 +6,7 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
@@ -19,7 +19,7 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use crate::agent::{AgentEvent, claude::SessionOptions};
 use crate::agent_slot::{AgentSlot, AgentSlotEvent};
 use crate::changes::{ProjectChanges, ReviewView, Summarizer};
-use crate::panes::{PaneEvent, Panes, Start};
+use crate::panes::{FLOAT_HEIGHT, FLOAT_INSET, PaneEvent, Panes, Start};
 use crate::settings::Settings;
 use crate::store::SplitDirection;
 use crate::store::{self, Accounts, Paths, State};
@@ -30,6 +30,18 @@ use gpui_kit::assets::IconName;
 
 const SIDEBAR_WIDTH: f32 = 264.0;
 const HEADER_HEIGHT: f32 = 46.0;
+
+// The top bar's floating things sit in its middle.
+const _: () = assert!(HEADER_HEIGHT == FLOAT_HEIGHT + 2.0 * FLOAT_INSET);
+
+pub const CONTEXT: &str = "Workspace";
+
+gpui_kit::actions!(workspace, [ToggleSidebar]);
+
+/// Shortcuts for the whole window. `Ctrl+Alt`, so the terminal never needs the key.
+pub fn bindings() -> Vec<KeyBinding> {
+    vec![KeyBinding::new("ctrl-alt-s", ToggleSidebar, Some(CONTEXT))]
+}
 /// The agent mark at the end of a thread's row in the sidebar.
 const MARK_SIZE: f32 = 14.0;
 /// An idle thread's Claude process (about 300 MB) is stopped after this long; the next
@@ -208,6 +220,13 @@ impl Workspace {
         });
         this.save();
         this
+    }
+
+    /// Fold the sidebar away, or bring it back. Remembered across restarts.
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.state.sidebar_collapsed = !self.state.sidebar_collapsed;
+        self.save();
+        cx.notify();
     }
 
     fn save(&mut self) {
@@ -1107,7 +1126,7 @@ impl Workspace {
             (theme.sidebar_foreground.opacity(0.6), theme.sidebar_accent, theme.sidebar_foreground);
         let waiting = theme.primary;
         let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
-        let (sidebar_bg, sidebar_border) = (theme.sidebar.opacity(alpha), theme.sidebar_border);
+        let sidebar_bg = theme.sidebar.opacity(alpha);
         let active = self.active.clone();
 
         let workspace = cx.entity();
@@ -1326,8 +1345,6 @@ impl Workspace {
             .h_full()
             .flex_none()
             .bg(sidebar_bg)
-            .border_r_1()
-            .border_color(sidebar_border)
             .child(
                 // "TJ" sits in the middle of the header; the controls and drag areas lie over it.
                 div()
@@ -1365,7 +1382,8 @@ impl Workspace {
     /// The top bar: `[badge] Project / Thread title`, like T3 Code, then the pane actions.
     fn content_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, waiting, muted, fg) = (theme.border, theme.warning, theme.muted_foreground, theme.foreground);
+        let (waiting, muted, fg) = (theme.warning, theme.muted_foreground, theme.foreground);
+        let (tab, tab_fg, page) = (theme.tab, theme.tab_foreground, theme.background);
         let thread = self.active_thread().map(|t| t.read(cx));
         let title = thread.and_then(|t| t.title.clone()).unwrap_or_else(|| "New thread".into());
         // Work in progress shows in the sidebar and the composer; only a question for the user
@@ -1375,29 +1393,54 @@ impl Workspace {
             _ => "",
         };
         let project_name = self.active_project().map(|p| p.name.clone());
-        let avatar = self.active_project().map(|p| {
-            let choices = self.image_choices(&p.id, cx);
-            div()
-                .id("header-project-image")
-                .flex_none()
-                .child(self.project_avatar(p, 20., cx))
-                .context_menu(move |menu, _, _| choices.add_to(menu))
-        });
-        let has_panes = self.active_project().is_some_and(|p| self.panes.contains_key(&p.id));
+        let avatar = |size: f32| {
+            self.active_project().map(|p| {
+                let choices = self.image_choices(&p.id, cx);
+                div()
+                    .id("header-project-image")
+                    .flex_none()
+                    .child(self.project_avatar(p, size, cx))
+                    .context_menu(move |menu, _, _| choices.add_to(menu))
+                    .into_any_element()
+            })
+        };
+        let panes = self.active_project().and_then(|p| self.panes.get(&p.id)).cloned();
+        let has_panes = panes.is_some();
+        // One pane: its tabs are the top bar's. Split: each pane keeps its strip and the bar
+        // names the project and thread.
+        let tabs = panes.as_ref().and_then(|panes| panes.read(cx).header_tabs(panes.clone(), avatar(16.), cx));
         let agent = self.active_project().and_then(|p| self.agents.get(&p.id)).cloned();
+
+        // Every action is its own round chip.
+        let chip = |id: &'static str, icon: IconName, tip: &'static str| {
+            div()
+                .id(id)
+                .test_support()
+                .flex_none()
+                .size(px(FLOAT_HEIGHT))
+                // In the middle of the bar, on the same line as the tabs.
+                .mb(px(FLOAT_INSET))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                // Solid, like the tabs not on show.
+                .bg(tab)
+                .text_color(tab_fg)
+                .hover(|el| el.bg(page).text_color(fg))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+                .child(Icon::new(icon).small())
+        };
         let status_toggle = agent.filter(|a| a.read(cx).has_status(cx)).map(|agent| {
             let shown = agent.read(cx).status_shown(cx);
-            Button::new("header-status")
-                .ghost()
-                .small()
-                .icon(if shown { IconName::PanelRightClose } else { IconName::PanelRightOpen })
-                .tooltip(if shown { "Hide the thread's status" } else { "Show the thread's status" })
-                .on_click(move |_, _, cx| agent.update(cx, |a, cx| a.toggle_status(cx)))
+            chip(
+                "header-status",
+                if shown { IconName::PanelRightClose } else { IconName::PanelRightOpen },
+                if shown { "Hide the thread's status" } else { "Show the thread's status" },
+            )
+            .on_click(move |_, _, cx| agent.update(cx, |a, cx| a.toggle_status(cx)))
         });
-
-        let pane_button = |id: &'static str, icon: IconName, tip: &'static str| {
-            Button::new(id).ghost().small().icon(icon).tooltip(tip)
-        };
         let with_panes = |f: fn(&mut Panes, &mut Window, &mut Context<Panes>)| {
             cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
                 if let Some(panes) = this.active_project().and_then(|p| this.panes.get(&p.id)).cloned() {
@@ -1405,53 +1448,81 @@ impl Workspace {
                 }
             })
         };
+        // Like a browser's tab-search button, at the far left: it hides or shows the sidebar.
+        let collapsed = self.state.sidebar_collapsed;
+        let sidebar_toggle = chip(
+            "header-sidebar",
+            if collapsed { IconName::PanelLeftOpen } else { IconName::PanelLeftClose },
+            if collapsed { "Show the sidebar (Ctrl+Alt+S)" } else { "Hide the sidebar (Ctrl+Alt+S)" },
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
+        let new_terminal = has_panes.then(|| {
+            chip("header-new-terminal", IconName::Plus, "New terminal tab (Ctrl+Shift+T)")
+                .on_click(with_panes(|p, window, cx| p.new_terminal(window, cx)))
+        });
 
         h_flex()
             .h(px(HEADER_HEIGHT))
             .flex_none()
-            .gap_2()
-            .px_3()
-            .border_b_1()
-            .border_color(border)
-            .children(avatar)
-            .when_some(project_name, |el, name| {
-                el.child(div().flex_none().text_sm().text_color(muted).child(name))
-                    .child(div().flex_none().text_sm().text_color(muted).child("/"))
+            .items_end()
+            // The same gap beside the floating things as above and below them, so the sidebar
+            // button sits in the middle between the window's edge and the first tab.
+            .gap(px(FLOAT_INSET))
+            .px(px(FLOAT_INSET))
+            .child(sidebar_toggle)
+            .map(|el| match tabs {
+                Some(tabs) => el.child(tabs).children(new_terminal),
+                None => el
+                    .child(
+                        h_flex()
+                            .h(px(FLOAT_HEIGHT))
+                            .mb(px(FLOAT_INSET))
+                            .min_w_0()
+                            .gap_2()
+                            .children(avatar(20.))
+                            .when_some(project_name, |el, name| {
+                                el.child(div().flex_none().text_sm().text_color(muted).child(name))
+                                    .child(div().flex_none().text_sm().text_color(muted).child("/"))
+                            })
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .max_w(px(420.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .text_color(fg)
+                                    .child(title),
+                            ),
+                    )
+                    .children(new_terminal),
             })
-            .child(
-                div()
-                    .min_w_0()
-                    .max_w(px(420.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_sm()
-                    .text_color(fg)
-                    .child(title),
-            )
             .child(drag_area())
-            .child(div().text_sm().text_color(waiting).child(status))
+            .child(
+                h_flex()
+                    .h(px(FLOAT_HEIGHT))
+                    .mb(px(FLOAT_INSET))
+                    .flex_none()
+                    .text_sm()
+                    .text_color(waiting)
+                    .child(status),
+            )
             .when(has_panes, |el| {
                 el.child(
-                    pane_button("header-new-terminal", IconName::SquareTerminal, "New terminal tab (Ctrl+Shift+T)")
-                        .on_click(with_panes(|p, window, cx| p.new_terminal(window, cx))),
-                )
-                .child(
-                    pane_button("header-split-right", IconName::Columns2, "Split right (Ctrl+Shift+E)")
+                    chip("header-split-right", IconName::Columns2, "Split right (Ctrl+Shift+E)")
                         .on_click(with_panes(|p, window, cx| p.split(SplitDirection::Right, window, cx))),
                 )
                 .child(
-                    pane_button("header-split-down", IconName::Rows2, "Split down (Ctrl+Shift+O)")
+                    chip("header-split-down", IconName::Rows2, "Split down (Ctrl+Shift+O)")
                         .on_click(with_panes(|p, window, cx| p.split(SplitDirection::Down, window, cx))),
                 )
             })
             .children(status_toggle)
-            .child(Button::new("close-window").ghost().small().icon(IconName::X).tooltip("Close").on_click(
-                cx.listener(|this, _, window, cx| {
-                    this.save_layouts(cx);
-                    window.remove_window();
-                }),
-            ))
+            .child(chip("close-window", IconName::X, "Close").on_click(cx.listener(|this, _, window, cx| {
+                this.save_layouts(cx);
+                window.remove_window();
+            })))
     }
 }
 
@@ -1567,21 +1638,38 @@ impl Render for Workspace {
         let panes = self.active_project().and_then(|p| self.panes.get(&p.id)).cloned();
         let theme = cx.theme();
         let (bg, fg, danger) = (theme.background, theme.foreground, theme.danger);
+        // Around the content is the window's frame, like a browser's: the sidebar's colour,
+        // see-through with it. The top bar is part of it, and the content below is the page
+        // the shown tab opens into.
+        let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
+        let frame = theme.sidebar.opacity(alpha);
 
-        // The window itself is transparent: only the content area paints an opaque background,
-        // so the sidebar can be see-through.
-        crate::caret::watch(h_flex()).size_full().text_color(fg).child(self.sidebar(window, cx)).child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .bg(bg)
-                .child(self.content_header(cx))
-                .when_some(self.problem.clone(), |el, problem| {
-                    el.child(div().px_4().py_2().text_sm().text_color(danger).child(problem))
-                })
-                .child(div().flex_1().min_h_0().min_w_0().children(panes)),
-        )
+        // The window itself is transparent: only the content under the top bar paints an
+        // opaque background, so the sidebar and the frame can be see-through.
+        let sidebar = (!self.state.sidebar_collapsed).then(|| self.sidebar(window, cx).into_any_element());
+        crate::caret::watch(h_flex())
+            .key_context(CONTEXT)
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .size_full()
+            .text_color(fg)
+            .children(sidebar)
+            .child(
+                v_flex().flex_1().min_w_0().h_full().bg(frame).child(self.content_header(cx)).child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        // Rounded at the top like a browser's page, so it sits in the frame. The
+                        // views in it round their own backgrounds to match.
+                        .rounded_t(px(crate::panes::CONTENT_RADIUS))
+                        .overflow_hidden()
+                        .bg(bg)
+                        .when_some(self.problem.clone(), |el, problem| {
+                            el.child(div().px_4().py_2().text_sm().text_color(danger).child(problem))
+                        })
+                        .child(div().flex_1().min_h_0().min_w_0().children(panes)),
+                ),
+            )
     }
 }
 
@@ -2095,20 +2183,42 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_top_bar_splits_the_focused_pane_and_tabs_appear_only_when_needed(cx: &mut TestAppContext) {
+    fn the_top_bar_holds_a_single_panes_tabs_and_splits_hand_them_back(cx: &mut TestAppContext) {
         let (window, workspace, _, _) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
         assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![1], "a new project starts with just its conversation");
         cx.update(|window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find(SharedString::from("tab-1-0")).is_none(), "no tab strip for a single tab");
+            assert!(window.try_find(SharedString::from("header-tab-0")).is_some(), "the agent is a tab in the top bar");
             window.click(SharedString::from("header-new-terminal"), cx);
             window.render_frame(cx);
-            assert!(window.try_find(SharedString::from("tab-1-1")).is_some(), "a second tab shows the strip");
+            assert!(window.try_find(SharedString::from("header-tab-1")).is_some(), "a terminal joins it there");
+            assert!(window.try_find(SharedString::from("tab-1-1")).is_none(), "no strip over a single pane");
             window.click(SharedString::from("header-split-right"), cx);
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from("header-tab-0")).is_none(), "split panes keep their own tabs");
+            assert!(window.try_find(SharedString::from("tab-1-1")).is_some(), "so the strip comes back");
         });
         assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2, 1]);
+    }
+
+    #[gpui_kit::test]
+    fn the_sidebar_folds_away_from_the_top_bar_or_ctrl_alt_s_and_stays_so(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let collapsed = |cx: &mut VisualTestContext| workspace.read_with(cx, |w, _| w.state.sidebar_collapsed);
+        assert!(!collapsed(cx), "the sidebar starts out shown");
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(SharedString::from("header-sidebar"), cx);
+        });
+        assert!(collapsed(cx), "the top bar's button hides it");
+        assert!(State::load(&paths).unwrap().sidebar_collapsed, "and that's saved");
+        cx.simulate_keystrokes("ctrl-alt-s");
+        assert!(!collapsed(cx), "Ctrl+Alt+S brings it back");
+        cx.simulate_keystrokes("ctrl-alt-s");
+        assert!(collapsed(cx), "and hides it again");
     }
 
     #[test]

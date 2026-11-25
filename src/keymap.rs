@@ -13,6 +13,8 @@ pub fn init(cx: &mut App) {
     crate::terminal::init(cx);
     // Vmux's pane and tab shortcuts, inside the terminal area only.
     cx.bind_keys(crate::panes::bindings());
+    // Window-wide: hiding the sidebar.
+    cx.bind_keys(crate::workspace::bindings());
     // Answering Claude's questions in their modal.
     cx.bind_keys(crate::thread::question_bindings());
 }

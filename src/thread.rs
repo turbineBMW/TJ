@@ -2254,6 +2254,7 @@ impl ThreadView {
         v_flex()
             .relative()
             .size_full()
+            .rounded_t(px(crate::panes::CONTENT_RADIUS))
             .bg(bg)
             .child(div().flex_1().min_h_0().child(transcript))
             .when_some(spinner, |el, spinner| {
@@ -2357,34 +2358,42 @@ impl ThreadView {
         };
 
         // A little above centre, like T3 Code's start screen.
-        v_flex().size_full().bg(bg).items_center().justify_center().px_6().pb(px(140.)).child(
-            v_flex()
-                .w_full()
-                .max_w(px(MAX_CONVERSATION_WIDTH - 80.0))
-                .gap_2()
-                .child(
-                    div()
-                        .w_full()
-                        .pb_4()
-                        .flex()
-                        .justify_center()
-                        .text_3xl()
-                        .text_color(fg)
-                        .child(format!("What should we build in {project}?")),
-                )
-                .child(card)
-                .child(
-                    h_flex()
-                        .px_2()
-                        .gap_4()
-                        .child(footnote(gpui_kit::assets::IconName::Folder, self.menus.project_dir.clone()))
-                        .child(div().flex_1())
-                        .when_some(self.menus.branch.clone(), |el, branch| {
-                            el.child(footnote(gpui_kit::assets::IconName::GitBranch, branch))
-                        })
-                        .child(footnote(gpui_kit::assets::IconName::Shield, self.mode.label().to_string())),
-                ),
-        )
+        v_flex()
+            .size_full()
+            .rounded_t(px(crate::panes::CONTENT_RADIUS))
+            .bg(bg)
+            .items_center()
+            .justify_center()
+            .px_6()
+            .pb(px(140.))
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(MAX_CONVERSATION_WIDTH - 80.0))
+                    .gap_2()
+                    .child(
+                        div()
+                            .w_full()
+                            .pb_4()
+                            .flex()
+                            .justify_center()
+                            .text_3xl()
+                            .text_color(fg)
+                            .child(format!("What should we build in {project}?")),
+                    )
+                    .child(card)
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .gap_4()
+                            .child(footnote(gpui_kit::assets::IconName::Folder, self.menus.project_dir.clone()))
+                            .child(div().flex_1())
+                            .when_some(self.menus.branch.clone(), |el, branch| {
+                                el.child(footnote(gpui_kit::assets::IconName::GitBranch, branch))
+                            })
+                            .child(footnote(gpui_kit::assets::IconName::Shield, self.mode.label().to_string())),
+                    ),
+            )
     }
 }
 

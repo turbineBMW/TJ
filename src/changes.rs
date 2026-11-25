@@ -435,6 +435,7 @@ impl Render for ReviewView {
 
         v_flex()
             .size_full()
+            .rounded_t(px(crate::panes::CONTENT_RADIUS))
             .bg(bg)
             .child(
                 h_flex()
