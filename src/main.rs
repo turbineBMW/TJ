@@ -8,6 +8,8 @@ mod changes;
 mod composer;
 mod demo;
 mod fonts;
+mod github;
+mod github_view;
 mod grow;
 mod handoff;
 mod highlight;
@@ -54,6 +56,8 @@ struct Args {
     project: Option<PathBuf>,
     /// Open the review of the project's changes.
     review: bool,
+    /// Open the project's GitHub tab.
+    github: bool,
 }
 
 impl Args {
@@ -68,6 +72,7 @@ impl Args {
             type_text: value("--type"),
             project: value("--project").map(PathBuf::from),
             review: args.iter().any(|a| a == "--review"),
+            github: args.iter().any(|a| a == "--github"),
         }
     }
 
@@ -92,6 +97,7 @@ impl Args {
             shell: None,
             no_summaries: false,
             review: self.review,
+            github: self.github,
         }
     }
 }

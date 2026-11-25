@@ -303,6 +303,9 @@ pub struct Project {
     /// The project's picture; when absent, an icon found in the project, else its initials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ProjectImage>,
+    /// The GitHub account (a `gh` login) for the GitHub tab; picked from the remote when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_account: Option<String>,
 }
 
 /// The picture chosen for a project.
@@ -336,6 +339,9 @@ pub enum TabState {
     Terminal { cwd: PathBuf },
     /// The review of the project's changes.
     Review,
+    /// The project's pull requests and branches on GitHub.
+    #[serde(rename = "github")]
+    GitHub,
 }
 
 /// A saved layout: panes of tabs, split right or down.
@@ -404,6 +410,7 @@ impl State {
             threads: Vec::new(),
             layout: None,
             image: None,
+            github_account: None,
         });
         self.projects.last_mut().unwrap()
     }

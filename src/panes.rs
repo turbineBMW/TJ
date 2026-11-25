@@ -1,5 +1,6 @@
 //! A project's main area, laid out like Vmux: panes split right or down, each with its own
-//! tabs. A tab is the project's agent, a terminal, or the review of the project's changes.
+//! tabs. A tab is the project's agent, a terminal, the review of the project's changes, or its
+//! GitHub page.
 //! There is one agent tab per project: picking a thread in the sidebar changes what it shows,
 //! and leaves every other tab where it is. Closing a pane's last tab folds its split back up.
 //! Shortcuts match Vmux's.
@@ -15,6 +16,7 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::agent_slot::AgentSlot;
 use crate::changes::ReviewView;
+use crate::github_view::GitHubView;
 use crate::store::{PaneLayout, SplitDirection, TabState};
 use crate::terminal::{TerminalExited, TerminalView};
 use crate::thread::{Status, ThreadView};
@@ -66,6 +68,7 @@ pub enum Tab {
     Agent(Entity<AgentSlot>),
     Terminal(Entity<TerminalView>),
     Review(Entity<ReviewView>),
+    GitHub(Entity<GitHubView>),
 }
 
 impl Tab {
@@ -74,6 +77,7 @@ impl Tab {
             Tab::Agent(agent) => agent.entity_id(),
             Tab::Terminal(term) => term.entity_id(),
             Tab::Review(review) => review.entity_id(),
+            Tab::GitHub(github) => github.entity_id(),
         }
     }
 
@@ -84,6 +88,7 @@ impl Tab {
                 TabState::Terminal { cwd: term.read(cx).cwd().unwrap_or_else(|| project_dir.to_path_buf()) }
             }
             Tab::Review(_) => TabState::Review,
+            Tab::GitHub(_) => TabState::GitHub,
         }
     }
 
@@ -309,6 +314,8 @@ pub struct Panes {
     agent: Entity<AgentSlot>,
     /// The project's review, shared by any review tab.
     review: Entity<ReviewView>,
+    /// The project's GitHub page, shared by any GitHub tab.
+    github: Entity<GitHubView>,
     /// The shell to run; the user's login shell when `None` (tests use `/bin/sh`).
     shell: Option<Shell>,
     /// The conversation last reported as focused.
@@ -328,6 +335,7 @@ impl Panes {
         layout: Option<&PaneLayout>,
         agent: Entity<AgentSlot>,
         review: Entity<ReviewView>,
+        github: Entity<GitHubView>,
         start: Start,
         shell: Option<Shell>,
         window: &mut Window,
@@ -340,6 +348,7 @@ impl Panes {
             project_dir,
             agent: agent.clone(),
             review,
+            github: github.clone(),
             shell,
             reported_thread: None,
             focus: cx.focus_handle(),
@@ -347,6 +356,7 @@ impl Panes {
             _subscriptions: Vec::new(),
         };
         this._subscriptions.push(cx.observe(&agent, |_, _, cx| cx.notify()));
+        this._subscriptions.push(cx.observe(&github, |_, _, cx| cx.notify()));
         let has_thread = start.thread.is_some();
         if let Some((id, view)) = start.thread {
             agent.update(cx, |a, cx| a.set_thread(&id, view, cx));
@@ -388,6 +398,7 @@ impl Panes {
                             self.spawn(Some(cwd.clone()).filter(|d| d.is_dir()), window, cx).map(Tab::Terminal)
                         }
                         TabState::Review => Some(Tab::Review(self.review.clone())),
+                        TabState::GitHub => Some(Tab::GitHub(self.github.clone())),
                     })
                     .collect();
                 (!tabs.is_empty()).then(|| {
@@ -513,6 +524,7 @@ impl Panes {
                     Some(Icon::new(IconName::SquareTerminal).small().text_color(muted).into_any_element())
                 }
                 Tab::Review(_) => Some(Icon::new(IconName::FileDiff).small().text_color(muted).into_any_element()),
+                Tab::GitHub(_) => Some(Icon::new(IconName::Github).small().text_color(muted).into_any_element()),
             };
             let (activate, close) = (this.clone(), this.clone());
             h_flex()
@@ -621,6 +633,7 @@ impl Panes {
                 let focus = Focusable::focus_handle(term.read(cx), cx);
                 window.focus(&focus, cx);
             }
+            Some(Tab::GitHub(github)) => github.update(cx, |g, cx| g.shown(window, cx)),
             Some(Tab::Review(_)) | None => self.focus.focus(window, cx),
         }
     }
@@ -674,6 +687,19 @@ impl Panes {
             Some(at) => self.activate_at(at, window, cx),
             None => self.push_tab(Tab::Review(self.review.clone()), window, cx),
         }
+    }
+
+    /// Show the GitHub tab, opening it in the focused pane if needed.
+    pub fn show_github(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.find(|t| matches!(t, Tab::GitHub(_))) {
+            Some(at) => self.activate_at(at, window, cx),
+            None => self.push_tab(Tab::GitHub(self.github.clone()), window, cx),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn github_is_showing(&self) -> bool {
+        matches!(self.active_tab(), Some(Tab::GitHub(_)))
     }
 
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -935,6 +961,7 @@ impl Panes {
             Tab::Agent(agent) => agent.clone().into_any_element(),
             Tab::Terminal(term) => term.clone().into_any_element(),
             Tab::Review(review) => review.clone().into_any_element(),
+            Tab::GitHub(github) => github.clone().into_any_element(),
         });
         v_flex()
             .size_full()
@@ -985,6 +1012,7 @@ fn tab_label(tab: &Tab, cx: &App) -> (String, Option<Hsla>) {
             (tab_title(t.title(), t.cwd()), None)
         }
         Tab::Review(review) => (review.read(cx).title(cx), None),
+        Tab::GitHub(github) => (github.read(cx).title(), None),
     }
 }
 
@@ -1116,10 +1144,11 @@ mod tests {
                 let thread = cx.new(|cx| ThreadView::new(Backend::Scripted(Vec::new()), window, cx));
                 let changes = cx.new(|cx| ProjectChanges::new(project.clone(), cx));
                 let review = cx.new(|cx| ReviewView::new(changes.clone(), true, cx));
+                let github = cx.new(|cx| crate::github_view::GitHubView::new(project.clone(), None, window, cx));
                 let agent = cx.new(|cx| crate::agent_slot::AgentSlot::new(project.clone(), changes, cx));
                 let start = Start { thread: start_thread.then(|| ("t1".to_string(), thread.clone())), terminal: true };
                 let panes = cx.new(|cx| {
-                    Panes::new(project, layout.as_ref(), agent, review, start, Some(shell.clone()), window, cx)
+                    Panes::new(project, layout.as_ref(), agent, review, github, start, Some(shell.clone()), window, cx)
                 });
                 cx.subscribe(&panes, move |_, event: &PaneEvent, _| {
                     log.borrow_mut().push(match event {
@@ -1338,6 +1367,7 @@ mod tests {
                     TabState::Thread { id: "t1".into() },
                     TabState::Thread { id: "gone".into() },
                     TabState::Review,
+                    TabState::GitHub,
                 ],
                 active: 1,
             }),
@@ -1348,11 +1378,11 @@ mod tests {
         };
         let s = open(cx, Some(layout), false);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "the conversations become one agent tab");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![3, 1], "the conversations become one agent tab");
         let restored = s.panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
         let PaneLayout::Split { ratio, first, second, .. } = restored else { panic!("{restored:?}") };
         assert_eq!(ratio, 0.6);
-        let expected = vec![TabState::Agent, TabState::Review];
+        let expected = vec![TabState::Agent, TabState::Review, TabState::GitHub];
         assert!(matches!(*first, PaneLayout::Pane { ref tabs, .. } if *tabs == expected));
         let PaneLayout::Pane { tabs, .. } = *second else { panic!() };
         assert_eq!(

@@ -15,6 +15,8 @@ pub fn init(cx: &mut App) {
     // Answering Claude's questions in their modal, and moving around the settings modal.
     cx.bind_keys(crate::thread::question_bindings());
     cx.bind_keys(crate::settings_view::bindings());
+    // Moving through pull requests and sections in the GitHub tab.
+    cx.bind_keys(crate::github_view::bindings());
     // The shortcuts settings can change: Vmux's pane and tab keys inside the main area, and the
     // window-wide ones (projects, the switcher, settings, the sidebar).
     crate::keybindings::apply(cx);
