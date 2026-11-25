@@ -41,6 +41,7 @@ The model is Rustle and Bubo (`~/Projects/Rustle`, `~/Projects/Bubo`):
 
 ## Keyboard rules
 
+- **Keyboard first.** TJ is a GUI, but everything in it must be doable from the keyboard alone: every button, card, menu, list and dialog needs a key path, and a feature isn't finished until it has one. The mouse is a convenience, never the only way. Show the keys where they apply (the question modal's hint line is the model). TODO.md lists what still needs the mouse.
 - **Tab never moves focus.** Terminals (and the prompt box) use Tab. Move focus with explicit shortcuts such as the pane-focus keys above.
 - gpui runs key bindings before a view's key handler. Any binding an outer view makes that a terminal needs must be unbound in the `Terminal` key context, via `terminal::PASSTHROUGH_KEYS` and `NoAction`. gpui-kit's root view binds Tab, Shift+Tab and Ctrl+C. The test `tab_and_ctrl_c_reach_the_shell` guards this.
 - App shortcuts use `Ctrl+Shift` or `Ctrl+Alt`, so plain `Ctrl+letter` always reaches the shell.
