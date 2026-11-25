@@ -509,19 +509,19 @@ impl Panes {
     }
 
     /// Whether the tabs live in the top bar instead of a strip over the pane: when the project
-    /// is a single pane, so the shown tab can open straight into it.
+    /// is a single pane, so there's no doubt which pane they switch.
     pub fn tabs_in_header(&self) -> bool {
         matches!(self.root, Some(Node::Pane(_)))
     }
 
-    /// The single pane's tabs for the top bar, like a browser's: the shown one joins the
-    /// content below, the others float. `favicon` goes on the agent tab.
+    /// The single pane's tabs for the top bar, every one floating on the frame; the shown one
+    /// stands out by its colour. `favicon` goes on the agent tab.
     pub fn header_tabs(&self, this: Entity<Self>, favicon: Option<AnyElement>, cx: &App) -> Option<AnyElement> {
         let Some(Node::Pane(pane)) = &self.root else { return None };
         let theme = cx.theme();
-        let (fg, muted, page) = (theme.foreground, theme.muted_foreground, theme.background);
-        // Like Chrome's: the tabs not on show are the frame's colour, solid, so they float on a
-        // see-through frame; hovering one lifts it to the page's colour.
+        let (fg, muted, shown) = (theme.foreground, theme.muted_foreground, theme.tab_active);
+        // Every tab floats on the see-through frame, solid: the one on show in Chrome's colour
+        // for a shown tab, the others in the frame's; hovering one lifts it to the shown colour.
         let (tab_bg, tab_fg) = (theme.tab, theme.tab_foreground);
         let mut favicon = favicon;
         let pane_id = pane.id;
@@ -548,18 +548,14 @@ impl Panes {
                 .px_3()
                 .text_sm()
                 .cursor_pointer()
+                .h(px(FLOAT_HEIGHT))
+                .mb(px(FLOAT_INSET))
+                .rounded_lg()
                 .map(|el| {
                     if active {
-                        // From the floating tabs' top down into the content, with its title
-                        // level with theirs.
-                        el.h(px(FLOAT_HEIGHT + FLOAT_INSET)).pb(px(FLOAT_INSET)).text_color(fg).child(tab_shape(page))
+                        el.text_color(fg).bg(shown)
                     } else {
-                        el.h(px(FLOAT_HEIGHT))
-                            .mb(px(FLOAT_INSET))
-                            .rounded_lg()
-                            .text_color(tab_fg)
-                            .bg(tab_bg)
-                            .hover(|el| el.bg(page).text_color(fg))
+                        el.text_color(tab_fg).bg(tab_bg).hover(|el| el.bg(shown).text_color(fg))
                     }
                 })
                 .on_click(move |_, window, cx| activate.update(cx, |p, cx| p.activate_at((pane_id, ix), window, cx)))
@@ -590,7 +586,7 @@ impl Panes {
                 .min_w_0()
                 .flex_shrink(1.)
                 .items_end()
-                .gap(px(TAB_FLARE + 2.))
+                .gap(px(FLOAT_INSET))
                 .children(tabs)
                 .into_any_element(),
         )
@@ -1022,42 +1018,6 @@ pub const CONTENT_RADIUS: f32 = 10.0;
 /// above and below them, so they sit in the middle of the bar, level with the sidebar's buttons.
 pub const FLOAT_HEIGHT: f32 = 30.0;
 pub const FLOAT_INSET: f32 = 8.0;
-
-/// How far the shown tab's foot curves out into the frame on each side.
-const TAB_FLARE: f32 = 8.0;
-/// The shown tab's top corners.
-const TAB_RADIUS: f32 = 10.0;
-
-/// The shown tab's shape, like a browser's: rounded at the top, its foot flaring out on both
-/// sides into the content below. It sits behind the tab and reaches [`TAB_FLARE`] past it.
-fn tab_shape(color: Hsla) -> impl IntoElement {
-    canvas(
-        |_, _, _| {},
-        move |bounds, _, window, _| {
-            let (o, w, h) = (bounds.origin, bounds.size.width, bounds.size.height);
-            let (f, r) = (px(TAB_FLARE), px(TAB_RADIUS));
-            let at = |x: Pixels, y: Pixels| point(o.x + x, o.y + y);
-            let mut path = PathBuilder::fill();
-            path.move_to(at(px(0.), h));
-            path.curve_to(at(f, h - f), at(f, h));
-            path.line_to(at(f, r));
-            path.curve_to(at(f + r, px(0.)), at(f, px(0.)));
-            path.line_to(at(w - f - r, px(0.)));
-            path.curve_to(at(w - f, r), at(w - f, px(0.)));
-            path.line_to(at(w - f, h - f));
-            path.curve_to(at(w, h), at(w - f, h));
-            path.close();
-            if let Ok(path) = path.build() {
-                window.paint_path(path, color);
-            }
-        },
-    )
-    .absolute()
-    .top_0()
-    .bottom_0()
-    .left(px(-TAB_FLARE))
-    .right(px(-TAB_FLARE))
-}
 
 /// A short tab label: a path-like shell title shows its last folder ("~/Projects/TJ" -> "TJ");
 /// anything else (a running program's title) is shown as is.
