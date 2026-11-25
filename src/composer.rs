@@ -1,4 +1,4 @@
-//! What the prompt box needs besides text: `@file` mentions and attached images.
+//! What the prompt box needs besides text: `@file` mentions, `/` commands and attached images.
 //!
 //! A mention is the text `@path`, which Claude Code itself expands into the file's contents
 //! (also in `-p` stream-json mode), so TJ only has to help pick the path. Images go to the
@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::Context as _;
 
-use crate::agent::PromptImage;
+use crate::agent::{PromptImage, SlashCommand};
 
 /// Stop listing a huge tree here; the picker only ever shows a few.
 pub const MAX_FILES: usize = 50_000;
@@ -115,6 +115,57 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
     needle.chars().all(|c| rest.any(|h| h == c))
 }
 
+/// The `/command` being typed: the prompt starts with `/` and the cursor is still in that
+/// first word. Returns the word's range (to replace) and what's typed after the slash.
+/// Claude Code only runs a command at the very start of a message, so nowhere else counts.
+pub fn command_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
+    let rest = text.strip_prefix('/')?;
+    let end = 1 + rest.find(char::is_whitespace).unwrap_or(rest.len());
+    if cursor == 0 || cursor > end {
+        return None;
+    }
+    let word = &text[1..end];
+    // `/src/main.rs` is a path, not a command.
+    if word.contains('/') || word.contains('\\') {
+        return None;
+    }
+    Some((0..end, text[1..cursor].to_string()))
+}
+
+/// The commands matching `query`, best first: names that start with it, then names with a
+/// part that does (`review` finds `code-review`), then names that contain it. From three
+/// letters on, descriptions with a word that starts with it and names that have its letters
+/// in order count too; shorter, they'd match nearly everything.
+pub fn rank_commands(commands: &[SlashCommand], query: &str, limit: usize) -> Vec<SlashCommand> {
+    let query = query.to_lowercase();
+    let loose = query.chars().count() >= 3;
+    let mut scored: Vec<(u8, usize, usize)> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, c)| {
+            let name = c.name.to_lowercase();
+            let score = if name.starts_with(&query) {
+                0
+            } else if name.split([':', '-', '_']).any(|part| part.starts_with(&query)) {
+                1
+            } else if name.contains(&query) {
+                2
+            } else if loose
+                && c.description.to_lowercase().split(|ch: char| !ch.is_alphanumeric()).any(|w| w.starts_with(&query))
+            {
+                3
+            } else if loose && is_subsequence(&query, &name) {
+                4
+            } else {
+                return None;
+            };
+            Some((score, if query.is_empty() { 0 } else { name.len() }, ix))
+        })
+        .collect();
+    scored.sort();
+    scored.into_iter().take(limit).map(|(_, _, ix)| commands[ix].clone()).collect()
+}
+
 /// The text a mention inserts. Paths with spaces are quoted, as Claude Code expects.
 pub fn mention_text(path: &str) -> String {
     if path.chars().any(char::is_whitespace) { format!("@\"{path}\"") } else { format!("@{path}") }
@@ -193,7 +244,45 @@ pub fn files_dir(transcript: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_image, mention_path, mention_text, prepare_image, query_at, rank};
+    use super::{command_query, is_image, mention_path, mention_text, prepare_image, query_at, rank, rank_commands};
+    use crate::agent::SlashCommand;
+
+    #[test]
+    fn a_command_is_the_first_word_of_the_prompt() {
+        assert_eq!(command_query("/", 1), Some((0..1, String::new())));
+        assert_eq!(command_query("/comp", 5), Some((0..5, "comp".into())));
+        assert_eq!(command_query("/compact keep the plan", 3), Some((0..8, "co".into())), "the whole word is replaced");
+        assert_eq!(command_query("/compact keep", 12), None, "past the name it's the arguments");
+        assert_eq!(command_query("look /comp", 10), None, "only at the start");
+        assert_eq!(command_query("/src/main.rs", 4), None, "a path");
+        assert_eq!(command_query("/x", 0), None, "the cursor is before the slash");
+    }
+
+    #[test]
+    fn command_names_that_start_with_the_query_come_first() {
+        let commands: Vec<SlashCommand> = [
+            ("code-review", "Review the diff"),
+            ("compact", "Clear history but keep a summary"),
+            ("context", "Show context usage"),
+            ("plugin:commit", "Make a commit"),
+            ("clear", "Start over"),
+        ]
+        .map(|(name, description)| SlashCommand {
+            name: name.into(),
+            description: description.into(),
+            argument_hint: String::new(),
+        })
+        .to_vec();
+        let names = |query: &str| rank_commands(&commands, query, 8).into_iter().map(|c| c.name).collect::<Vec<_>>();
+        assert_eq!(names("co"), ["compact", "context", "code-review", "plugin:commit"]);
+        assert_eq!(names("review"), ["code-review"]);
+        assert_eq!(names("commit"), ["plugin:commit"]);
+        assert_eq!(names("summary"), ["compact"], "descriptions count too");
+        assert_eq!(names("us"), Vec::<String>::new(), "but not for a letter or two (\"usage\" in a description)");
+        assert_eq!(names("ont"), ["context"], "a word inside a description has to start with it");
+        assert_eq!(names("").len(), 5, "everything, in Claude's order");
+        assert_eq!(names("")[0], "code-review");
+    }
     use std::path::Path;
 
     #[test]

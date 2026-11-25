@@ -18,6 +18,9 @@ INIT_KEEP = {"type", "subtype", "session_id", "model", "permissionMode", "claude
 INITIALIZE_KEEP = {"claude_code_version", "current_permission_mode", "session_state",
                    "pending_permission_requests"}
 RESULT_DROP = {"credential_expires_at"}
+# The initialize reply's slash commands include the user's own skills and plugins; only
+# Claude Code's built-ins are kept.
+BUILTIN_COMMANDS = {"clear", "compact", "context", "effort", "init", "model", "review", "security-review"}
 
 def scrub_str(s, workdirs):
     for w in workdirs:
@@ -58,7 +61,10 @@ for record in records:
         response = m["response"]
         body = response.get("response") or {}
         if response.get("request_id", "").startswith("tj-initialize-"):
-            response["response"] = {k: v for k, v in body.items() if k in INITIALIZE_KEEP}
+            kept = {k: v for k, v in body.items() if k in INITIALIZE_KEEP}
+            if "commands" in body:
+                kept["commands"] = [c for c in body["commands"] if c.get("name") in BUILTIN_COMMANDS]
+            response["response"] = kept
         elif response.get("request_id", "").startswith("tj-get_usage-"):
             limits = {k: v for k, v in (body.get("rate_limits") or {}).items() if v is not None}
             response["response"] = {"subscription_type": body.get("subscription_type"),

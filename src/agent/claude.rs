@@ -20,7 +20,9 @@ use std::{
 use anyhow::Context as _;
 use serde_json::{Value, json};
 
-use super::{AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, Spend, ToolImage, UsageWindow};
+use super::{
+    AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, SlashCommand, Spend, ToolImage, UsageWindow,
+};
 
 /// The `claude` version the protocol handling was written and recorded against.
 pub const TESTED_VERSION: &str = "2.1.331";
@@ -221,10 +223,29 @@ pub fn message_content(text: &str, images: &[super::PromptImage]) -> Value {
 /// The models `claude` offers this account, read from the `initialize` reply of a session
 /// that is stopped straight after (no prompt is sent, so it costs nothing). Blocking.
 pub fn list_models(config_dir: Option<&std::path::Path>) -> anyhow::Result<Vec<super::ModelChoice>> {
+    let reply = initialize_reply(config_dir, &std::env::temp_dir())?;
+    let models = parse_models(&reply["models"]);
+    anyhow::ensure!(!models.is_empty(), "claude listed no models");
+    Ok(models)
+}
+
+/// The slash commands a session in `cwd` accepts on this account (its project's own commands
+/// and skills too), the same way as [`list_models`]. Blocking.
+pub fn list_commands(config_dir: Option<&std::path::Path>, cwd: &std::path::Path) -> anyhow::Result<Vec<SlashCommand>> {
+    let reply = initialize_reply(config_dir, cwd)?;
+    let commands = parse_commands(&reply["commands"]);
+    anyhow::ensure!(!commands.is_empty(), "claude listed no commands");
+    Ok(commands)
+}
+
+/// The `initialize` reply of a session in `cwd` that is stopped straight after.
+fn initialize_reply(config_dir: Option<&std::path::Path>, cwd: &std::path::Path) -> anyhow::Result<Value> {
     let mut command = Command::new("claude");
     command
         .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
-        .current_dir(std::env::temp_dir())
+        // Only the lists are wanted: the user's SessionStart hooks needn't run for it.
+        .args(["--settings", r#"{"disableAllHooks":true}"#])
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -255,10 +276,28 @@ pub fn list_models(config_dir: Option<&std::path::Path>) -> anyhow::Result<Vec<s
     let reply = rx.recv_timeout(std::time::Duration::from_secs(20));
     let _ = child.kill();
     let _ = child.wait();
-    let reply = reply.context("claude did not answer in time")?;
-    let models = parse_models(&reply["response"]["response"]["models"]);
-    anyhow::ensure!(!models.is_empty(), "claude listed no models");
-    Ok(models)
+    let mut reply = reply.context("claude did not answer in time")?;
+    Ok(reply["response"]["response"].take())
+}
+
+pub fn parse_commands(commands: &Value) -> Vec<SlashCommand> {
+    let mut seen = std::collections::HashSet::new();
+    commands
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = c.get("name")?.as_str()?.trim_start_matches('/').to_string();
+            Some(SlashCommand {
+                description: text(c, "description").unwrap_or_default(),
+                argument_hint: text(c, "argumentHint").unwrap_or_default(),
+                name,
+            })
+        })
+        // Claude Code's internal commands start with `__`; they aren't for people to type.
+        .filter(|c| !c.name.is_empty() && !c.name.starts_with("__"))
+        .filter(|c| seen.insert(c.name.to_lowercase()))
+        .collect()
 }
 
 pub fn parse_models(models: &Value) -> Vec<super::ModelChoice> {
@@ -424,6 +463,21 @@ impl Parser {
                 }],
                 None => Vec::new(),
             },
+            Some("system") if subtype.as_deref() == Some("compact_boundary") => {
+                let meta = &m["compact_metadata"];
+                vec![AgentEvent::Compacted {
+                    pre_tokens: meta["pre_tokens"].as_u64(),
+                    manual: meta["trigger"].as_str() == Some("manual"),
+                }]
+            }
+            Some("conversation_reset") => vec![AgentEvent::ConversationReset],
+            // A slash command Claude Code ran itself: its output, written as an assistant message.
+            Some("assistant") if m.get("local_command_run").is_some_and(|r| !r.is_null()) => {
+                let command = str_at(&m["local_command_run"], "command").unwrap_or_default();
+                let text =
+                    blocks(m).filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n");
+                vec![AgentEvent::CommandOutput { command, text }]
+            }
             Some("system") if subtype.as_deref() == Some("init") => match str_at(m, "session_id") {
                 Some(session_id) => vec![AgentEvent::SessionInfo { session_id, model: str_at(m, "model") }],
                 None => Vec::new(),
@@ -511,9 +565,11 @@ impl Parser {
                 if window.is_some() {
                     events.push(AgentEvent::Context { tokens: None, window });
                 }
+                // A slash command Claude Code ran itself never reached a model: nothing to report.
+                let local = m.get("local_command").is_some_and(|c| !c.is_null()) && !is_error;
                 events.push(AgentEvent::TurnFinished {
-                    cost_usd: m.get("total_cost_usd").and_then(Value::as_f64),
-                    duration_ms: m.get("duration_ms").and_then(Value::as_u64),
+                    cost_usd: m.get("total_cost_usd").and_then(Value::as_f64).filter(|_| !local),
+                    duration_ms: m.get("duration_ms").and_then(Value::as_u64).filter(|_| !local),
                     is_error,
                     error: is_error.then(|| str_at(m, "result").unwrap_or_else(|| "The turn failed.".into())),
                 });
@@ -554,6 +610,7 @@ impl Parser {
                         version: str_at(body, "claude_code_version"),
                         permission_mode: str_at(body, "current_permission_mode")
                             .and_then(|mode| PermissionMode::from_claude_name(&mode)),
+                        commands: parse_commands(&body["commands"]),
                     }]
                 } else if request_id.starts_with("tj-get_usage-") {
                     let mut events = Vec::new();
@@ -791,11 +848,68 @@ mod tests {
     }
 
     #[test]
+    fn slash_commands_are_listed_and_local_ones_print_their_output() {
+        let events = replay("2.1.332-slash.jsonl");
+
+        let AgentEvent::Started { commands, .. } = &events[0] else { panic!("{:?}", events[0]) };
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"compact") && names.contains(&"clear"), "{names:?}");
+        let effort = commands.iter().find(|c| c.name == "effort").unwrap();
+        assert!(effort.argument_hint.starts_with("<low|"), "{effort:?}");
+
+        let outputs: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::CommandOutput { command, text } => Some((command.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 2, "{outputs:?}");
+        assert_eq!(outputs[0].0, "effort");
+        assert!(outputs[0].1.starts_with("Set effort level to high"), "{outputs:?}");
+        assert_eq!(outputs[1], ("compact", "Not enough messages to compact."));
+        assert!(text(&events).is_empty(), "command output isn't streamed text");
+
+        assert!(events.contains(&AgentEvent::ConversationReset), "/clear resets the conversation");
+        let turns: Vec<_> = events.iter().filter(|e| matches!(e, AgentEvent::TurnFinished { .. })).collect();
+        assert_eq!(turns.len(), 3);
+        assert!(
+            turns.iter().all(|t| matches!(
+                t,
+                AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, .. }
+            )),
+            "a local command costs nothing and has no time worth showing: {turns:?}"
+        );
+    }
+
+    #[test]
+    fn compacting_is_reported() {
+        let events = Parser.parse(&json!({
+            "type": "system", "subtype": "compact_boundary", "session_id": "s",
+            "compact_metadata": { "trigger": "manual", "pre_tokens": 48213 },
+        }));
+        assert_eq!(events, vec![AgentEvent::Compacted { pre_tokens: Some(48213), manual: true }]);
+    }
+
+    #[test]
+    fn internal_and_repeated_commands_are_left_out() {
+        let commands = parse_commands(&json!([
+            { "name": "compact", "description": "Summarize", "argumentHint": "<instructions>" },
+            { "name": "__remote-workflow", "description": "" },
+            { "name": "Compact", "description": "again" },
+            { "name": "plugin:skill" },
+        ]));
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["compact", "plugin:skill"]);
+        assert_eq!(commands[0].argument_hint, "<instructions>");
+    }
+
+    #[test]
     fn approved_tool_call_runs_and_the_turn_finishes() {
         let events = replay("2.1.331-approve.jsonl");
 
         assert!(
-            matches!(&events[0], AgentEvent::Started { version: Some(v), permission_mode: Some(PermissionMode::Ask) } if v == TESTED_VERSION)
+            matches!(&events[0], AgentEvent::Started { version: Some(v), permission_mode: Some(PermissionMode::Ask), .. } if v == TESTED_VERSION)
         );
         assert!(
             events
