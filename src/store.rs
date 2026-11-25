@@ -154,6 +154,16 @@ impl Accounts {
         Self { default: accounts[0].id.clone(), accounts }
     }
 
+    /// Write the default account into `accounts.toml`, changing only its `default = ...` line
+    /// so the comments and accounts written there by hand stay as they are.
+    pub fn save_default(&self, paths: &Paths) -> anyhow::Result<()> {
+        let file = paths.accounts_file();
+        let text = fs::read_to_string(&file).unwrap_or_default();
+        fs::create_dir_all(&paths.config_dir)?;
+        fs::write(&file, with_default(&text, &self.default))?;
+        Ok(())
+    }
+
     /// Read `accounts.toml`, creating it from [`Accounts::detect`] the first time.
     pub fn load_or_create(paths: &Paths, home: &Path) -> anyhow::Result<Self> {
         let file = paths.accounts_file();
@@ -175,6 +185,28 @@ impl Accounts {
         )?;
         Ok(accounts)
     }
+}
+
+/// `accounts.toml`'s text with its top-level `default` set to `id`: the line replaced where
+/// there is one before the first table, else added before the first table.
+fn with_default(text: &str, id: &str) -> String {
+    let line = format!("default = {}", toml::Value::String(id.to_string()));
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let first_table = lines.iter().position(|l| l.trim_start().starts_with('[')).unwrap_or(lines.len());
+    let existing = lines[..first_table].iter().position(|l| {
+        let l = l.trim_start();
+        l.strip_prefix("default").is_some_and(|rest| rest.trim_start().starts_with('='))
+    });
+    match existing {
+        Some(ix) => lines[ix] = line,
+        None => {
+            lines.insert(first_table, String::new());
+            lines.insert(first_table, line);
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 fn capitalize(s: &str) -> String {
@@ -532,6 +564,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tj-test-{name}-{}", new_id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn the_default_account_is_saved_without_touching_the_rest() {
+        let text = "# my notes\ndefault = \"personal\"\n\n[[account]]\nid = \"work\"\nname = \"Work\"\n";
+        let saved = with_default(text, "work");
+        assert_eq!(saved, text.replace("default = \"personal\"", "default = \"work\""));
+        let accounts: Accounts = toml::from_str(&saved).unwrap();
+        assert_eq!(accounts.default, "work");
+        let added = with_default("[[account]]\nid = \"work\"\nname = \"Work\"\n", "work");
+        assert!(added.starts_with("default = \"work\"\n\n[[account]]"), "{added}");
     }
 
     #[test]

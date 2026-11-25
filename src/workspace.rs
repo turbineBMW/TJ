@@ -10,9 +10,6 @@ use gpui_kit::component::{
     button::{Button, ButtonVariant, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
-    popover::Popover,
-    slider::{Slider, SliderEvent, SliderState, SliderValue},
-    switch::Switch,
 };
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
@@ -36,12 +33,8 @@ const _: () = assert!(HEADER_HEIGHT == FLOAT_HEIGHT + 2.0 * FLOAT_INSET);
 
 pub const CONTEXT: &str = "Workspace";
 
-gpui_kit::actions!(workspace, [ToggleSidebar]);
-
-/// Shortcuts for the whole window. `Ctrl+Alt`, so the terminal never needs the key.
-pub fn bindings() -> Vec<KeyBinding> {
-    vec![KeyBinding::new("ctrl-alt-s", ToggleSidebar, Some(CONTEXT))]
-}
+// Window-wide commands. Their keys are in `keybindings::COMMANDS`, and settings can change them.
+gpui_kit::actions!(workspace, [ToggleSidebar, NextProject, PreviousProject, NewThread, OpenSwitcher, OpenSettings]);
 /// The agent mark at the end of a thread's row in the sidebar.
 const MARK_SIZE: f32 = 14.0;
 /// An idle thread's Claude process (about 300 MB) is stopped after this long; the next
@@ -97,16 +90,14 @@ pub struct Workspace {
     models: HashMap<String, Vec<crate::agent::ModelChoice>>,
     models_loading: std::collections::HashSet<String>,
     no_summaries: bool,
-    /// The sidebar-opacity slider in the settings popover.
-    opacity_slider: Entity<SliderState>,
-    /// The cursor-animation slider (milliseconds; 0 is off).
-    glide_slider: Entity<SliderState>,
     /// The thread whose title is being edited in the sidebar, and the editor.
     renaming: Option<(String, Entity<InputState>)>,
     /// Projects whose archived threads are listed.
     show_archived: std::collections::HashSet<String>,
     /// Per project: the icon found in its folder, once looked for (`None` inside: there isn't one).
     found_icons: HashMap<String, Option<PathBuf>>,
+    /// The settings modal, while it's open.
+    settings_view: Option<WeakEntity<crate::settings_view::SettingsView>>,
     _subscriptions: Vec<Subscription>,
     /// Checks every minute for Claude processes idle long enough to stop.
     _idle_check: Option<Task<()>>,
@@ -126,28 +117,6 @@ impl Workspace {
             State::default()
         });
 
-        let opacity = cx.try_global::<Settings>().map(|s| s.sidebar_opacity).unwrap_or(0.8);
-        let opacity_slider =
-            cx.new(|_| SliderState::new().min(Settings::MIN_OPACITY).max(1.0).step(0.05).default_value(opacity));
-        let glide =
-            cx.try_global::<Settings>().map(|s| s.cursor_glide_ms).unwrap_or(Settings::default().cursor_glide_ms);
-        let glide_slider = cx.new(|_| {
-            SliderState::new().min(0.).max(Settings::MAX_GLIDE_MS as f32).step(10.).default_value(glide as f32)
-        });
-        let glide_events = cx.subscribe(&glide_slider, |this, _, event: &SliderEvent, cx| {
-            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
-            if let SliderValue::Single(ms) = value {
-                let ms = ms.round().max(0.) as u32;
-                this.update_settings(cx, |s| s.cursor_glide_ms = ms);
-            }
-        });
-        let slider_events = cx.subscribe(&opacity_slider, |this, _, event: &SliderEvent, cx| {
-            let (SliderEvent::Change(value) | SliderEvent::Release(value)) = event;
-            if let SliderValue::Single(opacity) = value {
-                let opacity = *opacity;
-                this.update_settings(cx, |s| s.sidebar_opacity = opacity);
-            }
-        });
         let mut this = Self {
             paths,
             home,
@@ -170,9 +139,8 @@ impl Workspace {
             show_archived: Default::default(),
             found_icons: HashMap::new(),
             no_summaries: launch.no_summaries,
-            opacity_slider,
-            glide_slider,
-            _subscriptions: vec![slider_events, glide_events],
+            settings_view: None,
+            _subscriptions: Vec::new(),
             _idle_check: None,
         };
         this._idle_check = Some(cx.spawn(async move |this, cx| {
@@ -652,7 +620,7 @@ impl Workspace {
         view.update(cx, |v, cx| v.focus(window, cx));
     }
 
-    fn new_thread(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn new_thread(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.state.new_thread(project_id) {
             self.open_thread(&id, window, cx);
         }
@@ -767,7 +735,7 @@ impl Workspace {
     }
 
     /// The project's picture, or its initials on the accent colour, `size` pixels square.
-    fn project_avatar(&self, project: &store::Project, size: f32, cx: &App) -> AnyElement {
+    pub(crate) fn project_avatar(&self, project: &store::Project, size: f32, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let (accent, accent_fg) = (theme.primary, theme.primary_foreground);
         let name = project.name.clone();
@@ -873,7 +841,7 @@ impl Workspace {
     }
 
     /// Change a setting, save it, and re-apply the theme if following it was switched.
-    fn update_settings(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Settings)) {
+    pub(crate) fn update_settings(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Settings)) {
         if !cx.has_global::<Settings>() {
             cx.set_global(Settings::default());
         }
@@ -886,91 +854,156 @@ impl Workspace {
         if let Err(err) = after.save(&self.paths) {
             self.problem = Some(format!("Could not save settings: {err:#}").into());
         }
-        if after.follow_omarchy_theme != before.follow_omarchy_theme {
-            let font = cx.theme().font_family.to_string();
-            crate::omarchy::apply(cx, after.follow_omarchy_theme, Some(&font));
+        let fonts_changed = (&after.ui_font, &after.mono_font) != (&before.ui_font, &before.mono_font);
+        if after.follow_omarchy_theme != before.follow_omarchy_theme || fonts_changed {
+            crate::omarchy::apply(cx, after.follow_omarchy_theme);
+        }
+        if after.keybindings != before.keybindings {
+            crate::keybindings::apply(cx);
         }
         cx.notify();
     }
 
-    fn settings_popover(&self, cx: &mut Context<Self>) -> AnyElement {
-        let this = cx.entity();
-        let slider = self.opacity_slider.clone();
-        let glide_slider = self.glide_slider.clone();
-        let theme_name = crate::omarchy::theme_name(&self.home);
-        Popover::new("settings")
-            .anchor(Anchor::TopLeft)
-            .trigger(Button::new("settings-button").ghost().small().icon(IconName::Settings).tooltip("Settings"))
-            .content(move |_, _window, cx| {
-                let settings = cx.try_global::<Settings>().cloned().unwrap_or_default();
-                let muted = cx.theme().muted_foreground;
-                let (this_follow, this_transparent) = (this.clone(), this.clone());
-                let glide = match settings.cursor_glide_ms {
-                    0 => "Off".to_string(),
-                    ms => format!("{ms} ms"),
-                };
-                let row = |label: &'static str, hint: Option<String>, control: AnyElement| {
-                    h_flex()
-                        .gap_3()
-                        .justify_between()
-                        .child(
-                            v_flex()
-                                .child(div().text_sm().child(label))
-                                .children(hint.map(|h| div().text_xs().text_color(muted).child(h))),
-                        )
-                        .child(control)
-                };
-                v_flex()
-                    .w(px(300.))
-                    .gap_3()
-                    .p_1()
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Settings"))
-                    .child(row(
-                        "Follow Omarchy theme",
-                        Some(theme_name.clone().unwrap_or_else(|| "No Omarchy theme found".into())),
-                        Switch::new("follow-theme")
-                            .checked(settings.follow_omarchy_theme)
-                            .on_change(move |checked, _, cx| {
-                                let checked = *checked;
-                                this_follow
-                                    .update(cx, |w, cx| w.update_settings(cx, |s| s.follow_omarchy_theme = checked))
-                            })
-                            .into_any_element(),
-                    ))
-                    .child(row(
-                        "Transparent sidebar",
-                        None,
-                        Switch::new("transparent-sidebar")
-                            .checked(settings.transparent_sidebar)
-                            .on_change(move |checked, _, cx| {
-                                let checked = *checked;
-                                this_transparent
-                                    .update(cx, |w, cx| w.update_settings(cx, |s| s.transparent_sidebar = checked))
-                            })
-                            .into_any_element(),
-                    ))
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(h_flex().justify_between().text_sm().child("Opacity").child(
-                                div().text_color(muted).child(format!("{:.0}%", settings.sidebar_opacity * 100.0)),
-                            ))
-                            .child(Slider::new(&slider).disabled(!settings.transparent_sidebar)),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .text_sm()
-                                    .child("Cursor animation")
-                                    .child(div().text_color(muted).child(glide)),
-                            )
-                            .child(Slider::new(&glide_slider)),
-                    )
-            })
-            .into_any_element()
+    // ---------- settings and the switcher ----------
+
+    pub(crate) fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
+    pub(crate) fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
+    pub(crate) fn accounts(&self) -> &Accounts {
+        &self.accounts
+    }
+
+    /// Make `account_id` the account threads use when neither they nor their project name one.
+    /// Threads already open keep the account they started on.
+    pub(crate) fn set_default_account(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        if self.accounts.default == account_id || self.accounts.get(account_id).is_none() {
+            return;
+        }
+        self.accounts.default = account_id.to_string();
+        if let Err(err) = self.accounts.save_default(&self.paths) {
+            self.problem = Some(format!("Could not save the default account: {err:#}").into());
+        }
+        self.refresh_menus(cx);
+        cx.notify();
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.entity().downgrade();
+        let view = cx.new(|cx| crate::settings_view::SettingsView::new(workspace, window, cx));
+        self.settings_view = Some(view.downgrade());
+        let shown = view.clone();
+        window.open_dialog(cx, move |dialog, _, _| dialog.w(px(720.)).title("Settings").child(shown.clone()));
+        view.update(cx, |v, cx| v.focus(window, cx));
+    }
+
+    fn open_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.entity().downgrade();
+        let view = cx.new(|cx| crate::switcher::SwitcherView::new(workspace, window, cx));
+        let shown = view.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.w(px(620.)).margin_top(px(90.)).close_button(false).child(shown.clone())
+        });
+        view.update(cx, |v, cx| v.focus(window, cx));
+    }
+
+    /// Every project, each followed by its threads (newest first, archived ones last), for the
+    /// switcher.
+    pub(crate) fn switcher_entries(&self) -> Vec<crate::switcher::Entry> {
+        use crate::switcher::{Entry, EntryKind};
+        let mut entries = Vec::new();
+        for project in &self.state.projects {
+            entries.push(Entry {
+                kind: EntryKind::Project,
+                id: project.id.clone(),
+                project_id: project.id.clone(),
+                title: project.name.clone(),
+                detail: display_path(&project.path, &self.home),
+                project_name: project.name.clone(),
+                updated_at: 0,
+                agent: Default::default(),
+                archived: false,
+            });
+            let mut threads: Vec<&store::ThreadMeta> = project.threads.iter().collect();
+            threads.sort_by_key(|t| (t.archived, std::cmp::Reverse(t.updated_at)));
+            entries.extend(threads.into_iter().map(|t| Entry {
+                kind: EntryKind::Thread,
+                id: t.id.clone(),
+                project_id: project.id.clone(),
+                title: t.title.clone().unwrap_or_else(|| "New thread".into()),
+                detail: String::new(),
+                project_name: project.name.clone(),
+                updated_at: t.updated_at,
+                agent: t.agent,
+                archived: t.archived,
+            }));
+        }
+        entries
+    }
+
+    pub(crate) fn project_by_id(&self, project_id: &str) -> Option<&store::Project> {
+        self.state.project(project_id)
+    }
+
+    /// The project on show, by id.
+    pub(crate) fn active_project_id(&self) -> Option<String> {
+        self.active_project().map(|p| p.id.clone())
+    }
+
+    // ---------- moving between projects ----------
+
+    /// Show the project as it was left: the thread its agent tab last showed, with its panes
+    /// and tabs untouched. A project not opened yet shows its newest thread, or a new one.
+    pub(crate) fn open_project(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.state.project(project_id) else { return };
+        let last_shown = self
+            .agents
+            .get(project_id)
+            .and_then(|a| a.read(cx).thread_id().map(str::to_string))
+            .filter(|id| self.state.thread(id).is_some());
+        if let (Some(thread_id), Some(panes)) = (last_shown, self.panes.get(project_id).cloned()) {
+            self.active = Some(thread_id);
+            self.state.selected_thread = self.active.clone();
+            self.save();
+            panes.update(cx, |p, cx| p.focus_active(window, cx));
+            cx.notify();
+            return;
+        }
+        match project.threads.iter().find(|t| !t.archived).map(|t| t.id.clone()) {
+            Some(thread_id) => self.open_thread(&thread_id, window, cx),
+            None => self.new_thread(project_id, window, cx),
+        }
+    }
+
+    /// Show the next (`step` 1) or previous (-1) project in the sidebar's order, wrapping round.
+    fn step_project(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.state.projects.len() as isize;
+        if count == 0 {
+            return;
+        }
+        let current = self
+            .active_project()
+            .and_then(|p| self.state.projects.iter().position(|q| q.id == p.id))
+            .map(|ix| ix as isize);
+        let next = match current {
+            Some(ix) => (ix + step).rem_euclid(count),
+            None => 0,
+        };
+        let id = self.state.projects[next as usize].id.clone();
+        self.open_project(&id, window, cx);
+    }
+
+    /// A new thread in the project on show: its start screen, with the prompt box focused.
+    fn new_thread_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project =
+            self.active_project().map(|p| p.id.clone()).or_else(|| self.state.projects.first().map(|p| p.id.clone()));
+        if let Some(project) = project {
+            self.new_thread(&project, window, cx);
+        }
     }
 
     /// The active project's changes, created (and first read) on demand.
@@ -1117,7 +1150,12 @@ impl Workspace {
     // ---------- rendering ----------
 
     fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = self.settings_popover(cx);
+        let settings = Button::new("settings-button")
+            .ghost()
+            .small()
+            .icon(IconName::Settings)
+            .tooltip(crate::keybindings::tooltip("Settings", "settings", cx))
+            .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)));
         // A working thread's agent mark breathes instead of showing a dot.
         let working = self.threads.values().any(|t| t.read(cx).status == Status::Running);
         let breath = if working { crate::working::breath(crate::working::tick(window, cx)) } else { 1.0 };
@@ -1412,7 +1450,7 @@ impl Workspace {
         let agent = self.active_project().and_then(|p| self.agents.get(&p.id)).cloned();
 
         // Every action is its own round chip.
-        let chip = |id: &'static str, icon: IconName, tip: &'static str| {
+        let chip = |id: &'static str, icon: IconName, tip: SharedString| {
             div()
                 .id(id)
                 .test_support()
@@ -1429,7 +1467,7 @@ impl Workspace {
                 .bg(tab)
                 .text_color(tab_fg)
                 .hover(|el| el.bg(shown).text_color(fg))
-                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
                 .child(Icon::new(icon).small())
         };
         let status_toggle = agent.filter(|a| a.read(cx).has_status(cx)).map(|agent| {
@@ -1437,7 +1475,7 @@ impl Workspace {
             chip(
                 "header-status",
                 if shown { IconName::PanelRightClose } else { IconName::PanelRightOpen },
-                if shown { "Hide the thread's status" } else { "Show the thread's status" },
+                if shown { "Hide the thread's status" } else { "Show the thread's status" }.into(),
             )
             .on_click(move |_, _, cx| agent.update(cx, |a, cx| a.toggle_status(cx)))
         });
@@ -1453,12 +1491,21 @@ impl Workspace {
         let sidebar_toggle = chip(
             "header-sidebar",
             if collapsed { IconName::PanelLeftOpen } else { IconName::PanelLeftClose },
-            if collapsed { "Show the sidebar (Ctrl+Alt+S)" } else { "Hide the sidebar (Ctrl+Alt+S)" },
+            crate::keybindings::tooltip(
+                if collapsed { "Show the sidebar" } else { "Hide the sidebar" },
+                "toggle_sidebar",
+                cx,
+            )
+            .into(),
         )
         .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
         let new_terminal = has_panes.then(|| {
-            chip("header-new-terminal", IconName::Plus, "New terminal tab (Ctrl+Shift+T)")
-                .on_click(with_panes(|p, window, cx| p.new_terminal(window, cx)))
+            chip(
+                "header-new-terminal",
+                IconName::Plus,
+                crate::keybindings::tooltip("New terminal tab", "new_tab", cx).into(),
+            )
+            .on_click(with_panes(|p, window, cx| p.new_terminal(window, cx)))
         });
 
         h_flex()
@@ -1510,16 +1557,24 @@ impl Workspace {
             )
             .when(has_panes, |el| {
                 el.child(
-                    chip("header-split-right", IconName::Columns2, "Split right (Ctrl+Shift+E)")
-                        .on_click(with_panes(|p, window, cx| p.split(SplitDirection::Right, window, cx))),
+                    chip(
+                        "header-split-right",
+                        IconName::Columns2,
+                        crate::keybindings::tooltip("Split right", "split_right", cx).into(),
+                    )
+                    .on_click(with_panes(|p, window, cx| p.split(SplitDirection::Right, window, cx))),
                 )
                 .child(
-                    chip("header-split-down", IconName::Rows2, "Split down (Ctrl+Shift+O)")
-                        .on_click(with_panes(|p, window, cx| p.split(SplitDirection::Down, window, cx))),
+                    chip(
+                        "header-split-down",
+                        IconName::Rows2,
+                        crate::keybindings::tooltip("Split down", "split_down", cx).into(),
+                    )
+                    .on_click(with_panes(|p, window, cx| p.split(SplitDirection::Down, window, cx))),
                 )
             })
             .children(status_toggle)
-            .child(chip("close-window", IconName::X, "Close").on_click(cx.listener(|this, _, window, cx| {
+            .child(chip("close-window", IconName::X, "Close".into()).on_click(cx.listener(|this, _, window, cx| {
                 this.save_layouts(cx);
                 window.remove_window();
             })))
@@ -1650,6 +1705,11 @@ impl Render for Workspace {
         crate::caret::watch(h_flex())
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &NextProject, window, cx| this.step_project(1, window, cx)))
+            .on_action(cx.listener(|this, _: &PreviousProject, window, cx| this.step_project(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread_here(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSwitcher, window, cx| this.open_switcher(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .size_full()
             .text_color(fg)
             .children(sidebar)
@@ -2131,7 +2191,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_settings_popover_turns_on_the_transparent_sidebar_and_saves_it(cx: &mut TestAppContext) {
+    fn the_settings_modal_turns_on_the_transparent_sidebar_and_saves_it(cx: &mut TestAppContext) {
         let (window, _workspace, paths, _) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         cx.update(|_, cx| cx.set_global(crate::settings::Settings::default()));
@@ -2140,6 +2200,9 @@ mod tests {
             window.click(SharedString::from("settings-button"), cx);
         });
         cx.run_until_parked();
+        assert!(cx.update(gpui_kit::component::WindowExt::has_active_dialog), "the button opens the modal");
+        // General first; Ctrl+PageDown moves to Appearance.
+        cx.simulate_keystrokes("ctrl-pagedown");
         cx.update(|window, cx| {
             window.render_frame(cx);
             window.click(SharedString::from("transparent-sidebar"), cx);
@@ -2148,6 +2211,59 @@ mod tests {
         assert!(settings.transparent_sidebar);
         assert_eq!(settings.sidebar_alpha(), 0.8);
         assert_eq!(crate::settings::Settings::load(&paths), settings, "the change was saved");
+    }
+
+    #[gpui_kit::test]
+    fn fonts_are_picked_from_the_keyboard(cx: &mut TestAppContext) {
+        use crate::settings_view::FontKind;
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|_, cx| cx.set_global(crate::settings::Settings::default()));
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("ctrl-,");
+        let view = workspace.read_with(cx, |w, _| w.settings_view.clone()).and_then(|v| v.upgrade()).unwrap();
+        let mono =
+            |cx: &mut VisualTestContext| cx.update(|_, cx| cx.global::<crate::settings::Settings>().mono_font.clone());
+        // Appearance: Follow theme, Interface font, Monospace font.
+        cx.simulate_keystrokes("ctrl-pagedown down down enter");
+        assert_eq!(view.read_with(cx, |v, _| v.picking_font()), Some(FontKind::Mono), "Enter opens the list");
+        cx.simulate_input("r ");
+        assert_eq!(view.read_with(cx, |v, _| v.picking_font()), Some(FontKind::Mono), "R and Space are typed");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(view.read_with(cx, |v, _| v.picking_font()), None, "Escape goes back to the rows");
+        assert!(cx.update(gpui_kit::component::WindowExt::has_active_dialog), "and leaves the dialog open");
+
+        // The test platform has no fonts; give it two.
+        let first = "Fira Mono".to_string();
+        cx.update(|_, cx| {
+            let names: std::rc::Rc<[String]> = [first.clone(), "Iosevka".to_string()].into();
+            let families = crate::fonts::Families { installed: names.clone(), ui: names.clone(), mono: Some(names) };
+            cx.set_global(families);
+        });
+        // The list starts on the default; Down and Enter use the first family.
+        cx.simulate_keystrokes("enter down enter");
+        assert_eq!(view.read_with(cx, |v, _| v.picking_font()), None);
+        assert!(cx.update(gpui_kit::component::WindowExt::has_active_dialog), "Enter doesn't close the dialog");
+        assert_eq!(mono(cx), Some(first.clone()));
+        assert_eq!(crate::settings::Settings::load(&paths).mono_font, Some(first.clone()), "saved");
+        assert_eq!(
+            cx.update(|_, cx| gpui_kit::component::ActiveTheme::theme(cx).mono_font_family.to_string()),
+            first,
+            "and drawn with"
+        );
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(mono(cx), None, "Backspace gives back the default");
+        // Typing filters the list: "iose" leaves only Iosevka.
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("iose");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(mono(cx).as_deref(), Some("Iosevka"));
+        cx.simulate_keystrokes("left");
+        assert_eq!(mono(cx), Some(first.clone()), "Left steps to the family before");
+        cx.simulate_keystrokes("left");
+        assert_eq!(mono(cx), None, "Left steps back to the default");
+        let default = cx.update(|_, cx| crate::fonts::defaults(cx).mono);
+        assert_eq!(cx.update(|_, cx| gpui_kit::component::ActiveTheme::theme(cx).mono_font_family.clone()), default);
     }
 
     #[gpui_kit::test]
@@ -2298,5 +2414,123 @@ mod tests {
         workspace.update_in(cx, |w, window, cx| w.new_thread(&project_id, window, cx));
         let mode = workspace.read_with(cx, |w, cx| w.active_thread().unwrap().read(cx).mode);
         assert_eq!(mode, crate::agent::PermissionMode::Plan);
+    }
+
+    /// A second project beside the demo one: (first project id, second project id).
+    fn two_projects(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> (String, String) {
+        let other = std::env::temp_dir().join(format!("tj-ws-other-{}", new_id()));
+        std::fs::create_dir_all(&other).unwrap();
+        workspace.update(cx, |w, _| {
+            w.state.add_project(&other);
+            (w.state.projects[0].id.clone(), w.state.projects[1].id.clone())
+        })
+    }
+
+    fn shown_project(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+        workspace.read_with(cx, |w, _| w.active_project_id())
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_alt_n_and_p_move_between_projects_and_ctrl_shift_n_starts_a_thread(cx: &mut TestAppContext) {
+        let (window, workspace, _, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (first, second) = two_projects(&workspace, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(shown_project(&workspace, cx).as_ref(), Some(&first));
+
+        cx.simulate_keystrokes("ctrl-alt-n");
+        assert_eq!(shown_project(&workspace, cx).as_ref(), Some(&second), "down to the next project");
+        let second_thread = workspace.read_with(cx, |w, _| w.active.clone().unwrap());
+        assert_eq!(workspace.read_with(cx, |w, _| w.state.project(&second).unwrap().threads.len()), 1);
+        cx.simulate_keystrokes("ctrl-alt-n");
+        assert_eq!(shown_project(&workspace, cx).as_ref(), Some(&first), "and round to the top");
+        cx.simulate_keystrokes("ctrl-alt-p");
+        assert_eq!(shown_project(&workspace, cx).as_ref(), Some(&second), "up wraps to the bottom");
+        assert_eq!(
+            workspace.read_with(cx, |w, _| w.active.clone()),
+            Some(second_thread.clone()),
+            "coming back shows the thread it was left on"
+        );
+
+        cx.simulate_keystrokes("ctrl-shift-n");
+        let (active, threads) = workspace
+            .read_with(cx, |w, _| (w.active.clone().unwrap(), w.state.project(&second).unwrap().threads.len()));
+        assert_ne!(active, second_thread, "a new thread is shown");
+        assert_eq!(threads, 2, "in the project on show");
+    }
+
+    #[gpui_kit::test]
+    fn a_rebound_shortcut_takes_effect_at_once_and_is_saved(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (first, second) = two_projects(&workspace, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        workspace.update(cx, |w, cx| {
+            w.update_settings(cx, |s| {
+                crate::keybindings::assign(&mut s.keybindings, "next_project", "ctrl-alt-j");
+            })
+        });
+        cx.simulate_keystrokes("ctrl-alt-n");
+        assert_eq!(shown_project(&workspace, cx).as_ref(), Some(&first), "the old key does nothing now");
+        cx.simulate_keystrokes("ctrl-alt-j");
+        assert_eq!(shown_project(&workspace, cx).as_ref(), Some(&second), "the new one moves on");
+        let saved = crate::settings::Settings::load(&paths);
+        assert_eq!(saved.keybindings.get("next_project"), Some(&vec!["ctrl-alt-j".to_string()]));
+        let tip = cx.update(|_, cx| crate::keybindings::tooltip("Next", "next_project", cx));
+        assert_eq!(tip, "Next (Ctrl+Alt+J)");
+    }
+
+    #[gpui_kit::test]
+    fn a_shortcut_is_recorded_from_the_keybindings_tab(cx: &mut TestAppContext) {
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("ctrl-,");
+        assert!(cx.update(gpui_kit::component::WindowExt::has_active_dialog), "Ctrl+, opens settings");
+        let view = workspace.read_with(cx, |w, _| w.settings_view.clone()).and_then(|v| v.upgrade()).unwrap();
+        cx.simulate_keystrokes("ctrl-pagedown ctrl-pagedown");
+        // The first row is "Next project"; Enter waits for its new key.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(view.read_with(cx, |v, _| v.recording()), Some("next_project"));
+        cx.simulate_keystrokes("shift-k");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.recording()),
+            Some("next_project"),
+            "a key without Ctrl or Alt is refused"
+        );
+        cx.simulate_keystrokes("ctrl-alt-k");
+        assert_eq!(view.read_with(cx, |v, _| v.recording()), None);
+        let saved = crate::settings::Settings::load(&paths);
+        assert_eq!(saved.keybindings.get("next_project"), Some(&vec!["ctrl-alt-k".to_string()]));
+        assert!(
+            cx.update(gpui_kit::component::WindowExt::has_active_dialog),
+            "the key went to the recorder, not the app"
+        );
+        // R gives the default back.
+        cx.simulate_keystrokes("r");
+        assert!(crate::settings::Settings::load(&paths).keybindings.is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_space_finds_a_project_or_a_thread(cx: &mut TestAppContext) {
+        let (window, workspace, _, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (project_id, first, second) = two_threads(&workspace, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        assert_eq!(workspace.read_with(cx, |w, _| w.active.clone()), Some(second.clone()));
+
+        // The list: the project, then its threads, newest first. The older thread is third.
+        cx.simulate_keystrokes("ctrl-space");
+        assert!(cx.update(gpui_kit::component::WindowExt::has_active_dialog));
+        cx.simulate_keystrokes("down down enter");
+        assert!(!cx.update(gpui_kit::component::WindowExt::has_active_dialog), "opening closes it");
+        assert_eq!(workspace.read_with(cx, |w, _| w.active.clone()), Some(first), "the thread picked is shown");
+
+        // Picking the project starts a new thread in it.
+        cx.simulate_keystrokes("ctrl-space");
+        cx.simulate_input("demo");
+        cx.simulate_keystrokes("enter");
+        let threads = workspace.read_with(cx, |w, _| w.state.project(&project_id).unwrap().threads.len());
+        assert_eq!(threads, 3);
     }
 }
