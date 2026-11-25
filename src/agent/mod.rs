@@ -205,6 +205,10 @@ pub enum AgentEvent {
         /// Pictures the tool returned (Read on an image, an MCP tool's screenshot).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ToolImage>,
+        /// How long the call ran, in milliseconds. The thread view measures it; the agent
+        /// leaves it empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        took_ms: Option<u64>,
     },
     PermissionRequested(PermissionRequest),
     /// The agent no longer needs the answer (for example the turn was interrupted).

@@ -20,7 +20,7 @@ TJ should work entirely from the keyboard (ROADMAP.md, "Keyboard rules"). Still 
 - [ ] Moving between projects and threads in the sidebar, and opening a project's history.
 - [ ] The account, mode and model menus under the prompt box.
 - [ ] Thread and project right-click menus (rename, archive, delete, remove, project picture).
-- [ ] Opening and folding tool cards, and opening the review from the changes list.
+- [ ] Opening and folding tool cards, opening a long Bash card ("Click to expand"), adding a card to the prompt, and opening the review from the changes list.
 - [ ] Settings (⚙).
 
 ## Threads and projects
