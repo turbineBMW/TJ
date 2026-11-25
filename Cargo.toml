@@ -7,6 +7,8 @@ edition = "2024"
 alacritty_terminal = "0.26"
 anyhow = "1.0.105"
 base64 = "0.22"
+# Already built for gpui (same features); TJ uses it for local dates in the thread history.
+chrono = "0.4"
 gpui-kit = { version = "0.11.0", features = ["tree-sitter-languages"] }
 # Already built for gpui (same features); TJ uses it to scale down large attached images.
 image = "0.25"
