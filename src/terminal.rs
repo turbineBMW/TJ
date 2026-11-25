@@ -312,7 +312,6 @@ impl TerminalView {
             term.scroll_display(Scroll::Bottom);
             term.selection = None;
             drop(term);
-            self.caret.blink_from = std::time::Instant::now();
             self.write(bytes);
             cx.stop_propagation();
         }
@@ -575,8 +574,8 @@ impl Palette<'_> {
 impl TerminalView {
     // ---------- cursor ----------
 
-    /// The cursor, painted over the grid by [`crate::caret`]: it glides (and trails) between
-    /// cells and fades as it blinks. A block shows the character under it in the background
+    /// The cursor, painted over the grid by [`crate::caret`]: it glides between cells when a
+    /// key moved it (the program's echo) and fades as it blinks. A block shows the character under it in the background
     /// colour once it has arrived; an unfocused terminal shows a hollow block.
     #[allow(clippy::too_many_arguments)]
     fn render_cursor(
@@ -594,6 +593,8 @@ impl TerminalView {
     ) -> Vec<AnyElement> {
         let row = cursor.point.line.0 + offset;
         if cursor.shape == CursorShape::Hidden || row < 0 || row as usize >= self.size.rows {
+            // Not drawn: when it shows again it appears there, rather than gliding from here.
+            self.caret.reset();
             return Vec::new();
         }
         let (c, wide) = under.unwrap_or((' ', false));
@@ -601,6 +602,7 @@ impl TerminalView {
         let width = if wide { cell.width * 2.0 } else { cell.width };
         let (x, y) = (cell.width * cursor.point.column.0 as f32, cell.height * row as f32);
         if !focused || cursor.shape == CursorShape::HollowBlock {
+            self.caret.reset();
             let hollow =
                 div().absolute().left(x).top(y).w(width).h(cell.height).border_1().border_color(fg.opacity(0.8));
             return vec![hollow.into_any_element()];
@@ -611,17 +613,27 @@ impl TerminalView {
             CursorShape::Underline => Bounds::new(point(x, y + cell.height - px(2.)), size(width, px(2.))),
             _ => Bounds::new(point(x, y), size(width, cell.height)),
         };
-        let now = std::time::Instant::now();
-        self.caret.aim(target, crate::caret::Motion::from_settings(cx), now);
-        let Some((corners, moving)) = self.caret.corners_at(now) else { return Vec::new() };
-        let alpha = self.caret.alpha(blinking, moving, now, window, cx);
+        let (rows, cols) = (self.size.rows as f32, self.size.cols as f32);
+        let aim = crate::caret::Aim {
+            target,
+            // A resize or scrolling back moves the cursor without a glide.
+            view: crate::caret::fingerprint(&[cell.width.into(), cell.height.into(), rows, cols, offset as f32]),
+            viewport: Bounds::new(point(px(0.), px(0.)), size(cell.width * cols, cell.height * rows)),
+            echo: crate::caret::TERMINAL_ECHO,
+            blinking,
+        };
+        let look = self.caret.look(aim, window, cx);
+        let alpha = look.opacity;
         if alpha <= 0.0 {
             return Vec::new();
         }
         let ink = fg.opacity(alpha);
         let quad = canvas(
             |_, _, _| {},
-            move |bounds, _, window, _| crate::caret::paint(corners.map(|p| p + bounds.origin), ink, window),
+            move |bounds, _, window, _| {
+                let at = Bounds::new(look.bounds.origin + bounds.origin, look.bounds.size);
+                crate::caret::paint(at, ink, window)
+            },
         )
         .absolute()
         .top_0()
@@ -629,7 +641,7 @@ impl TerminalView {
         .size_full();
         let mut out = vec![quad.into_any_element()];
         let block = !matches!(cursor.shape, CursorShape::Beam | CursorShape::Underline);
-        if block && !moving && c != ' ' && c != '\0' {
+        if block && !look.gliding && c != ' ' && c != '\0' {
             out.push(
                 div()
                     .absolute()
@@ -743,7 +755,6 @@ impl TerminalView {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
-        self.caret.blink_from = std::time::Instant::now();
         let button = match event.button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,

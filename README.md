@@ -91,7 +91,7 @@ Test hooks:
   config_dir = "~/.claude-work"
   ```
 
-- `~/.config/tj/settings.toml`: follow the Omarchy theme, transparent sidebar, opacity, cursor animation (`cursor_glide_ms`) and trail (`cursor_trail`).
+- `~/.config/tj/settings.toml`: follow the Omarchy theme, transparent sidebar, opacity, and how long the cursor glides after a key (`cursor_glide_ms`).
 - `~/.local/share/tj/state.json`: projects, threads, defaults, and what was open.
 - `~/.local/share/tj/threads/<id>.jsonl`: each thread's transcript.
 
