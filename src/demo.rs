@@ -4,7 +4,7 @@
 use std::{path::Path, time::Duration};
 
 use crate::agent::{
-    AgentEvent,
+    AgentEvent, Spend, UsageWindow,
     claude::{Parser, read_fixture},
 };
 use crate::sample;
@@ -15,6 +15,9 @@ pub fn sample_stream(fast: bool) -> Vec<(Duration, AgentEvent)> {
     let (words, every) = if fast { (20, Duration::from_millis(16)) } else { (6, Duration::from_millis(100)) };
     let mut events = vec![
         (Duration::ZERO, AgentEvent::SessionInfo { session_id: "demo".into(), model: Some("claude-opus-5-5".into()) }),
+        (Duration::ZERO, AgentEvent::Plan("max".into())),
+        (Duration::ZERO, AgentEvent::Usage(sample_usage())),
+        (Duration::ZERO, AgentEvent::Context { tokens: Some(186_000), window: Some(1_000_000) }),
         (Duration::from_millis(300), AgentEvent::TextStarted),
     ];
     events.extend(chunk_words(sample::REPLY, words).into_iter().map(|chunk| (every, AgentEvent::TextDelta(chunk))));
@@ -23,6 +26,34 @@ pub fn sample_stream(fast: bool) -> Vec<(Duration, AgentEvent)> {
         AgentEvent::TurnFinished { cost_usd: Some(0.0412), duration_ms: Some(9_200), is_error: false, error: None },
     ));
     events
+}
+
+/// A subscription part way through its windows, so the status column's meters have
+/// something to show.
+fn sample_usage() -> Vec<UsageWindow> {
+    let now = chrono::Utc::now().timestamp();
+    vec![
+        UsageWindow {
+            id: "five_hour".into(),
+            utilization: 0.42,
+            resets_at: Some(now + 2 * 3600 + 14 * 60),
+            ..Default::default()
+        },
+        UsageWindow {
+            id: "seven_day".into(),
+            utilization: 0.81,
+            resets_at: Some(now + 2 * 86_400 + 3600),
+            severity: Some("warning".into()),
+            ..Default::default()
+        },
+        UsageWindow {
+            id: "spend_monthly".into(),
+            utilization: 0.27,
+            resets_at: Some(now + 6 * 86_400),
+            spend: Some(Spend { used: 27.14, limit: Some(100.0), currency: "USD".into() }),
+            ..Default::default()
+        },
+    ]
 }
 
 /// A recorded session from `tests/fixtures/claude/`, played back through the real parser.

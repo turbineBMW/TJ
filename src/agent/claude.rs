@@ -20,7 +20,7 @@ use std::{
 use anyhow::Context as _;
 use serde_json::{Value, json};
 
-use super::{AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, ToolImage, UsageWindow};
+use super::{AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, Spend, ToolImage, UsageWindow};
 
 /// The `claude` version the protocol handling was written and recorded against.
 pub const TESTED_VERSION: &str = "2.1.331";
@@ -155,11 +155,6 @@ impl ClaudeSession {
             "request": fields,
         }))
     }
-
-    /// Ask for the subscription usage windows; they arrive as [`AgentEvent::Usage`].
-    pub fn request_usage(&self) -> anyhow::Result<()> {
-        self.control("get_usage", json!({}))
-    }
 }
 
 impl AgentSession for ClaudeSession {
@@ -197,6 +192,10 @@ impl AgentSession for ClaudeSession {
     /// Effort is a flag-tier setting; `null` returns to the model's default effort.
     fn set_effort(&self, effort: Option<&str>) -> anyhow::Result<()> {
         self.control("apply_flag_settings", json!({ "settings": { "effortLevel": effort } }))
+    }
+
+    fn request_usage(&self) -> anyhow::Result<()> {
+        self.control("get_usage", json!({}))
     }
 }
 
@@ -490,6 +489,12 @@ impl Parser {
                                     id: id.clone(),
                                     utilization: w.get("utilization")?.as_f64()?,
                                     resets_at: w.get("resetsAt").and_then(Value::as_i64),
+                                    severity: match w.get("status").and_then(Value::as_str) {
+                                        Some("allowed_warning") => Some("warning".into()),
+                                        Some("rejected") => Some("critical".into()),
+                                        _ => None,
+                                    },
+                                    ..Default::default()
                                 })
                             })
                             .collect::<Vec<_>>()
@@ -551,23 +556,15 @@ impl Parser {
                             .and_then(|mode| PermissionMode::from_claude_name(&mode)),
                     }]
                 } else if request_id.starts_with("tj-get_usage-") {
-                    let windows: Vec<UsageWindow> = body["rate_limits"]
-                        .as_object()
-                        .map(|limits| {
-                            limits
-                                .iter()
-                                .filter_map(|(id, w)| {
-                                    Some(UsageWindow {
-                                        id: id.clone(),
-                                        // get_usage reports percent; the stream reports a fraction.
-                                        utilization: w.get("utilization")?.as_f64()? / 100.0,
-                                        resets_at: None,
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if windows.is_empty() { Vec::new() } else { vec![AgentEvent::Usage(windows)] }
+                    let mut events = Vec::new();
+                    if let Some(plan) = str_at(body, "subscription_type") {
+                        events.push(AgentEvent::Plan(plan));
+                    }
+                    let windows = usage_windows(&body["rate_limits"]);
+                    if !windows.is_empty() {
+                        events.push(AgentEvent::Usage(windows));
+                    }
+                    events
                 } else {
                     Vec::new()
                 }
@@ -575,6 +572,88 @@ impl Parser {
             _ => Vec::new(),
         }
     }
+}
+
+/// The account's limits from a `get_usage` reply's `rate_limits`: the server's meters
+/// (`limits[]`) when it sends them, else the older named windows, plus extra-usage spend.
+fn usage_windows(limits: &Value) -> Vec<UsageWindow> {
+    let mut windows: Vec<UsageWindow> = match limits["limits"].as_array() {
+        Some(rows) => rows
+            .iter()
+            .filter_map(|row| {
+                let kind = row["kind"].as_str()?;
+                let group = row["group"].as_str().unwrap_or_default();
+                let scope = row["scope"]["model"]["display_name"]
+                    .as_str()
+                    .or_else(|| row["scope"]["surface"]["display_name"].as_str())
+                    .map(str::to_owned);
+                let id = match (kind, &scope) {
+                    ("session", None) => "five_hour".to_string(),
+                    ("weekly_all", None) => "seven_day".to_string(),
+                    ("spend", _) => format!("spend_{group}"),
+                    (_, Some(scope)) => format!("{kind}:{scope}"),
+                    (_, None) => kind.to_string(),
+                };
+                Some(UsageWindow {
+                    id,
+                    utilization: row["percent"].as_f64()? / 100.0,
+                    resets_at: row["resets_at"].as_str().and_then(unix_seconds),
+                    severity: text(row, "severity"),
+                    scope,
+                    spend: None,
+                })
+            })
+            .collect(),
+        // A server that predates `limits[]`: its named windows, in percent.
+        None => limits
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(id, _)| id.as_str() != "extra_usage")
+            .filter_map(|(id, w)| {
+                Some(UsageWindow {
+                    id: id.clone(),
+                    utilization: w.get("utilization")?.as_f64()? / 100.0,
+                    resets_at: w.get("resets_at").and_then(Value::as_str).and_then(unix_seconds),
+                    ..Default::default()
+                })
+            })
+            .collect(),
+    };
+    // Extra usage (a subscription's overage, or a team or enterprise seat's spending limit) is
+    // in minor units: cents for USD.
+    let extra = &limits["extra_usage"];
+    if extra["is_enabled"].as_bool() == Some(true) {
+        let scale = 10f64.powi(extra["decimal_places"].as_i64().unwrap_or(2) as i32);
+        let limit = extra["monthly_limit"].as_f64().map(|c| c / scale);
+        let used = extra["used_credits"].as_f64().map(|c| c / scale);
+        if let Some(used) = used {
+            let spend = Spend { used, limit, currency: text(extra, "currency").unwrap_or_else(|| "USD".into()) };
+            match windows.iter_mut().find(|w| w.id == "spend_monthly") {
+                Some(window) => window.spend = Some(spend),
+                None => windows.push(UsageWindow {
+                    id: "spend_monthly".into(),
+                    utilization: match (extra["utilization"].as_f64(), limit) {
+                        (Some(percent), _) => percent / 100.0,
+                        (None, Some(limit)) if limit > 0.0 => used / limit,
+                        _ => 0.0,
+                    },
+                    spend: Some(spend),
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+    windows
+}
+
+fn text(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// An ISO 8601 time as Unix seconds.
+fn unix_seconds(iso: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(iso).ok().map(|t| t.timestamp())
 }
 
 fn blocks(message: &Value) -> impl Iterator<Item = &Value> {
@@ -875,6 +954,44 @@ mod tests {
         assert!(windows.len() >= 2, "expected stream and get_usage values, got {windows:?}");
         assert!(windows.iter().all(|u| (0.0..=1.0).contains(u)));
         assert!((windows[0] - windows[windows.len() - 1]).abs() < 0.02);
+    }
+
+    #[test]
+    fn get_usage_reads_the_servers_meters_and_spend() {
+        // A subscription: the session and weekly meters, and a model's own weekly one.
+        let windows = usage_windows(&json!({
+            "five_hour": null,
+            "seven_day": { "utilization": 17, "resets_at": "2026-11-27T06:00:00+00:00" },
+            "extra_usage": { "is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null },
+            "limits": [
+                { "kind": "session", "group": "session", "percent": 42, "severity": "normal", "resets_at": "2026-11-25T23:00:00+00:00", "scope": null, "is_active": false },
+                { "kind": "weekly_all", "group": "weekly", "percent": 17, "severity": "normal", "resets_at": "2026-11-27T06:00:00+00:00", "scope": null, "is_active": true },
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 13, "severity": "normal", "resets_at": null, "scope": { "model": { "display_name": "Fable" } }, "is_active": false }
+            ]
+        }));
+        let ids: Vec<_> = windows.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["five_hour", "seven_day", "weekly_scoped:Fable"]);
+        assert!((windows[0].utilization - 0.42).abs() < 1e-9);
+        assert_eq!(windows[1].resets_at, Some(1795759200));
+        assert_eq!(windows[2].scope.as_deref(), Some("Fable"));
+
+        // An enterprise seat with a monthly spending limit, in cents.
+        let windows = usage_windows(&json!({
+            "extra_usage": { "is_enabled": true, "monthly_limit": 50000, "used_credits": 27140, "utilization": 54, "currency": "USD" },
+            "limits": [{ "kind": "spend", "group": "monthly", "percent": 54, "severity": "normal", "resets_at": "2026-12-01T00:00:00+00:00", "is_active": true }]
+        }));
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].id, "spend_monthly");
+        assert_eq!(windows[0].spend, Some(Spend { used: 271.4, limit: Some(500.0), currency: "USD".into() }));
+
+        // Spend with no meter row still shows up; a server without `limits[]` gives its windows.
+        let windows = usage_windows(&json!({
+            "seven_day": { "utilization": 6, "resets_at": null },
+            "extra_usage": { "is_enabled": true, "monthly_limit": 10000, "used_credits": 2500, "utilization": null, "currency": "USD" }
+        }));
+        let ids: Vec<_> = windows.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["seven_day", "spend_monthly"]);
+        assert!((windows[1].utilization - 0.25).abs() < 1e-9);
     }
 
     fn request() -> PermissionRequest {

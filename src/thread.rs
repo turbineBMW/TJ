@@ -19,7 +19,7 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use serde_json::Value;
 
 use crate::agent::{
-    AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, ScriptedAgent, ScriptedCall, UsageWindow,
+    AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, ScriptedAgent, ScriptedCall,
     claude::{self, ClaudeSession, SessionOptions},
 };
 use crate::overview::{self, Overview};
@@ -301,7 +301,6 @@ pub struct ThreadView {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub cost_usd: f64,
-    pub usage: Vec<UsageWindow>,
     /// What a scripted agent was asked to do; tests read it.
     pub scripted_log: Option<Arc<Mutex<Vec<ScriptedCall>>>>,
 }
@@ -382,7 +381,6 @@ impl ThreadView {
             session_id: None,
             model: None,
             cost_usd: 0.0,
-            usage: Vec::new(),
             scripted_log: None,
         };
         this.replay(records, cx);
@@ -1521,7 +1519,7 @@ impl ThreadView {
         }
         match &event {
             // Process lifecycle and live usage aren't part of the conversation.
-            AgentEvent::Started { .. } | AgentEvent::Exited { .. } | AgentEvent::Usage(_) => {}
+            AgentEvent::Started { .. } | AgentEvent::Exited { .. } | AgentEvent::Usage(_) | AgentEvent::Plan(_) => {}
             AgentEvent::TextDelta(text) if !self.replaying => self.pending_text.push_str(text),
             _ => self.write(Record::Event { event: event.clone() }),
         }
@@ -1760,18 +1758,16 @@ impl ThreadView {
                 self.context_tokens = tokens.or(self.context_tokens);
                 self.context_window = window.or(self.context_window);
             }
-            AgentEvent::Usage(windows) => {
-                for window in windows {
-                    match self.usage.iter_mut().find(|w| w.id == window.id) {
-                        Some(existing) => *existing = window,
-                        None => self.usage.push(window),
-                    }
-                }
-            }
+            AgentEvent::Usage(windows) => crate::usage::Usage::update(cx, &self.account_id, |u| u.merge(windows)),
+            AgentEvent::Plan(plan) => crate::usage::Usage::update(cx, &self.account_id, |u| u.plan = Some(plan)),
             AgentEvent::TurnFinished { cost_usd, duration_ms, is_error, error } => {
                 self.current_text = None;
                 self.status = Status::Idle;
                 self.update_overview(cx);
+                // Spending limits only come from get_usage, so ask again after each turn.
+                if let (false, Some(agent)) = (self.replaying, &self.agent) {
+                    let _ = agent.request_usage();
+                }
                 if let Some(cost) = cost_usd {
                     self.cost_usd += cost;
                 }

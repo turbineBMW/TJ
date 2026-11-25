@@ -27,6 +27,7 @@ mod switcher;
 mod terminal;
 mod thread;
 mod tool_card;
+mod usage;
 mod working;
 mod workspace;
 
