@@ -71,7 +71,7 @@ pub static COMMANDS: &[Command] = &[
     command!("settings", "Open settings", Window, WS, ["ctrl-,"], workspace::OpenSettings),
     command!("toggle_sidebar", "Show or hide the sidebar", Window, WS, ["ctrl-shift-s"], workspace::ToggleSidebar),
     command!("new_tab", "New terminal tab", Panes, PANES, ["ctrl-shift-t"], panes::NewTab),
-    command!("close_tab", "Close tab", Panes, PANES, ["ctrl-shift-w"], panes::CloseTab),
+    command!("close_tab", "Close the pane (its tab, with the last)", Panes, PANES, ["ctrl-shift-w"], panes::CloseTab),
     command!("next_tab", "Next tab", Panes, PANES, ["ctrl-pagedown"], panes::NextTab),
     command!("previous_tab", "Previous tab", Panes, PANES, ["ctrl-pageup"], panes::PreviousTab),
     command!("split_right", "Split right", Panes, PANES, ["ctrl-alt-h"], panes::SplitRight),

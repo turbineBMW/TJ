@@ -36,6 +36,7 @@ TJ should work entirely from the keyboard (ROADMAP.md, "Keyboard rules"). Still 
 - [x] Smooth cursor, in the terminal and the text fields: glides, fades as it blinks, optional trail; speed and trail in settings.
 - [x] Inline images: kitty graphics, SIXEL and iTerm2 (no kitty animation or relative placements).
 - [x] Drag to resize splits (the divider between panes; double-click centres it).
+- [x] Tabs in the top bar hold their own splits: a split stays in its tab, and the tab is titled after its focused pane.
 
 ## Distribution
 

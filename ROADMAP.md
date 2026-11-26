@@ -25,7 +25,7 @@ The model is Rustle and Bubo (`~/Projects/Rustle`, `~/Projects/Bubo`):
 
 ## Terminals: panes and tabs like Vmux/tmux
 
-- A terminal area can **split right**, **split down**, or **add a tab**. Every pane has its own tab strip. Closing a pane's last tab folds the split back up.
+- The main area has **tabs** in the top bar, and each tab can **split right** or **split down** into its own panes. A tab is titled after its focused pane. Closing a pane folds its split; closing a tab's last pane closes the tab.
 - Use the same shortcuts as Vmux (`~/Projects/Vmux/src/keybinds.rs`):
 
   | Keys | Action |

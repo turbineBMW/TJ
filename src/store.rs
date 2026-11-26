@@ -297,8 +297,11 @@ pub struct Project {
     pub effort: Option<String>,
     #[serde(default)]
     pub threads: Vec<ThreadMeta>,
-    /// The project's panes and their tabs (conversations, terminals, the review).
-    #[serde(default)]
+    /// The project's tabs and each one's panes (the agent, terminals, the review, GitHub).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<AreaLayout>,
+    /// The layout from before each tab held its own splits; read once, then saved as `area`.
+    #[serde(default, skip_serializing)]
     pub layout: Option<PaneLayout>,
     /// The project's picture; when absent, an icon found in the project, else its initials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,7 +347,37 @@ pub enum TabState {
     GitHub,
 }
 
-/// A saved layout: panes of tabs, split right or down.
+/// A saved main area: the tabs along the top bar, and which one is on show.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AreaLayout {
+    pub tabs: Vec<SplitLayout>,
+    pub active: usize,
+}
+
+/// One saved tab: its panes, each showing one thing, split right or down.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SplitLayout {
+    Pane {
+        view: TabState,
+    },
+    Split {
+        direction: SplitDirection,
+        /// The first side's share, 0.15 to 0.85.
+        ratio: f32,
+        first: Box<SplitLayout>,
+        second: Box<SplitLayout>,
+    },
+}
+
+impl Project {
+    /// The saved area, reading the older layout if that's all there is.
+    pub fn area_layout(&self) -> Option<AreaLayout> {
+        self.area.clone().or_else(|| self.layout.as_ref().map(PaneLayout::to_area))
+    }
+}
+
+/// The layout saved before each tab held its own splits: panes of tabs, split right or down.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PaneLayout {
@@ -359,6 +392,39 @@ pub enum PaneLayout {
         first: Box<PaneLayout>,
         second: Box<PaneLayout>,
     },
+}
+
+impl PaneLayout {
+    /// The panes as they looked, each showing the tab it had on show, become the first tab;
+    /// every tab that was behind another becomes a tab of its own.
+    pub fn to_area(&self) -> AreaLayout {
+        let mut behind = Vec::new();
+        let shown = self.shown(&mut behind);
+        let tabs = shown.into_iter().chain(behind.into_iter().map(|view| SplitLayout::Pane { view })).collect();
+        AreaLayout { tabs, active: 0 }
+    }
+
+    fn shown(&self, behind: &mut Vec<TabState>) -> Option<SplitLayout> {
+        match self {
+            PaneLayout::Pane { tabs, active } => {
+                let active = (*active).min(tabs.len().saturating_sub(1));
+                behind.extend(tabs.iter().enumerate().filter(|(ix, _)| *ix != active).map(|(_, t)| t.clone()));
+                tabs.get(active).map(|view| SplitLayout::Pane { view: view.clone() })
+            }
+            PaneLayout::Split { direction, ratio, first, second } => {
+                match (first.shown(behind), second.shown(behind)) {
+                    (Some(first), Some(second)) => Some(SplitLayout::Split {
+                        direction: *direction,
+                        ratio: *ratio,
+                        first: Box::new(first),
+                        second: Box::new(second),
+                    }),
+                    (Some(only), None) | (None, Some(only)) => Some(only),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -408,6 +474,7 @@ impl State {
             model: None,
             effort: None,
             threads: Vec::new(),
+            area: None,
             layout: None,
             image: None,
             github_account: None,
