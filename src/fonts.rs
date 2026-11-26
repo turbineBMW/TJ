@@ -5,7 +5,7 @@
 //! gpui panics on the first line it lays out in a family it can't find, so a pick is only
 //! used while that family is installed: a font removed since falls back to the default.
 
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{App, Global, SharedString, font, px};
@@ -129,6 +129,93 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8(out.stdout).ok()).flatten()
 }
 
+/// The characters one font has, as fontconfig lists them: sorted, inclusive ranges.
+#[derive(Debug, Default, PartialEq)]
+struct Coverage(Vec<(u32, u32)>);
+
+impl Coverage {
+    /// Read fontconfig's `%{charset}`: hex code points and ranges, such as `20-7e a0 e000-e00a`.
+    fn parse(charset: &str) -> Self {
+        let hex = |s: &str| u32::from_str_radix(s, 16).ok();
+        let mut ranges: Vec<(u32, u32)> = charset
+            .split_whitespace()
+            .filter_map(|part| match part.split_once('-') {
+                Some((a, b)) => Some((hex(a)?, hex(b)?)),
+                None => hex(part).map(|c| (c, c)),
+            })
+            .collect();
+        ranges.sort_unstable();
+        Self(ranges)
+    }
+
+    fn has(&self, ch: char) -> bool {
+        let c = ch as u32;
+        let ix = self.0.partition_point(|&(start, _)| start <= c);
+        ix > 0 && self.0[ix - 1].1 >= c
+    }
+}
+
+/// Where a monospace family's missing characters come from, in fontconfig's order, so the
+/// terminal picks the same font for them as foot and VTE do, and fontconfig rules the user
+/// wrote apply. gpui's own fallback ignores fontconfig: it would draw the Omarchy mark from
+/// the stock font even when a rule puts a re-centred copy first.
+#[derive(Debug, PartialEq)]
+pub struct Fallback {
+    /// What the family itself has.
+    own: Coverage,
+    /// The families fontconfig tries after it, best first, with what each has.
+    rest: Vec<(SharedString, Coverage)>,
+}
+
+impl Fallback {
+    /// The family to draw `ch` in when the font lacks it, if fontconfig knows one gpui can
+    /// draw. `None` keeps the font (and gpui's own fallback after it).
+    pub fn family_for(&self, ch: char) -> Option<&SharedString> {
+        if ch.is_ascii() || self.own.has(ch) {
+            return None;
+        }
+        self.rest.iter().find(|(_, coverage)| coverage.has(ch)).map(|(family, _)| family)
+    }
+
+    /// Read `fc-match -s -f '%{family[0]}|%{charset}\n' <family>`: one font per line, best
+    /// first. Only families gpui has (`installed`) are kept, each once. fontconfig may put
+    /// other fonts ahead of `family` (a rule preferring one for every monospace request), but
+    /// gpui draws in `family` itself, so the rest is the list without it. `None` when
+    /// fontconfig doesn't have `family`.
+    fn parse(family: &str, sorted: &str, installed: &[String]) -> Option<Self> {
+        let fonts: Vec<(&str, &str)> = sorted.lines().filter_map(|line| line.split_once('|')).collect();
+        let is_family = |name: &str| name.eq_ignore_ascii_case(family);
+        let own = fonts.iter().find(|(name, _)| is_family(name))?.1;
+        let mut rest: Vec<(SharedString, Coverage)> = Vec::new();
+        for &(name, charset) in &fonts {
+            let known = is_family(name) || rest.iter().any(|(f, _)| f.as_ref() == name);
+            if !known && installed.iter().any(|i| i == name) {
+                rest.push((SharedString::from(name.to_string()), Coverage::parse(charset)));
+            }
+        }
+        Some(Self { own: Coverage::parse(own), rest })
+    }
+}
+
+/// Each monospace family's [`Fallback`], read from fontconfig the first time it's asked for.
+#[derive(Default)]
+struct Fallbacks(HashMap<SharedString, Option<Rc<Fallback>>>);
+
+impl Global for Fallbacks {}
+
+/// Where `family`'s missing characters come from (see [`Fallback`]); `None` without
+/// fontconfig, or when it doesn't know the family.
+pub fn fallback(family: &SharedString, cx: &mut App) -> Option<Rc<Fallback>> {
+    if let Some(known) = cx.try_global::<Fallbacks>().and_then(|f| f.0.get(family)) {
+        return known.clone();
+    }
+    let installed = families(cx).installed.clone();
+    let sorted = run("fc-match", &["-s", "-f", "%{family[0]}|%{charset}\n", family]);
+    let loaded = sorted.and_then(|sorted| Fallback::parse(family, &sorted, &installed)).map(Rc::new);
+    cx.default_global::<Fallbacks>().0.insert(family.clone(), loaded.clone());
+    loaded
+}
+
 /// Whether `family` has a bold face of its own. gpui on Linux ignores the weight axis of
 /// variable fonts, so a variable-only family (Adwaita Sans, say) draws **bold** as regular.
 /// A static bold face lives in its own file; a variable font's "Bold" instance shares the
@@ -164,7 +251,7 @@ fn desktop_ui_font() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{choices, matches};
+    use super::{Coverage, Fallback, choices, matches};
 
     #[test]
     fn choices_keep_what_fontconfig_lists_and_gpui_can_draw() {
@@ -177,6 +264,36 @@ mod tests {
             ["adwaita Mono", "Gone", "JoyPixels", "Noto Sans"],
             "without fontconfig, all but the virtual names"
         );
+    }
+
+    #[test]
+    fn coverage_reads_fontconfig_charsets() {
+        let coverage = Coverage::parse("20-7e a0-ac e000-e00a 2665");
+        assert!(coverage.has('A') && coverage.has('\u{a0}') && coverage.has('\u{e00a}') && coverage.has('♥'));
+        assert!(!coverage.has('\u{1f}') && !coverage.has('\u{ad}') && !coverage.has('\u{e900}'));
+        assert_eq!(Coverage::parse(""), Coverage::default());
+    }
+
+    #[test]
+    fn fallback_follows_fontconfig_order() {
+        let installed: Vec<String> = ["Mono", "omarchy-centered", "Icons", "Emoji"].map(String::from).into();
+        let sorted = "Mono|20-7e e000-e00a\nomarchy-centered|e900\nNot In Gpui|e900-e9ff\n\
+                      Mono|20-7e e900\nIcons|e900-e9ff f000\nEmoji|1f600-1f64f\n";
+        let fallback = Fallback::parse("Mono", sorted, &installed).unwrap();
+        let family = |ch: char| fallback.family_for(ch).map(|f| f.to_string());
+        assert_eq!(family('\u{e900}').as_deref(), Some("omarchy-centered"), "first in fontconfig's order");
+        assert_eq!(family('\u{e901}').as_deref(), Some("Icons"), "skipping families gpui doesn't have");
+        assert_eq!(family('😀').as_deref(), Some("Emoji"));
+        assert_eq!(family('\u{e005}'), None, "the font has it");
+        assert_eq!(family('A'), None);
+        assert_eq!(family('\u{10ffff}'), None, "nothing has it: gpui's own fallback");
+        assert_eq!(Fallback::parse("Missing", sorted, &installed), None, "fontconfig doesn't have it");
+
+        // A rule can put another font ahead of the one asked for; gpui still draws in it.
+        let preferred = "Icons|20-7e e900-e9ff\nMono|20-7e\n";
+        let fallback = Fallback::parse("Mono", preferred, &installed).unwrap();
+        assert_eq!(fallback.family_for('\u{e900}').map(|f| f.to_string()).as_deref(), Some("Icons"));
+        assert_eq!(fallback.family_for('z'), None);
     }
 
     #[test]
