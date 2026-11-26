@@ -57,7 +57,9 @@ gpui_kit::actions!(
         GrowPane,
         ShrinkPane,
         NextTab,
-        PreviousTab
+        PreviousTab,
+        MoveTabRight,
+        MoveTabLeft
     ]
 );
 
@@ -904,6 +906,18 @@ impl Panes {
         }
     }
 
+    /// Move the tab on show one place right (or, with a negative step, left), as Chrome's
+    /// Ctrl+Shift+PageDown/PageUp do; it stays put at either end.
+    pub fn move_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.active as isize + step;
+        if self.active < self.tabs.len() && (0..self.tabs.len() as isize).contains(&to) {
+            let tab = self.tabs.remove(self.active);
+            self.active = to as usize;
+            self.tabs.insert(self.active, tab);
+            self.changed(window, cx);
+        }
+    }
+
     // ---------- rendering ----------
 
     /// Drag a divider: the split takes the pointer's position within it as its ratio.
@@ -1120,6 +1134,8 @@ impl Render for Panes {
             .on_action(cx.listener(|this, _: &ShrinkPane, window, cx| this.resize(-RESIZE_STEP, window, cx)))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(1, window, cx)))
             .on_action(cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &MoveTabRight, window, cx| this.move_tab(1, window, cx)))
+            .on_action(cx.listener(|this, _: &MoveTabLeft, window, cx| this.move_tab(-1, window, cx)))
             .when_some(self.error.clone(), |el, error| el.child(div().p_2().text_xs().child(error)))
             .child(body)
     }
@@ -1380,6 +1396,18 @@ mod tests {
         cx.update(|window, cx| window.press("ctrl-pageup", cx));
         assert_eq!(s.panes.read_with(cx, |p, _| p.active_tab()), 0, "Ctrl+PageUp goes back to the split tab");
         assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), right, "with the same pane focused");
+
+        cx.update(|window, cx| window.press("ctrl-shift-pageup", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "the first tab can't move further left");
+        cx.update(|window, cx| window.press("ctrl-shift-pagedown", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 2], "Ctrl+Shift+PageDown moves the tab right");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.active_tab()), 1, "and it stays on show");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), right, "with the same pane focused");
+        cx.update(|window, cx| window.press("ctrl-shift-pagedown", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 2], "the last tab can't move further right");
+        cx.update(|window, cx| window.press("ctrl-shift-pageup", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "Ctrl+Shift+PageUp moves it back left");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.active_tab()), 0);
 
         cx.update(|window, cx| window.press("ctrl-alt-s", cx));
         assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), first, "Ctrl+Alt+S moves to the left pane");

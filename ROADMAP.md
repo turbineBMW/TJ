@@ -36,6 +36,7 @@ The model is Rustle and Bubo (`~/Projects/Rustle`, `~/Projects/Bubo`):
   | `Ctrl+Shift+A` | Focus next pane |
   | `Ctrl+Shift+=` / `Ctrl+Shift+-` | Grow / shrink pane |
   | `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab |
+  | `Ctrl+Shift+PageDown` / `Ctrl+Shift+PageUp` | Move tab right / left |
 
 - Layout, tabs and working directories should persist per project.
 
