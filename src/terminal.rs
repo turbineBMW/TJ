@@ -572,6 +572,10 @@ struct GridLine {
     /// Colour, and whether it's a curly underline.
     underlines: Vec<(Range<usize>, (Hsla, bool))>,
     strikethroughs: Vec<(Range<usize>, Hsla)>,
+    /// Lines, blocks and Powerline shapes drawn to fill their cell rather than taken from the
+    /// font (see [`crate::box_drawing`]): column, character and colour. Their cells hold a space
+    /// in `text`.
+    drawn: Vec<(usize, char, Hsla)>,
 }
 
 /// Where text sits in a cell, measured once for the monospace font.
@@ -600,6 +604,12 @@ fn push_span<T: PartialEq>(spans: &mut Vec<(Range<usize>, T)>, cols: Range<usize
 
 impl GridLine {
     fn push(&mut self, col: usize, ch: char, zerowidth: Option<&[char]>, color: Hsla, font: Font) {
+        let ch = if zerowidth.is_none() && crate::box_drawing::drawn(ch) {
+            self.drawn.push((col, ch, color));
+            ' '
+        } else {
+            ch
+        };
         let start = self.text.len();
         self.text.push(ch);
         if let Some(extra) = zerowidth {
@@ -630,6 +640,10 @@ impl GridLine {
 
         let scale = window.scale_factor();
         let baseline = snap(origin.y + (cell.height - m.ascent - m.descent) / 2. + m.ascent, scale);
+        for &(col, ch, color) in &self.drawn {
+            let at = point(origin.x + cell.width * col as f32, origin.y);
+            crate::box_drawing::paint(ch, at, cell, px(FONT_SIZE), color, window);
+        }
         if !self.text.trim().is_empty() {
             let font_size = px(FONT_SIZE);
             let shaped = window.text_system().shape_line(self.text.clone().into(), font_size, &self.runs, None);
@@ -716,7 +730,7 @@ impl TerminalView {
         &mut self,
         cursor: alacritty_terminal::term::RenderableCursor,
         blinking: bool,
-        under: Option<(char, bool)>,
+        under: Option<(char, bool, Font)>,
         offset: i32,
         focused: bool,
         fg: Hsla,
@@ -731,7 +745,7 @@ impl TerminalView {
             self.caret.reset();
             return Vec::new();
         }
-        let (c, wide) = under.unwrap_or((' ', false));
+        let (c, wide, under_font) = under.unwrap_or((' ', false, font.clone()));
         let cell = self.cell;
         let width = if wide { cell.width * 2.0 } else { cell.width };
         let (x, y) = (cell.width * cursor.point.column.0 as f32, cell.height * row as f32);
@@ -778,7 +792,7 @@ impl TerminalView {
         let block = !matches!(cursor.shape, CursorShape::Beam | CursorShape::Underline);
         if block && !look.gliding && c != ' ' && c != '\0' {
             let mut line = GridLine::default();
-            line.push(cursor.point.column.0, c, None, bg.opacity(alpha), font.clone());
+            line.push(cursor.point.column.0, c, None, bg.opacity(alpha), under_font);
             let metrics = LineMetrics::of(font, window);
             let char_under = canvas(
                 |_, _, _| {},
@@ -1004,6 +1018,8 @@ impl Render for TerminalView {
         self.sync_cell(window, cx);
         let (ansi, fg, bg) = terminal_colors(cx);
         let base_font = mono_font(cx);
+        // Characters the font lacks are drawn in the font fontconfig picks, as in foot and VTE.
+        let fallback = crate::fonts::fallback(&base_font.family, cx);
         let focused = self.focus.is_focused(window);
 
         let term = self.term.lock();
@@ -1013,7 +1029,7 @@ impl Render for TerminalView {
         let cursor = content.cursor;
         let selection = content.selection;
         let cursor_style = term.cursor_style();
-        let mut cursor_cell: Option<(char, bool)> = None;
+        let mut cursor_cell: Option<(char, bool, Font)> = None;
         let selection_bg = cx.theme().selection;
         let metrics = LineMetrics::of(&base_font, window);
 
@@ -1053,9 +1069,6 @@ impl Render for TerminalView {
             if selection.is_some_and(|s| s.contains(indexed.point)) {
                 cell_bg = Some(selection_bg);
             }
-            if indexed.point == cursor.point {
-                cursor_cell = Some((cell.c, cell.flags.contains(Flags::WIDE_CHAR)));
-            }
 
             let cols = col..col + if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
             if let Some(color) = cell_bg {
@@ -1077,6 +1090,12 @@ impl Render for TerminalView {
             }
             if cell.flags.contains(Flags::ITALIC) {
                 run_font.style = FontStyle::Italic;
+            }
+            if let Some(family) = fallback.as_ref().and_then(|f| f.family_for(ch)) {
+                run_font.family = family.clone();
+            }
+            if indexed.point == cursor.point {
+                cursor_cell = Some((cell.c, cell.flags.contains(Flags::WIDE_CHAR), run_font.clone()));
             }
             line.push(col, ch, zerowidth, cell_fg, run_font);
         }
