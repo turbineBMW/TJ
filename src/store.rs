@@ -523,15 +523,18 @@ impl State {
     }
 
     /// The user just messaged the thread: it was touched now and goes to the top of its
-    /// project, so the sidebar's short list is always the threads used last.
+    /// project, and the project to the top of the sidebar, so both lists lead with what was
+    /// used last.
     pub fn touch_thread(&mut self, thread_id: &str) {
-        let Some(project) = self.projects.iter_mut().find(|p| p.threads.iter().any(|t| t.id == thread_id)) else {
+        let Some(px) = self.projects.iter().position(|p| p.threads.iter().any(|t| t.id == thread_id)) else {
             return;
         };
+        let mut project = self.projects.remove(px);
         let ix = project.threads.iter().position(|t| t.id == thread_id).unwrap();
         let mut meta = project.threads.remove(ix);
         meta.updated_at = now();
         project.threads.insert(0, meta);
+        self.projects.insert(0, project);
     }
 
     /// Forget a thread. Its files are deleted separately ([`Paths::delete_thread_files`]).
@@ -754,6 +757,24 @@ mod tests {
         assert_eq!(threads[0].id, ids[0]);
         assert!(threads[0].updated_at > 7);
         assert_eq!(names(split_threads(threads, |_| false).1), vec![ids[2].clone(), ids[1].clone()]);
+    }
+
+    #[test]
+    fn messaging_a_thread_brings_its_project_to_the_top() {
+        let mut state = State::default();
+        let first = state.add_project(&temp_dir("top-a")).id.clone();
+        let second = state.add_project(&temp_dir("top-b")).id.clone();
+        let third = state.add_project(&temp_dir("top-c")).id.clone();
+        let thread = state.new_thread(&third).unwrap();
+        let order = |s: &State| s.projects.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        assert_eq!(order(&state), vec![first.clone(), second.clone(), third.clone()]);
+
+        state.touch_thread(&thread);
+        assert_eq!(order(&state), vec![third.clone(), first.clone(), second.clone()]);
+
+        // An unknown thread moves nothing.
+        state.touch_thread("missing");
+        assert_eq!(order(&state), vec![third, first, second]);
     }
 
     #[test]
