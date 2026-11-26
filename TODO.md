@@ -31,7 +31,7 @@ TJ should work entirely from the keyboard (ROADMAP.md, "Keyboard rules"). Still 
 
 ## Terminal and panes
 
-- [x] Mouse selection and copy in the terminal (drag, double- and triple-click; primary selection, Ctrl+Shift+C, middle-click paste).
+- [x] Mouse selection and copy in the terminal (drag, double- and triple-click; primary selection, Ctrl+C copies a selection, middle-click paste).
 - [x] Mouse reporting for terminal apps (vim, htop, less): clicks, drags, motion and the wheel; Shift selects instead.
 - [x] Smooth cursor, in the terminal and the text fields: glides, fades as it blinks, optional trail; speed and trail in settings.
 - [x] Inline images: kitty graphics, SIXEL and iTerm2 (no kitty animation or relative placements).

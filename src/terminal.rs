@@ -297,19 +297,34 @@ impl TerminalView {
         let mode = *self.term.lock().mode();
         let m = &ks.modifiers;
 
-        // Ctrl+Shift+V pastes, honouring bracketed paste.
-        if m.control && m.shift && ks.key == "v" {
+        let ctrl_only = m.control && !m.alt && !m.platform;
+        // Ctrl+V pastes, honouring bracketed paste. Ctrl+Shift+V sends the literal ^V.
+        if ctrl_only && !m.shift && ks.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
                 self.paste(&text);
             }
             cx.stop_propagation();
             return;
         }
-        // Ctrl+Shift+C copies the selection.
-        if m.control && m.shift && ks.key == "c" {
-            if let Some(text) = self.selected_text() {
+        // Ctrl+C copies when there is a selection and clears it, so a second Ctrl+C
+        // interrupts. With nothing selected, Ctrl+C and Ctrl+Shift+C both send ^C.
+        if ctrl_only && ks.key == "c" {
+            if !m.shift
+                && let Some(text) = self.selected_text()
+            {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.term.lock().selection = None;
+                cx.notify();
+                cx.stop_propagation();
+                return;
             }
+            self.term.lock().scroll_display(Scroll::Bottom);
+            self.write(b"\x03".to_vec());
+            cx.stop_propagation();
+            return;
+        }
+        if ctrl_only && m.shift && ks.key == "v" {
+            self.write(b"\x16".to_vec());
             cx.stop_propagation();
             return;
         }
@@ -1406,12 +1421,41 @@ mod tests {
         assert_eq!(term.read_with(cx, |t, _| t.selected_text()).as_deref(), Some("hello"));
         assert_eq!(cx.update(|_, cx| cx.read_from_primary().and_then(|c| c.text())).as_deref(), Some("hello"));
 
-        // Ctrl+Shift+C copies it to the clipboard; typing clears it.
+        // Typing clears it.
         cx.update(|window, cx| window.render_frame(cx));
-        cx.simulate_keystrokes("ctrl-shift-c");
-        assert_eq!(cx.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text())).as_deref(), Some("hello"));
         cx.simulate_keystrokes("x");
         assert_eq!(term.read_with(cx, |t, _| t.selected_text()), None);
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_c_copies_a_selection_and_otherwise_interrupts(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, b"hello world");
+        let cx = &mut cx;
+        let (start, end) = (at(&term, cx, 0, 0, false), at(&term, cx, 4, 0, true));
+        cx.simulate_event(mouse(MouseButton::Left, start, 1, false));
+        cx.simulate_event(MouseMoveEvent {
+            position: end,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        cx.simulate_event(up(end));
+        cx.update(|window, cx| window.render_frame(cx));
+        let sent = |cx: &mut gpui_kit::VisualTestContext| term.read_with(cx, |t, _| t.sent.take());
+        sent(cx);
+
+        // With a selection, Ctrl+C copies it and clears it, sending nothing.
+        cx.simulate_keystrokes("ctrl-c");
+        assert_eq!(cx.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text())).as_deref(), Some("hello"));
+        assert_eq!(term.read_with(cx, |t, _| t.selected_text()), None);
+        assert_eq!(sent(cx), b"");
+
+        // Without one, Ctrl+C interrupts; Ctrl+Shift+C always does.
+        cx.simulate_keystrokes("ctrl-c ctrl-shift-c");
+        assert_eq!(sent(cx), b"\x03\x03");
+
+        // Ctrl+V pastes the clipboard; Ctrl+Shift+V sends a literal ^V.
+        cx.simulate_keystrokes("ctrl-v ctrl-shift-v");
+        assert_eq!(sent(cx), b"hello\x16");
     }
 
     #[gpui_kit::test]
