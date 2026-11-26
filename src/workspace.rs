@@ -331,6 +331,7 @@ impl Workspace {
                         ThreadAction::MakeModeDefault => this.make_project_default_mode(cx),
                         ThreadAction::MakeModelDefault => this.make_project_default_model(cx),
                         ThreadAction::LogIn => this.log_in(window, cx),
+                        ThreadAction::RunInTerminal(command) => this.run_in_terminal(command, window, cx),
                     }
                 },
             ));
@@ -927,6 +928,18 @@ impl Workspace {
             let focus = term.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
         }
+        cx.notify();
+    }
+
+    /// Open a terminal tab in the thread's project with `command` on its command line, not run:
+    /// the user reads it, edits it if need be, and presses Enter.
+    fn run_in_terminal(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self.active_project().map(|p| p.id.clone()) else { return };
+        let Some(panes) = self.project_panes(&project_id, None, window, cx) else { return };
+        let Some(term) = panes.update(cx, |p, cx| p.new_project_terminal(window, cx)) else { return };
+        crate::terminal::TerminalView::insert_command(&term, command.to_string(), cx);
+        let focus = term.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
         cx.notify();
     }
 

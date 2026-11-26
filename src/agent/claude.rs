@@ -29,6 +29,19 @@ pub const TESTED_VERSION: &str = "2.1.331";
 
 const STDERR_LINES_KEPT: usize = 40;
 
+/// Added to Claude's system prompt in every TJ session: how TJ shows commands, so the agent
+/// writes them in a form its Copy and Run in terminal buttons can take whole.
+pub const TJ_INSTRUCTIONS: &str = "You are running inside TJ, a desktop app. \
+In your replies, every fenced code block gets a Copy button, and a shell block (```bash, ```sh, ```zsh) \
+also gets a Run in terminal button that puts its contents on a new terminal's command line for the user \
+to check and run. So when you ask the user to run something in a terminal:
+- Put exactly one command in each code block. Never put two commands in one block, not even a variable \
+assignment followed by the command that uses it: give each its own block, in the order to run them.
+- One command may span lines with trailing backslashes or a pipeline; that still counts as one.
+- Mark the block as ```bash (or the shell it is for). Leave out prompts such as `$ ` and leave output out \
+of the block.
+- When the user has to fill in a value, say which one in the text before the block.";
+
 /// How to start a session.
 #[derive(Clone, Debug, Default)]
 pub struct SessionOptions {
@@ -57,6 +70,8 @@ impl SessionOptions {
             "--include-partial-messages",
             // Permission prompts come to us as `can_use_tool` control requests.
             "--permission-prompt-tool=stdio",
+            "--append-system-prompt",
+            TJ_INSTRUCTIONS,
         ]
         .map(String::from)
         .to_vec();
@@ -1209,6 +1224,14 @@ mod tests {
         let options = SessionOptions { model: Some("opus".into()), effort: Some("high".into()), ..Default::default() };
         let args = options.args().join(" ");
         assert!(args.contains("--model opus") && args.contains("--effort high"), "{args}");
+    }
+
+    #[test]
+    fn sessions_are_told_how_tj_shows_commands() {
+        let args = SessionOptions::default().args();
+        let at = args.iter().position(|a| a == "--append-system-prompt").expect("flag");
+        assert_eq!(args[at + 1], TJ_INSTRUCTIONS);
+        assert!(TJ_INSTRUCTIONS.contains("exactly one command in each code block"));
     }
 
     /// `cargo test -- --ignored live_` (no tokens: the session is stopped after its handshake)
