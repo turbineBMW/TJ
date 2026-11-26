@@ -227,6 +227,54 @@ pub fn prepare_image(bytes: Vec<u8>) -> anyhow::Result<PromptImage> {
     Ok(PromptImage { media_type: "image/jpeg".into(), data: Arc::new(jpeg) })
 }
 
+/// The messages sent in a thread, for Up and Down in the prompt box, as in Claude Code: Up
+/// shows the one before, Down the one after, and Down past the newest brings back what was
+/// being typed.
+#[derive(Default)]
+pub struct PromptHistory {
+    sent: Vec<String>,
+    /// While browsing: the entry shown, and the draft to come back to.
+    browsing: Option<(usize, String)>,
+}
+
+impl PromptHistory {
+    /// Remember a sent message. Blank ones and repeats of the last one are skipped.
+    pub fn push(&mut self, text: &str) {
+        self.browsing = None;
+        let text = text.trim();
+        if !text.is_empty() && self.sent.last().is_none_or(|last| last != text) {
+            self.sent.push(text.to_string());
+        }
+    }
+
+    /// The message before the one shown; `current` is kept as the draft when browsing starts.
+    /// None at the oldest, or with nothing sent.
+    pub fn older(&mut self, current: &str) -> Option<String> {
+        let ix = match &self.browsing {
+            None => self.sent.len().checked_sub(1)?,
+            Some((ix, _)) => ix.checked_sub(1)?,
+        };
+        let draft = self.browsing.take().map_or_else(|| current.to_string(), |(_, draft)| draft);
+        self.browsing = Some((ix, draft));
+        Some(self.sent[ix].clone())
+    }
+
+    /// The message after the one shown, or the draft after the newest. None when not browsing.
+    pub fn newer(&mut self) -> Option<String> {
+        let (ix, draft) = self.browsing.take()?;
+        if ix + 1 < self.sent.len() {
+            self.browsing = Some((ix + 1, draft));
+            return Some(self.sent[ix + 1].clone());
+        }
+        Some(draft)
+    }
+
+    /// The shown text was edited: it is the draft now, and Up starts again from the newest.
+    pub fn stop(&mut self) {
+        self.browsing = None;
+    }
+}
+
 /// The file extension for a media type, for saving attached images with the transcript.
 pub fn extension(media_type: &str) -> &'static str {
     match media_type {
@@ -244,8 +292,35 @@ pub fn files_dir(transcript: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_query, is_image, mention_path, mention_text, prepare_image, query_at, rank, rank_commands};
+    use super::{
+        PromptHistory, command_query, is_image, mention_path, mention_text, prepare_image, query_at, rank,
+        rank_commands,
+    };
     use crate::agent::SlashCommand;
+
+    #[test]
+    fn up_and_down_walk_the_sent_messages_and_come_back_to_the_draft() {
+        let mut history = PromptHistory::default();
+        assert_eq!(history.older("draft"), None, "nothing sent yet");
+        for text in ["first", "  ", "second", "second", "third\nwith two lines"] {
+            history.push(text);
+        }
+        assert_eq!(history.newer(), None, "not browsing");
+        assert_eq!(history.older("half typed").as_deref(), Some("third\nwith two lines"));
+        assert_eq!(history.older("ignored").as_deref(), Some("second"), "a repeat is kept once");
+        assert_eq!(history.older("ignored").as_deref(), Some("first"), "blank messages are skipped");
+        assert_eq!(history.older("ignored"), None, "the oldest");
+        assert_eq!(history.newer().as_deref(), Some("second"));
+        assert_eq!(history.newer().as_deref(), Some("third\nwith two lines"));
+        assert_eq!(history.newer().as_deref(), Some("half typed"), "past the newest: the draft");
+        assert_eq!(history.newer(), None);
+
+        history.older("");
+        history.older("");
+        history.stop();
+        assert_eq!(history.older("edited").as_deref(), Some("third\nwith two lines"), "an edit starts over");
+        assert_eq!(history.newer().as_deref(), Some("edited"));
+    }
 
     #[test]
     fn a_command_is_the_first_word_of_the_prompt() {

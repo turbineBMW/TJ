@@ -292,6 +292,8 @@ pub struct ThreadView {
     quotes: Vec<Quote>,
     mention: Option<MentionPicker>,
     command_picker: Option<CommandPicker>,
+    /// The messages sent here, for Up and Down in the prompt box.
+    history: crate::composer::PromptHistory,
     command_scroll: ScrollHandle,
     /// The slash commands the running session said it accepts; until it has, the workspace's list.
     session_commands: Vec<crate::agent::SlashCommand>,
@@ -344,6 +346,9 @@ impl ThreadView {
             // Shift+Enter has already inserted a newline; only a plain or Ctrl+Enter sends.
             InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
             InputEvent::Change => {
+                // Typing over a recalled message makes it the draft. (Recalling doesn't
+                // count: setting the value is not a change.)
+                this.history.stop();
                 this.update_mention(cx);
                 this.update_command_picker(cx);
             }
@@ -387,6 +392,7 @@ impl ThreadView {
             quotes: Vec::new(),
             mention: None,
             command_picker: None,
+            history: Default::default(),
             command_scroll: ScrollHandle::new(),
             session_commands: Vec::new(),
             project_files: None,
@@ -1111,14 +1117,18 @@ impl ThreadView {
         let primary = cx.theme().primary;
         v_flex()
             .relative()
-            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
                 if this.move_mention(-1, cx) || this.move_command(-1, cx) {
                     cx.stop_propagation();
+                } else {
+                    this.recall_when_stuck(true, window, cx);
                 }
             }))
-            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+            .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
                 if this.move_mention(1, cx) || this.move_command(1, cx) {
                     cx.stop_propagation();
+                } else {
+                    this.recall_when_stuck(false, window, cx);
                 }
             }))
             // Enter picks the highlighted mention or command; a command already typed in full
@@ -1135,9 +1145,13 @@ impl ThreadView {
                     cx.stop_propagation();
                 }
             }))
+            // Escape closes a picker; with none open it stops the agent, as in Claude Code.
             .capture_action(cx.listener(|this, _: &Escape, _, cx| {
                 if this.mention.take().is_some() || this.command_picker.take().is_some() {
                     cx.notify();
+                    cx.stop_propagation();
+                } else if this.status != Status::Idle {
+                    this.interrupt(cx);
                     cx.stop_propagation();
                 }
             }))
@@ -1152,6 +1166,37 @@ impl ThreadView {
             .drag_over::<gpui_kit::ExternalPaths>(move |style, _, _, _| style.border_color(primary))
             .children(self.render_mention_picker(cx))
             .children(self.render_command_picker(cx))
+    }
+
+    /// Up on the prompt's top row recalls the message sent before, Down on its bottom row the
+    /// one after (or what was being typed), as in Claude Code. The prompt box moves the caret
+    /// first, wrapped lines included; when it didn't move, it was on that row. A recalled
+    /// message starts with the caret at its start going up and at its end going down, so the
+    /// next press keeps walking.
+    fn recall_when_stuck(&mut self, older: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let caret = self.prompt.read(cx).selected_range();
+        if !caret.is_empty() {
+            return;
+        }
+        cx.defer_in(window, move |this, window, cx| {
+            let prompt = this.prompt.read(cx);
+            if prompt.selected_range() != caret {
+                return;
+            }
+            let recalled = if older { this.history.older(&prompt.value()) } else { this.history.newer() };
+            let Some(text) = recalled else { return };
+            this.prompt.update(cx, |prompt, cx| {
+                prompt.set_value(text.as_str(), window, cx);
+                if !older {
+                    prompt.set_selected_range(text.len()..text.len(), cx);
+                }
+            });
+            // A recalled `/command` or `@mention` doesn't open its picker: the next Up or
+            // Down keeps walking the history.
+            this.mention = None;
+            this.command_picker = None;
+            cx.notify();
+        });
     }
 
     /// What goes with the next message, each with a remove button: the tool calls it asks
@@ -1425,6 +1470,7 @@ impl ThreadView {
         let count = images.len();
         let body = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
         self.push_row(Row::User(body, images), cx);
+        self.history.push(text);
         self.plain.push(match count {
             0 => format!("User: {text}"),
             n => format!("User: {text} [{n} image{}]", if n == 1 { "" } else { "s" }),
@@ -3867,6 +3913,60 @@ mod tests {
                 matches!(t.rows.last(), Some(Row::Notice(super::NoticeKind::Info, text)) if text.contains("Context cleared"))
             );
         });
+    }
+
+    #[gpui_kit::test]
+    fn up_and_down_in_the_prompt_walk_the_sent_messages(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, cx| {
+            t.send("first", cx);
+            t.send("second\nline two", cx);
+        });
+        type_into_prompt(&thread, "draft", cx);
+        let caret = |cx: &mut VisualTestContext| thread.read_with(cx, |t, cx| t.prompt.read(cx).cursor());
+
+        cx.simulate_keystrokes("up");
+        assert_eq!(prompt_text(&thread, cx), "second\nline two");
+        assert_eq!(caret(cx), 0, "going back, the caret starts at the top");
+        cx.simulate_keystrokes("up");
+        assert_eq!(prompt_text(&thread, cx), "first");
+        cx.simulate_keystrokes("up");
+        assert_eq!(prompt_text(&thread, cx), "first", "the oldest");
+        cx.simulate_keystrokes("down");
+        assert_eq!(prompt_text(&thread, cx), "second\nline two");
+        assert_eq!(caret(cx), "second\nline two".len(), "going forward, at the end");
+        cx.simulate_keystrokes("down");
+        assert_eq!(prompt_text(&thread, cx), "draft", "past the newest, the draft comes back");
+
+        // Up in a message of several lines moves up a line before it recalls anything.
+        thread.update_in(cx, |t, window, cx| t.prompt.update(cx, |p, cx| p.set_value("", window, cx)));
+        type_into_prompt(&thread, "one\ntwo", cx);
+        cx.simulate_keystrokes("up");
+        assert_eq!(prompt_text(&thread, cx), "one\ntwo");
+        cx.simulate_keystrokes("up");
+        assert_eq!(prompt_text(&thread, cx), "second\nline two");
+    }
+
+    #[gpui_kit::test]
+    fn escape_in_the_prompt_stops_a_working_agent(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        type_into_prompt(&thread, "", cx);
+        cx.simulate_keystrokes("escape");
+        let interrupts = |cx: &mut VisualTestContext| {
+            calls(&thread, cx).into_iter().filter(|c| matches!(c, ScriptedCall::Interrupt)).count()
+        };
+        assert_eq!(interrupts(cx), 0, "nothing to stop");
+
+        thread.update(cx, |t, cx| t.send("Look around", cx));
+        type_into_prompt(&thread, "@cargo", cx);
+        assert!(thread.read_with(cx, |t, _| t.mention.is_some()));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(interrupts(cx), 0, "the first Escape closes the picker");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(interrupts(cx), 1, "the next one stops the agent");
+        assert_eq!(prompt_text(&thread, cx), "@cargo", "and keeps what was typed");
     }
 
     #[gpui_kit::test]
