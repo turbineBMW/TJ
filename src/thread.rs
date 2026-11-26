@@ -55,9 +55,53 @@ pub enum ThreadAction {
     MakeModeDefault,
     /// Start `claude auth login` for the thread's account in a terminal.
     LogIn,
+    /// Open a terminal with this command on its command line, not run (a reply's code block).
+    RunInTerminal(String),
 }
 
 impl EventEmitter<ThreadAction> for ThreadView {}
+
+/// The buttons in the corner of a reply's code block: Copy, and on a shell block, Run in
+/// terminal, which opens a terminal with the command typed but not run.
+fn code_block_buttons(block: &gpui_kit::base::text::CodeBlock, thread: WeakEntity<ThreadView>) -> AnyElement {
+    use gpui_kit::{assets::IconName, component::clipboard::Clipboard};
+    let shell = block.lang().is_some_and(|lang| is_shell(lang.as_ref()));
+    let code = if shell { command_text(&block.code()) } else { block.code().to_string() };
+    h_flex()
+        .gap_0p5()
+        .when(shell, |el| {
+            let command = code.clone();
+            el.child(
+                Button::new("run")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::SquareTerminal)
+                    .tooltip("Run in terminal (typed, not run: press Enter there)")
+                    .on_click(move |_, _, cx| {
+                        let action = ThreadAction::RunInTerminal(command.clone());
+                        let _ = thread.update(cx, |_, cx| cx.emit(action));
+                    }),
+            )
+        })
+        .child(Clipboard::new("copy").value(code).tooltip("Copy"))
+        .into_any_element()
+}
+
+/// A code block's language that is a shell's, so its contents are a command to run.
+fn is_shell(lang: &str) -> bool {
+    matches!(lang.to_ascii_lowercase().as_str(), "bash" | "sh" | "shell" | "zsh" | "fish" | "console" | "shell-session")
+}
+
+/// A shell block's command as the user would type it: without a trailing newline, and without
+/// the `$ ` prompts some replies put in front of every line.
+fn command_text(code: &str) -> String {
+    let code = code.trim_end();
+    let lines: Vec<&str> = code.lines().filter(|l| !l.trim().is_empty()).collect();
+    if !lines.is_empty() && lines.iter().all(|l| l.starts_with("$ ")) {
+        return code.lines().map(|l| l.strip_prefix("$ ").unwrap_or(l)).collect::<Vec<_>>().join("\n");
+    }
+    code.to_string()
+}
 
 /// What the composer's menus offer, provided by the workspace.
 #[derive(Clone, Default)]
@@ -2154,7 +2198,16 @@ impl ThreadView {
                 )
                 .into_any_element(),
             Row::Assistant(body) => {
-                pad(div()).py_2().child(TextView::new(body).selectable(true).stream_fade(true)).into_any_element()
+                let thread = cx.entity().downgrade();
+                pad(div())
+                    .py_2()
+                    .child(
+                        TextView::new(body)
+                            .selectable(true)
+                            .stream_fade(true)
+                            .code_block_actions(move |block, _, _| code_block_buttons(block, thread.clone())),
+                    )
+                    .into_any_element()
             }
             Row::Tool(tool) => {
                 let sub = tool.subagent.as_ref();
@@ -2845,7 +2898,17 @@ pub fn default_cwd() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, Row, Status, ThreadView};
+    use super::{Backend, Row, Status, ThreadView, command_text, is_shell};
+
+    #[test]
+    fn shell_blocks_give_the_command_as_typed() {
+        assert!(is_shell("bash") && is_shell("Shell") && is_shell("zsh") && !is_shell("json") && !is_shell("rust"));
+        assert_eq!(command_text("ls -la\n"), "ls -la");
+        assert_eq!(command_text("$ cd src\n$ ls\n"), "cd src\nls");
+        // A `$` that isn't a prompt on every line stays.
+        assert_eq!(command_text("echo $HOME\n"), "echo $HOME");
+        assert_eq!(command_text("curl x \\\n  | jq .\n"), "curl x \\\n  | jq .");
+    }
     use crate::agent::{AgentEvent, Decision, ScriptedAgent, ScriptedCall, claude};
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{

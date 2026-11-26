@@ -540,6 +540,20 @@ fn terminal_colors(cx: &App) -> ([Rgb; 16], Hsla, Hsla) {
 
 /// The built-in ANSI colours (Tokyo Night), for dark surfaces when the theme's own terminal
 /// palette is made for a light background.
+/// What to send the shell so `command` sits on its command line, not yet run. Without
+/// bracketed paste a newline would run what came before it, so lines continued with `\` are
+/// joined; anything still on several lines goes bracketed anyway, which most shells understand.
+fn command_line_bytes(command: &str, bracketed: bool) -> Vec<u8> {
+    let command = command.trim_end().replace('\x1b', "");
+    if !bracketed {
+        let joined = command.replace("\\\r\n", " ").replace("\\\n", " ");
+        if !joined.contains('\n') {
+            return joined.into_bytes();
+        }
+    }
+    format!("\x1b[200~{command}\x1b[201~").into_bytes()
+}
+
 pub fn default_ansi() -> [Hsla; 16] {
     ANSI.map(|v| rgb_to_hsla(Rgb { r: (v >> 16) as u8, g: (v >> 8) as u8, b: v as u8 }))
 }
@@ -1018,6 +1032,29 @@ impl TerminalView {
         self.term.lock().selection_to_string().filter(|t| !t.is_empty())
     }
 
+    /// Put `command` on the shell's command line without running it, for the user to check and
+    /// run with Enter. A shell just started isn't reading yet, so this waits (up to three seconds)
+    /// for its prompt to turn on bracketed paste: pasted that way, a command of several lines
+    /// stays on the command line instead of running line by line.
+    pub fn insert_command(this: &Entity<Self>, command: String, cx: &mut App) {
+        let this = this.downgrade();
+        cx.spawn(async move |cx| {
+            for _ in 0..60 {
+                let ready =
+                    this.read_with(cx, |t, _| t.term.lock().mode().contains(TermMode::BRACKETED_PASTE)).unwrap_or(true);
+                if ready {
+                    break;
+                }
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
+            }
+            let _ = this.update(cx, |t, _| {
+                let bracketed = t.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+                t.write(command_line_bytes(&command, bracketed));
+            });
+        })
+        .detach();
+    }
+
     fn paste(&self, text: &str) {
         let mode = *self.term.lock().mode();
         if mode.contains(TermMode::BRACKETED_PASTE) {
@@ -1229,13 +1266,24 @@ impl Focusable for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{TermMode, TerminalView, key_to_bytes, mouse_report};
+    use super::{TermMode, TerminalView, command_line_bytes, key_to_bytes, mouse_report};
     use alacritty_terminal::tty::Shell;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
         AppContext as _, Entity, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
         TestAppContext, WindowBounds, WindowOptions, bounds, point, px, size,
     };
+
+    #[test]
+    fn commands_go_on_the_command_line_without_running() {
+        // The trailing newline would press Enter, so it never goes.
+        assert_eq!(command_line_bytes("ls -la\n", false), b"ls -la");
+        assert_eq!(command_line_bytes("ls -la\n", true), b"\x1b[200~ls -la\x1b[201~");
+        // Without bracketed paste, continued lines are joined so no newline reaches the shell.
+        assert_eq!(command_line_bytes("curl -sS \\\n  -H x\n", false), b"curl -sS    -H x");
+        // Lines that can't be joined go bracketed, and a stray escape can't end the paste early.
+        assert_eq!(command_line_bytes("a\nb\x1b[201~", false), b"\x1b[200~a\nb[201~\x1b[201~");
+    }
 
     /// Open a real gpui-kit window (with its Root, which binds Tab and Ctrl-C) holding a
     /// terminal running /bin/sh, focus the terminal, press `keys`, and return what the

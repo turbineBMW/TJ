@@ -745,6 +745,17 @@ impl Panes {
         }
     }
 
+    /// A terminal in a new tab, started in the project's folder (not the focused terminal's).
+    pub fn new_project_terminal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TerminalView>> {
+        let term = self.spawn(None, window, cx)?;
+        self.push_tab(View::Terminal(term.clone()), window, cx);
+        Some(term)
+    }
+
     /// Split the focused pane of the tab on show; the new pane, in the same tab, starts with a
     /// terminal.
     pub fn split(&mut self, direction: SplitDirection, window: &mut Window, cx: &mut Context<Self>) {
