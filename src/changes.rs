@@ -265,6 +265,9 @@ pub struct ProjectChanges {
     auto_summarize: Option<(Summarizer, Vec<String>)>,
     /// The one file the review shows (and summarizes), or `None` for all of them.
     pub focus: Option<String>,
+    /// Changes from a patch (a pull request's) rather than the working tree; refresh leaves
+    /// them be.
+    fixed: bool,
 }
 
 impl ProjectChanges {
@@ -281,9 +284,61 @@ impl ProjectChanges {
             refresh_again: false,
             auto_summarize: None,
             focus: None,
+            fixed: false,
         };
         this.refresh(cx);
         this
+    }
+
+    /// The changes in `patch` (a pull request's), summarized with `root` as the working folder.
+    pub fn from_fixed_patch(root: PathBuf, patch: &str, cx: &mut Context<Self>) -> Self {
+        let diff = cx.new(|cx| DiffState::new(Vec::new(), cx));
+        let mut this = Self {
+            root,
+            changes: Changes::default(),
+            diff,
+            summaries: HashMap::new(),
+            summarizing: false,
+            error: None,
+            refreshing: false,
+            refresh_again: false,
+            auto_summarize: None,
+            focus: None,
+            fixed: true,
+        };
+        this.set_patch(patch, cx);
+        this
+    }
+
+    /// Show `patch` instead (the pull request moved on). Summaries of files that didn't change
+    /// are kept.
+    pub fn set_patch(&mut self, patch: &str, cx: &mut Context<Self>) {
+        match from_patch(patch) {
+            Ok(changes) => {
+                self.error = None;
+                self.changes = changes;
+            }
+            Err(err) => self.error = Some(format!("{err:#}")),
+        }
+        self.show_diff(cx);
+        cx.notify();
+    }
+
+    /// Where the focused file is among all of them: (index, count).
+    pub fn focus_position(&self) -> Option<(usize, usize)> {
+        let path = self.focus.as_ref()?;
+        let ix = self.changes.files.iter().position(|f| &f.path == path)?;
+        Some((ix, self.changes.files.len()))
+    }
+
+    /// Focus the file `step` files after (or before) the focused one.
+    pub fn step_focus(&mut self, step: isize, cx: &mut Context<Self>) {
+        let Some((ix, count)) = self.focus_position() else { return };
+        let to = (ix as isize + step).clamp(0, count as isize - 1) as usize;
+        if to != ix {
+            let path = self.changes.files[to].path.clone();
+            self.set_focus(Some(path), cx);
+        }
     }
 
     pub fn summary(&self, file: &FileChange) -> Option<&str> {
@@ -319,6 +374,9 @@ impl ProjectChanges {
 
     /// Re-read git in the background. Calls made while a refresh runs fold into one more.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.fixed {
+            return;
+        }
         if self.refreshing {
             self.refresh_again = true;
             return;
@@ -411,13 +469,25 @@ impl ProjectChanges {
 pub struct ReviewView {
     pub changes: Entity<ProjectChanges>,
     no_summaries: bool,
+    /// In a modal over a pull request: one file at a time, with Previous and Next file.
+    navigator: bool,
+    focus: FocusHandle,
     _observe: Subscription,
 }
 
 impl ReviewView {
     pub fn new(changes: Entity<ProjectChanges>, no_summaries: bool, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&changes, |_, _, cx| cx.notify());
-        Self { changes, no_summaries, _observe: observe }
+        Self { changes, no_summaries, navigator: false, focus: cx.focus_handle(), _observe: observe }
+    }
+
+    /// The review in a modal, a file at a time, with Previous and Next file (also ← and →).
+    pub fn with_navigator(changes: Entity<ProjectChanges>, no_summaries: bool, cx: &mut Context<Self>) -> Self {
+        Self { navigator: true, ..Self::new(changes, no_summaries, cx) }
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus, cx);
     }
 
     /// The tab's title: the file shown, or how many.
@@ -432,9 +502,10 @@ impl ReviewView {
 
 impl Render for ReviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::assets::IconName;
         use gpui_kit::base::{h_flex, v_flex};
         use gpui_kit::component::{
-            ActiveTheme as _, Selectable as _, Sizable as _,
+            ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _,
             button::{Button, ButtonVariants as _},
             diff::{Diff, DiffAnnotation, DiffMode},
         };
@@ -463,6 +534,34 @@ impl Render for ReviewView {
             None => format!("{} files changed · +{additions} −{deletions}", shown.len()),
         };
         let error = model.error.clone();
+        let position = if self.navigator { model.focus_position() } else { None };
+        let changes = self.changes.clone();
+        let navigator = position.map(|(ix, count)| {
+            let (back, next) = (changes.clone(), changes.clone());
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new("review-previous-file")
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::ChevronLeft)
+                        .label("Previous")
+                        .tooltip("Previous file (←)")
+                        .disabled(ix == 0)
+                        .on_click(move |_, _, cx| back.update(cx, |c, cx| c.step_focus(-1, cx))),
+                )
+                .child(div().px_1().text_xs().text_color(muted).child(format!("File {} of {count}", ix + 1)))
+                .child(
+                    Button::new("review-next-file")
+                        .xsmall()
+                        .ghost()
+                        .label("Next")
+                        .icon(IconName::ChevronRight)
+                        .tooltip("Next file (→)")
+                        .disabled(ix + 1 >= count)
+                        .on_click(move |_, _, cx| next.update(cx, |c, cx| c.step_focus(1, cx))),
+                )
+        });
         let empty = shown.is_empty();
         let empty_text = match &model.focus {
             Some(path) => format!("{path} has no uncommitted changes."),
@@ -478,12 +577,27 @@ impl Render for ReviewView {
                     None if summarizing => "Summarizing…".into(),
                     None => "No summary yet.".into(),
                 };
-                div().px_3().py_2().bg(secondary).text_sm().child(text)
+                // Out over the padding the diff puts around each annotation, so the whole box is
+                // the summary's colour.
+                div().mx(rems(-0.75)).my(rems(-0.75)).px_6().py_4().bg(secondary).text_sm().child(text)
             },
         );
 
+        let (left, right) = (changes.clone(), changes);
         v_flex()
             .size_full()
+            .track_focus(&self.focus)
+            .when(self.navigator, |el| {
+                el.on_key_down(move |event, _, cx| match event.keystroke.key.as_str() {
+                    "left" if !event.keystroke.modifiers.modified() => {
+                        left.update(cx, |c, cx| c.step_focus(-1, cx));
+                    }
+                    "right" if !event.keystroke.modifiers.modified() => {
+                        right.update(cx, |c, cx| c.step_focus(1, cx));
+                    }
+                    _ => {}
+                })
+            })
             .rounded_t(px(crate::panes::CONTENT_RADIUS))
             .bg(bg)
             .child(
@@ -496,6 +610,7 @@ impl Render for ReviewView {
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(heading))
                     .when(summarizing, |el| el.child(div().text_xs().text_color(muted).child("Writing summaries…")))
                     .child(div().flex_1())
+                    .children(navigator)
                     .children([DiffMode::Unified, DiffMode::Split].map(|m| {
                         let state = diff_state.clone();
                         Button::new(SharedString::from(format!("diff-mode-{m:?}")))
@@ -642,6 +757,26 @@ mod tests {
         assert!(prompt.contains("- Make it faster"));
         assert!(prompt.contains("=== FILE: big.rs (Modified) ==="));
         assert!(prompt.len() < SUMMARY_FILE_CHARS + 500);
+    }
+
+    #[gpui_kit::test]
+    fn a_pull_requests_patch_is_shown_a_file_at_a_time(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+A\n\
+diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-b\n+B\n";
+        let changes = cx.new(|cx| super::ProjectChanges::from_fixed_patch(std::env::temp_dir(), patch, cx));
+        changes.update(cx, |c, cx| {
+            assert_eq!(c.changes.files.len(), 2);
+            c.set_focus(Some("a.rs".into()), cx);
+            assert_eq!(c.focus_position(), Some((0, 2)));
+            c.step_focus(1, cx);
+            assert_eq!(c.focus.as_deref(), Some("b.rs"));
+            c.step_focus(1, cx);
+            assert_eq!(c.focus_position(), Some((1, 2)), "stops at the last file");
+            c.refresh(cx);
+            assert_eq!(c.changes.files.len(), 2, "refresh doesn't swap in the working tree");
+            assert_eq!(c.diff.read(cx).files().len(), 1, "only the focused file is in the diff");
+        });
     }
 
     /// Runs the real claude on Haiku (a fraction of a cent): `cargo test -- --ignored live_`

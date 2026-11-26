@@ -89,6 +89,9 @@ pub struct Workspace {
     reviews: HashMap<String, Entity<ReviewView>>,
     /// Per project: its GitHub page, shown in a tab.
     githubs: HashMap<String, Entity<GitHubView>>,
+    /// Per pull request ("<project id>#<number>"): its files with their summaries, for the
+    /// review modal, kept so summaries survive closing it.
+    pr_changes: HashMap<String, Entity<ProjectChanges>>,
     /// The thread the header follows (the one last shown or focused).
     active: Option<String>,
     /// The status column shown or hidden by hand; `None` follows the window's width.
@@ -148,6 +151,7 @@ impl Workspace {
             agents: HashMap::new(),
             reviews: HashMap::new(),
             githubs: HashMap::new(),
+            pr_changes: HashMap::new(),
             active: None,
             status_choice: None,
             shell: launch.shell,
@@ -622,6 +626,7 @@ impl Workspace {
         self.agents.remove(project_id);
         self.reviews.remove(project_id);
         self.githubs.remove(project_id);
+        self.pr_changes.retain(|key, _| !key.starts_with(&format!("{project_id}#")));
         self.changes.remove(project_id);
         self.show_archived.remove(project_id);
         if let Some(gone) = self.active.take_if(|id| project.threads.iter().any(|t| &t.id == id)) {
@@ -1144,6 +1149,58 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A pull request's file in the review modal: its diff and summary, with Previous and Next
+    /// file.
+    fn open_pr_file(
+        &mut self,
+        project_id: &str,
+        root: std::path::PathBuf,
+        file: crate::github_view::ExpandFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = format!("{project_id}#{}", file.number);
+        let changes = match self.pr_changes.get(&key) {
+            Some(changes) => {
+                changes.update(cx, |c, cx| c.set_patch(&file.patch, cx));
+                changes.clone()
+            }
+            None => {
+                let changes = cx.new(|cx| ProjectChanges::from_fixed_patch(root, &file.patch, cx));
+                self.pr_changes.insert(key, changes.clone());
+                changes
+            }
+        };
+        let summarizer = if self.no_summaries {
+            Summarizer::Off
+        } else {
+            let config_dir = self
+                .active_thread()
+                .and_then(|t| self.accounts.get(&t.read(cx).account_id).and_then(|a| a.config_path(&self.home)));
+            Summarizer::Claude { config_dir }
+        };
+        changes.update(cx, |c, cx| {
+            // Focus first, so only this file is summarized.
+            c.set_focus(Some(file.path.clone()), cx);
+            c.set_auto_summarize(Some((summarizer, vec![file.context.clone()])), cx);
+        });
+        let view = cx.new(|cx| ReviewView::with_navigator(changes, self.no_summaries, cx));
+        let shown = view.clone();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            use gpui_kit::component::ActiveTheme as _;
+            let size = window.viewport_size();
+            // As tall as the window allows: the same gap above as the dialog keeps below.
+            let gap = cx.theme().spacing_tokens().lg;
+            dialog
+                .w((size.width * 0.9).min(px(1600.)))
+                .margin_top(gap)
+                .h(size.height - gap * 2.)
+                .title(format!("Pull request #{}", file.number))
+                .child(div().size_full().rounded_md().overflow_hidden().child(shown.clone()))
+        });
+        view.update(cx, |v, cx| v.focus(window, cx));
+    }
+
     /// Show the project's GitHub tab.
     fn open_github(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project_id) = self.active_project().map(|p| p.id.clone()) else { return };
@@ -1179,12 +1236,18 @@ impl Workspace {
             .clone();
         let github = cx.new(|cx| GitHubView::new(project.path.clone(), project.github_account.clone(), window, cx));
         let github_project = project.id.clone();
-        self._subscriptions.push(cx.subscribe(&github, move |this, _, event: &GitHubEvent, _| match event {
-            GitHubEvent::AccountChosen(login) => {
-                if let Some(project) = this.state.project_mut(&github_project) {
-                    project.github_account = login.clone();
+        let github_root = project.path.clone();
+        self._subscriptions.push(cx.subscribe_in(&github, window, move |this, _, event: &GitHubEvent, window, cx| {
+            match event {
+                GitHubEvent::AccountChosen(login) => {
+                    if let Some(project) = this.state.project_mut(&github_project) {
+                        project.github_account = login.clone();
+                    }
+                    this.save();
                 }
-                this.save();
+                GitHubEvent::ExpandFile(file) => {
+                    this.open_pr_file(&github_project, github_root.clone(), file.clone(), window, cx)
+                }
             }
         }));
         self.githubs.insert(project.id.clone(), github.clone());

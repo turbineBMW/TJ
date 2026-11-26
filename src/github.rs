@@ -797,6 +797,55 @@ pub fn set_ready(token: &str, remote: &Remote, number: u64) -> anyhow::Result<()
     Ok(())
 }
 
+/// Close a pull request without merging it, or reopen a closed one.
+pub fn set_open(token: &str, remote: &Remote, number: u64, open: bool) -> anyhow::Result<()> {
+    let body = json!({ "state": if open { "open" } else { "closed" } });
+    api(token, "PATCH", &format!("repos/{}/pulls/{number}", remote.slug()), Some(&body))?;
+    Ok(())
+}
+
+/// The last line the patch shows for its last file: `(on the old side, line number)`. That's
+/// where the diff ends, so the review box goes under it. `None` when the last file has no
+/// hunks (binary, or only renamed).
+pub fn last_patch_line(patch: &str) -> Option<(bool, u64)> {
+    let section = match patch.rfind("\ndiff --git ") {
+        Some(at) => &patch[at + 1..],
+        None => patch,
+    };
+    let (mut old, mut new, mut last, mut in_hunk) = (0u64, 0u64, None, false);
+    for line in section.lines() {
+        if let Some(rest) = line.strip_prefix("@@ -") {
+            // "@@ -a,b +c,d @@": the first line of each side.
+            let mut parts = rest.split(' ');
+            let start = |part: Option<&str>| -> Option<u64> { part?.split(',').next()?.parse().ok() };
+            old = start(parts.next())?;
+            new = start(parts.next().map(|p| p.trim_start_matches('+')))?;
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'+') => {
+                last = Some((false, new));
+                new += 1;
+            }
+            Some(b'-') => {
+                last = Some((true, old));
+                old += 1;
+            }
+            Some(b'\\') => {}
+            _ => {
+                last = Some((false, new));
+                old += 1;
+                new += 1;
+            }
+        }
+    }
+    last
+}
+
 // ---------- the local clone ----------
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -970,6 +1019,18 @@ pub fn ago(iso: &str, now: chrono::DateTime<chrono::Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn last_patch_line_is_the_end_of_the_last_file() {
+        let patch = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n\
+diff --git a/y.rs b/y.rs\n--- a/y.rs\n+++ b/y.rs\n@@ -10,3 +12,4 @@ fn f()\n ctx\n+new\n ctx\n ctx\n";
+        assert_eq!(super::last_patch_line(patch), Some((false, 15)));
+        let deleted_last =
+            "diff --git a/z b/z\n--- a/z\n+++ b/z\n@@ -4,2 +4,1 @@\n keep\n-gone\n\\ No newline at end of file\n";
+        assert_eq!(super::last_patch_line(deleted_last), Some((true, 5)));
+        let binary = "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/i.png b/i.png\nBinary files differ\n";
+        assert_eq!(super::last_patch_line(binary), None);
+    }
+
     use super::*;
 
     fn remote(host: &str, owner: &str) -> Remote {

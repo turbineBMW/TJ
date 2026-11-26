@@ -9,8 +9,10 @@
 //! All the work is `gh` and `git` in the background (see [`crate::github`]).
 
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     path::PathBuf,
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -20,7 +22,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
-    diff::{Diff, DiffAnnotation, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState},
+    diff::{Diff, DiffAnnotation, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState},
     input::{InputEvent, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     spinner::Spinner,
@@ -36,6 +38,9 @@ use crate::github::{
 
 pub const CONTEXT: &str = "GitHub";
 const LIST_WIDTH: f32 = 340.0;
+/// Narrower than this, the list and the pull request take turns: the list is a page of its own,
+/// and the pull request has a way back to it.
+const NARROW_WIDTH: f32 = 1000.0;
 /// The local branch's state is read again this often while the tab is open.
 const LOCAL_POLL: Duration = Duration::from_secs(15);
 /// Showing the tab again after this long reloads the pull requests.
@@ -43,7 +48,17 @@ const STALE: Duration = Duration::from_secs(45);
 
 gpui_kit::actions!(
     github,
-    [NextPullRequest, PreviousPullRequest, ShowConversation, ShowFiles, ShowCommits, Refresh, Pull]
+    [
+        NextPullRequest,
+        PreviousPullRequest,
+        OpenPullRequest,
+        BackToList,
+        ShowConversation,
+        ShowFiles,
+        ShowCommits,
+        Refresh,
+        Pull
+    ]
 );
 
 /// The tab's own keys; they apply while it has focus and a text box doesn't take them.
@@ -52,6 +67,8 @@ pub fn bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("down", NextPullRequest, cx),
         KeyBinding::new("up", PreviousPullRequest, cx),
+        KeyBinding::new("enter", OpenPullRequest, cx),
+        KeyBinding::new("escape", BackToList, cx),
         KeyBinding::new("alt-1", ShowConversation, cx),
         KeyBinding::new("alt-2", ShowFiles, cx),
         KeyBinding::new("alt-3", ShowCommits, cx),
@@ -64,6 +81,18 @@ pub fn bindings() -> Vec<KeyBinding> {
 pub enum GitHubEvent {
     /// The account picked for this project (`None`: TJ picks).
     AccountChosen(Option<String>),
+    /// Open a file of a pull request in the review modal, with its summary.
+    ExpandFile(ExpandFile),
+}
+
+/// A pull request's file to show in the review modal.
+#[derive(Clone, Debug)]
+pub struct ExpandFile {
+    pub number: u64,
+    pub patch: String,
+    pub path: String,
+    /// What the pull request is for, so the summary knows the intent.
+    pub context: String,
 }
 
 impl EventEmitter<GitHubEvent> for GitHubView {}
@@ -143,6 +172,22 @@ pub struct GitHubView {
     /// Text boxes to empty on the next render (after their text was sent).
     to_clear: Vec<Entity<TextareaState>>,
     list_scroll: ScrollHandle,
+    /// The tab's width at the last paint (`None` before the first), to tell when it's narrow.
+    width: Option<Pixels>,
+    /// When narrow, the list is showing instead of the pull request.
+    list_page: bool,
+    /// The file headers painted this frame (file index, top), to tell which file is at the top.
+    headers_seen: Rc<RefCell<Vec<(usize, Pixels)>>>,
+    /// Where the diff was painted.
+    diff_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The file at the top of the diff, which Previous and Next file move from.
+    current_file: usize,
+    /// Set by Previous/Next file and kept until the diff is scrolled by hand: the last files
+    /// can't reach the top, so where they sit doesn't say which one was picked.
+    file_pinned: bool,
+    /// The file the top of the diff is in, once its own header has scrolled out of view; its
+    /// header is drawn over the top of the diff.
+    sticky_file: Option<usize>,
     focus: FocusHandle,
     _poll: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -156,15 +201,16 @@ impl GitHubView {
         let comment_box = textarea("Leave a comment  (Ctrl+Enter sends)", window, cx);
         let review_box = textarea("Sum up your review (optional for an approval)", window, cx);
         let mut subscriptions = Vec::new();
-        subscriptions.push(cx.subscribe_in(&comment_box, window, |this, _, event: &InputEvent, _, cx| {
-            if let InputEvent::PressEnter { secondary: true, .. } = event {
-                this.send_comment(cx);
-            }
+        // Typing re-renders the view too: Close reads "Close with comment" while there's text.
+        subscriptions.push(cx.subscribe_in(&comment_box, window, |this, _, event: &InputEvent, _, cx| match event {
+            InputEvent::PressEnter { secondary: true, .. } => this.send_comment(cx),
+            InputEvent::Change => cx.notify(),
+            _ => {}
         }));
-        subscriptions.push(cx.subscribe_in(&review_box, window, |this, _, event: &InputEvent, _, cx| {
-            if let InputEvent::PressEnter { secondary: true, .. } = event {
-                this.send_review(ReviewEvent::Comment, cx);
-            }
+        subscriptions.push(cx.subscribe_in(&review_box, window, |this, _, event: &InputEvent, _, cx| match event {
+            InputEvent::PressEnter { secondary: true, .. } => this.send_review(ReviewEvent::Comment, cx),
+            InputEvent::Change => cx.notify(),
+            _ => {}
         }));
         let diff = cx.new(|cx| DiffState::new(Vec::new(), cx));
         Self {
@@ -199,6 +245,13 @@ impl GitHubView {
             generation: 0,
             to_clear: Vec::new(),
             list_scroll: ScrollHandle::new(),
+            width: None,
+            list_page: true,
+            headers_seen: Rc::new(RefCell::new(Vec::new())),
+            diff_bounds: Rc::new(Cell::new(Bounds::default())),
+            current_file: 0,
+            file_pinned: false,
+            sticky_file: None,
             focus: cx.focus_handle(),
             _poll: None,
             _subscriptions: subscriptions,
@@ -494,6 +547,9 @@ impl GitHubView {
             self.detail = None;
             self.drafts.clear();
             self.compose = None;
+            self.current_file = 0;
+            self.file_pinned = false;
+            self.sticky_file = None;
             self.diff.update(cx, |d, cx| d.set_files(Vec::new(), cx));
         }
         self.load_detail(number, cx);
@@ -501,6 +557,23 @@ impl GitHubView {
             self.list_scroll.scroll_to_item(ix);
         }
         cx.notify();
+    }
+
+    /// Whether the tab is too narrow for the list beside the pull request.
+    fn narrow(&self) -> bool {
+        self.width.is_some_and(|w| w < px(NARROW_WIDTH))
+    }
+
+    /// The button back to the list, when the pull request has the narrow tab to itself.
+    fn back_to_list(&self, cx: &mut Context<Self>) -> Option<Button> {
+        self.narrow().then(|| {
+            Button::new("github-back").small().ghost().icon(IconName::ArrowLeft).label("Pull requests").on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.list_page = true;
+                    cx.notify();
+                }),
+            )
+        })
     }
 
     fn select_step(&mut self, step: isize, cx: &mut Context<Self>) {
@@ -519,6 +592,7 @@ impl GitHubView {
     fn set_filter(&mut self, filter: PrFilter, cx: &mut Context<Self>) {
         if self.filter != filter {
             self.filter = filter;
+            self.list_page = true;
             self.prs.clear();
             self.selected = None;
             self.detail = None;
@@ -657,6 +731,101 @@ impl GitHubView {
             },
             cx,
         );
+    }
+
+    /// Close the pull request (or reopen it). Text in `with_comment` is posted first, as a
+    /// plain comment, and the box emptied.
+    fn set_open(&mut self, open: bool, with_comment: Option<Entity<TextareaState>>, cx: &mut Context<Self>) {
+        let (Some(remote), Some(token), Some(number)) = (self.remote.clone(), self.token(), self.selected) else {
+            return;
+        };
+        let body = with_comment.as_ref().map(|b| b.read(cx).value().to_string()).unwrap_or_default();
+        let commented = !body.trim().is_empty();
+        self.run(
+            if open { "Reopening…" } else { "Closing…" },
+            move || {
+                if commented {
+                    github::comment(&token, &remote, number, &body)?;
+                }
+                github::set_open(&token, &remote, number, open)
+            },
+            move |this, _, cx| {
+                this.say(true, if open { format!("Reopened #{number}.") } else { format!("Closed #{number}.") });
+                if let (true, Some(input)) = (commented, with_comment) {
+                    this.clear_box(input, cx);
+                }
+                // The list keeps it until the next refresh, so the page doesn't jump to another one.
+                if let Some(pr) = this.prs.iter_mut().find(|p| p.number == number) {
+                    pr.state = if open { PrState::Open } else { PrState::Closed };
+                }
+                this.load_detail(number, cx);
+            },
+            cx,
+        );
+    }
+
+    /// Whether the account in use opened this pull request; GitHub doesn't let an author
+    /// approve or request changes on their own.
+    fn is_author(&self, pr: &PullRequest) -> bool {
+        self.account.as_ref().is_some_and(|(login, _)| login.eq_ignore_ascii_case(&pr.author))
+    }
+
+    /// Where the review box sits: under the diff's last line, or under its last file's
+    /// header when that file shows no lines.
+    fn review_anchor(&self, detail: &PrDetail, cx: &App) -> Option<DiffAnnotation> {
+        let diff = self.diff.read(cx);
+        let path = diff.files().last()?.path().clone();
+        let line = github::last_patch_line(&detail.patch)
+            .map(|(old, line)| {
+                let side = if old { DiffSide::Original } else { DiffSide::Modified };
+                DiffLinePosition::new(path.clone(), side, line as usize)
+            })
+            .filter(|at| diff.has_line(at));
+        Some(match line {
+            Some(at) => DiffAnnotation::line("review", at),
+            None => DiffAnnotation::file("review", path),
+        })
+    }
+
+    /// Open `path` in the review modal, with a summary, a file at a time.
+    fn expand_file(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(detail) = &self.detail else { return };
+        let pr = &detail.pr;
+        let body: String = detail.body.chars().take(2_000).collect();
+        cx.emit(GitHubEvent::ExpandFile(ExpandFile {
+            number: pr.number,
+            patch: detail.patch.clone(),
+            path,
+            context: format!("Pull request #{}: {}\n\n{}", pr.number, pr.title, body.trim()),
+        }));
+    }
+
+    /// Scroll the diff to the header of the file `step` files from the one at the top.
+    fn step_file(&mut self, step: isize, cx: &mut Context<Self>) {
+        let count = self.diff.read(cx).files().len();
+        if count == 0 {
+            return;
+        }
+        let to = (self.current_file as isize + step).clamp(0, count as isize - 1) as usize;
+        self.scroll_to_file_ix(to, cx);
+    }
+
+    fn scroll_to_file_ix(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.diff.read(cx).files().get(ix).map(|f| f.path().clone()) else { return };
+        self.current_file = ix;
+        self.file_pinned = true;
+        self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
+        cx.notify();
+    }
+
+    /// Scroll the diff to its end, where the review box is.
+    fn jump_to_review(&mut self, cx: &mut Context<Self>) {
+        self.file_pinned = false;
+        let Some(anchor) = self.detail.as_ref().and_then(|d| self.review_anchor(d, cx)) else { return };
+        self.diff.update(cx, |d, cx| match anchor.position() {
+            Some(at) => d.scroll_to_line(at.clone(), cx),
+            None => d.scroll_to_file(&anchor.path().clone(), cx),
+        });
     }
 
     fn merge(&mut self, cx: &mut Context<Self>) {
@@ -1166,6 +1335,7 @@ impl GitHubView {
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     window.focus(&this.focus, cx);
+                    this.list_page = false;
                     this.select(number, cx)
                 }))
                 .child(
@@ -1236,10 +1406,8 @@ impl GitHubView {
         });
         let empty = self.prs.is_empty();
         v_flex()
-            .w(px(LIST_WIDTH))
-            .flex_none()
+            .map(|el| if self.narrow() { el.flex_1().min_w_0() } else { el.w(px(LIST_WIDTH)).flex_none().border_r_1() })
             .h_full()
-            .border_r_1()
             .border_color(c.border)
             .child(h_flex().m_2().p_0p5().gap_0p5().rounded_lg().bg(c.card).children(segments))
             .child(
@@ -1282,20 +1450,30 @@ impl GitHubView {
 
     fn render_detail(&self, window: &mut Window, c: &Colors, cx: &mut Context<Self>) -> AnyElement {
         let Some(detail) = &self.detail else {
+            let back = self.back_to_list(cx);
             return v_flex()
                 .flex_1()
+                .min_w_0()
                 .h_full()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .text_sm()
-                .text_color(c.muted)
-                .child(if self.detail_loading || self.selected.is_some() {
-                    Spinner::new().color(c.accent).into_any_element()
-                } else {
-                    Icon::new(IconName::GitPullRequestArrow).large().text_color(c.muted.opacity(0.5)).into_any_element()
-                })
-                .when(self.selected.is_none() && !self.prs_loading, |el| el.child("Pick a pull request"))
+                .when_some(back, |el, back| el.child(h_flex().px_3().pt_3().child(back)))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(c.muted)
+                        .child(if self.detail_loading || self.selected.is_some() {
+                            Spinner::new().color(c.accent).into_any_element()
+                        } else {
+                            Icon::new(IconName::GitPullRequestArrow)
+                                .large()
+                                .text_color(c.muted.opacity(0.5))
+                                .into_any_element()
+                        })
+                        .when(self.selected.is_none() && !self.prs_loading, |el| el.child("Pick a pull request")),
+                )
                 .into_any_element();
         };
         let pr = &detail.pr;
@@ -1331,6 +1509,7 @@ impl GitHubView {
         };
         let conversation_count = detail.timeline.len();
         let tabs = h_flex()
+            .flex_wrap()
             .px_5()
             .gap_1()
             .border_b_1()
@@ -1357,6 +1536,33 @@ impl GitHubView {
                 cx,
             ))
             .child(div().flex_1())
+            .when(section == Section::Files, |el| {
+                let mode = self.diff.read(cx).mode();
+                el.child(h_flex().mr_3().p_0p5().gap_0p5().rounded_lg().bg(c.card).children(
+                    [(DiffMode::Unified, "Unified"), (DiffMode::Split, "Split")].map(|(m, label)| {
+                        let on = mode == m;
+                        let state = self.diff.clone();
+                        div()
+                            .id(SharedString::from(format!("github-diff-mode-{label}")))
+                            .test_support()
+                            .px_2p5()
+                            .py_0p5()
+                            .rounded_md()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .map(|el| {
+                                if on {
+                                    el.bg(c.accent.opacity(0.18)).text_color(c.fg).shadow_sm()
+                                } else {
+                                    el.text_color(c.muted).hover(|el| el.text_color(c.fg))
+                                }
+                            })
+                            .child(label)
+                            .on_click(move |_, _, cx| state.update(cx, |d, cx| d.set_mode(m, cx)))
+                    }),
+                ))
+            })
             .child(
                 h_flex()
                     .gap_1()
@@ -1367,11 +1573,13 @@ impl GitHubView {
             );
 
         let url = pr.url.clone();
+        let back = self.back_to_list(cx);
         let header = v_flex()
             .px_5()
             .pt_4()
             .pb_3()
             .gap_2()
+            .when_some(back, |el, back| el.child(h_flex().ml(px(-10.)).child(back)))
             .child(
                 h_flex()
                     .gap_3()
@@ -1445,7 +1653,7 @@ impl GitHubView {
 
         let body = match self.section {
             Section::Conversation => self.render_conversation(detail, c, cx).into_any_element(),
-            Section::Files => self.render_files(detail, window, c, cx).into_any_element(),
+            Section::Files => self.render_files(detail, window, c, cx),
             Section::Commits => self.render_commits(detail, c).into_any_element(),
         };
         v_flex()
@@ -1529,15 +1737,44 @@ impl GitHubView {
                             .child(self.avatar(self.account.as_ref().map(|(l, _)| l.as_str()).unwrap_or(""), 32., c))
                             .child(
                                 v_flex().flex_1().gap_2().child(Textarea::new(&self.comment_box)).child(
-                                    h_flex().justify_end().child(
-                                        Button::new("github-comment")
-                                            .small()
-                                            .primary()
-                                            .icon(IconName::MessageSquare)
-                                            .label("Comment")
-                                            .disabled(self.busy.is_some())
-                                            .on_click(cx.listener(|this, _, _, cx| this.send_comment(cx))),
-                                    ),
+                                    h_flex()
+                                        .gap_2()
+                                        .justify_end()
+                                        .child(
+                                            Button::new("github-conversation-close")
+                                                .small()
+                                                .outline()
+                                                .map(|b| {
+                                                    let has_text = !self.comment_box.read(cx).value().trim().is_empty();
+                                                    if open {
+                                                        b.icon(IconName::GitPullRequestClosed).label(if has_text {
+                                                            "Close with comment"
+                                                        } else {
+                                                            "Close pull request"
+                                                        })
+                                                    } else {
+                                                        b.icon(IconName::GitPullRequest).label(if has_text {
+                                                            "Reopen with comment"
+                                                        } else {
+                                                            "Reopen pull request"
+                                                        })
+                                                    }
+                                                })
+                                                .disabled(self.busy.is_some())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    let input = this.comment_box.clone();
+                                                    this.set_open(!open, Some(input), cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("github-comment")
+                                                .small()
+                                                .primary()
+                                                .icon(IconName::MessageSquare)
+                                                .label("Comment")
+                                                .disabled(self.busy.is_some())
+                                                .on_click(cx.listener(|this, _, _, cx| this.send_comment(cx))),
+                                        ),
                                 ),
                             ),
                     )
@@ -1750,13 +1987,7 @@ impl GitHubView {
             )
     }
 
-    fn render_files(
-        &self,
-        detail: &PrDetail,
-        window: &mut Window,
-        c: &Colors,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_files(&self, detail: &PrDetail, window: &mut Window, c: &Colors, cx: &mut Context<Self>) -> AnyElement {
         let _ = window;
         let this = cx.entity().downgrade();
         // Line comments in threads, under the line they're on (outdated ones under the file).
@@ -1771,6 +2002,8 @@ impl GitHubView {
             Thread(Vec<LineComment>),
             Draft(usize, DraftComment),
             Compose(Entity<TextareaState>, bool),
+            /// The review box, at the end of the diff.
+            Review,
         }
         let mut notes: Vec<(DiffAnnotation, Note)> = Vec::new();
         for (root, thread) in threads {
@@ -1797,16 +2030,156 @@ impl GitHubView {
                 Note::Compose(compose.input.clone(), compose.reply_to.is_some()),
             ));
         }
+        let open = matches!(detail.pr.state, PrState::Open | PrState::Draft);
+        // Last, so it comes after any comment on the same line.
+        let review_anchor = if open { self.review_anchor(detail, cx) } else { None };
+        if let Some(anchor) = review_anchor.clone() {
+            notes.push((anchor, Note::Review));
+        }
         let annotations: Vec<DiffAnnotation> = notes.iter().map(|(a, _)| a.clone()).collect();
         let avatars = self.avatars.clone();
         let palette = c.palette;
         let notes = std::rc::Rc::new(notes);
-        let mode = self.diff.read(cx).mode();
-        let diff_state = self.diff.clone();
         let busy = self.busy.is_some();
+        let review_card = {
+            let this = this.clone();
+            let input = self.review_box.clone();
+            let pending = self.drafts.len();
+            let author = self.is_author(&detail.pr);
+            move |cx: &mut App| -> AnyElement {
+                let c = GitHubView::colors(cx);
+                let has_text = !input.read(cx).value().trim().is_empty();
+                let (t1, t2, t3, t4) = (this.clone(), this.clone(), this.clone(), this.clone());
+                let own = "You opened this pull request, and GitHub doesn't let an author review their own.";
+                v_flex()
+                    .mx_3()
+                    .mt_2()
+                    // Room for the file navigation floating over the bottom of the diff.
+                    .mb(px(56.))
+                    .p_3()
+                    .gap_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(c.accent.opacity(0.4))
+                    .bg(c.card)
+                    .font_family(cx.theme().font_family.clone())
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(Icon::new(IconName::Eye).small().text_color(c.accent))
+                            .child("Finish your review")
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(if pending > 0 { c.yellow } else { c.muted })
+                                    .child(match pending {
+                                        0 => "Hover a line and press + to comment on it; select lines for a range."
+                                            .to_string(),
+                                        1 => "1 line comment will go with the review.".to_string(),
+                                        n => format!("{n} line comments will go with the review."),
+                                    }),
+                            ),
+                    )
+                    .child(Textarea::new(&input))
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Button::new("github-close")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::GitPullRequestClosed)
+                                    .label(if has_text { "Close with comment" } else { "Close pull request" })
+                                    .disabled(busy)
+                                    .on_click({
+                                        let input = input.clone();
+                                        move |_, _, cx| {
+                                            let input = input.clone();
+                                            let _ = t1.update(cx, |v, cx| v.set_open(false, Some(input), cx));
+                                        }
+                                    }),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("github-review-comment")
+                                    .small()
+                                    .outline()
+                                    .icon(IconName::MessageSquare)
+                                    .label("Comment")
+                                    .disabled(busy)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = t2.update(cx, |v, cx| v.send_review(ReviewEvent::Comment, cx));
+                                    }),
+                            )
+                            .child(
+                                Button::new("github-request-changes")
+                                    .small()
+                                    .outline()
+                                    .icon(IconName::FileDiff)
+                                    .label("Request changes")
+                                    .disabled(busy || author)
+                                    .when(author, |b| b.tooltip(own))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = t3.update(cx, |v, cx| v.send_review(ReviewEvent::RequestChanges, cx));
+                                    }),
+                            )
+                            .child(
+                                Button::new("github-approve")
+                                    .small()
+                                    .success()
+                                    .icon(IconName::Check)
+                                    .label("Approve")
+                                    .disabled(busy || author)
+                                    .when(author, |b| b.tooltip(own))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = t4.update(cx, |v, cx| v.send_review(ReviewEvent::Approve, cx));
+                                    }),
+                            ),
+                    )
+                    .into_any_element()
+            }
+        };
+        let review_card = Rc::new(review_card);
+        let card_for_diff = review_card.clone();
 
+        let paths: Vec<SharedString> = self.diff.read(cx).files().iter().map(|f| f.path().clone()).collect();
+        let file_count = paths.len();
+        let headers = self.headers_seen.clone();
+        let expand = this.clone();
         let diff = Diff::new(&self.diff)
             .syntax_highlight(true)
+            .render_header_suffix(move |file, _, _| {
+                let (this, path) = (expand.clone(), file.path().to_string());
+                Button::new("github-expand-file")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Maximize2)
+                    .tooltip("Open with its summary")
+                    .on_click(move |_, _, cx| {
+                        let path = path.clone();
+                        let _ = this.update(cx, |v, cx| v.expand_file(path, cx));
+                    })
+            })
+            // An empty marker in each header says where it was painted.
+            .render_header_prefix(move |file, _, _| {
+                let (headers, ix) = (headers.clone(), paths.iter().position(|p| p == file.path()));
+                canvas(
+                    move |bounds, _, _| {
+                        if let Some(ix) = ix {
+                            headers.borrow_mut().push((ix, bounds.top()));
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_0()
+            })
             .annotations(annotations)
             .on_add_annotation({
                 let this = this.clone();
@@ -1819,6 +2192,9 @@ impl GitHubView {
                 let Some((_, note)) = notes.iter().find(|(a, _)| a.id() == annotation.id()) else {
                     return div().into_any_element();
                 };
+                if let Note::Review = note {
+                    return card_for_diff(cx);
+                }
                 let avatar = |login: &str| match avatars.get(login) {
                     Some(image) => img(image.clone()).size(px(20.)).rounded_full().flex_none().into_any_element(),
                     None => {
@@ -1995,77 +2371,229 @@ impl GitHubView {
                             )
                             .into_any_element()
                     }
+                    Note::Review => div().into_any_element(),
                 }
             });
 
-        let pending = self.drafts.len();
-        let open = matches!(detail.pr.state, PrState::Open | PrState::Draft);
-        let review_bar = open.then(|| {
-            v_flex()
-                .flex_none()
-                .gap_2()
-                .px_4()
-                .py_3()
-                .border_b_1()
-                .border_color(c.border)
-                .bg(c.card.opacity(0.6))
-                .child(Textarea::new(&self.review_box))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().text_xs().text_color(if pending > 0 { c.yellow } else { c.muted }).child(
-                            match pending {
-                                0 => "Hover a line and press + to comment on it; select lines for a range.".to_string(),
-                                1 => "1 line comment will go with the review.".to_string(),
-                                n => format!("{n} line comments will go with the review."),
-                            },
-                        ))
-                        .child(div().flex_1())
-                        .children([DiffMode::Unified, DiffMode::Split].map(|m| {
-                            let state = diff_state.clone();
-                            Button::new(SharedString::from(format!("github-diff-mode-{m:?}")))
-                                .xsmall()
-                                .ghost()
-                                .map(|b| if mode == m { b.outline() } else { b })
-                                .label(if m == DiffMode::Split { "Split" } else { "Unified" })
-                                .on_click(move |_, _, cx| state.update(cx, |d, cx| d.set_mode(m, cx)))
-                        }))
-                        .child(
-                            Button::new("github-review-comment")
-                                .small()
-                                .outline()
-                                .icon(IconName::MessageSquare)
-                                .label("Comment")
-                                .disabled(busy)
-                                .on_click(cx.listener(|this, _, _, cx| this.send_review(ReviewEvent::Comment, cx))),
-                        )
-                        .child(
-                            Button::new("github-request-changes")
-                                .small()
-                                .outline()
-                                .icon(IconName::FileDiff)
-                                .label("Request changes")
-                                .disabled(busy)
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.send_review(ReviewEvent::RequestChanges, cx)),
-                                ),
-                        )
-                        .child(
-                            Button::new("github-approve")
-                                .small()
-                                .success()
-                                .icon(IconName::Check)
-                                .label("Approve")
-                                .disabled(busy)
-                                .on_click(cx.listener(|this, _, _, cx| this.send_review(ReviewEvent::Approve, cx))),
-                        ),
-                )
+        // Each frame: the first canvas notes the diff's frame and forgets the headers, each
+        // header painted notes where, and the last canvas works out which file is at the top.
+        let (headers, frame_bounds) = (self.headers_seen.clone(), self.diff_bounds.clone());
+        let before = canvas(
+            move |bounds, _, _| {
+                frame_bounds.set(bounds);
+                headers.borrow_mut().clear();
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+        let (headers, frame_bounds, view) = (self.headers_seen.clone(), self.diff_bounds.clone(), cx.entity());
+        let (was_current, was_sticky, pinned) = (self.current_file, self.sticky_file, self.file_pinned);
+        let unpin = cx.entity();
+        let input_bounds = self.diff_bounds.clone();
+        let after = canvas(
+            move |_, _, cx| {
+                let frame = frame_bounds.get();
+                let seen = headers.borrow();
+                // A header within a header's height of the top is the file at the top; else the
+                // file the top is inside: the one before the first header in view, or, with no
+                // header in view, the same one as before.
+                let at_top = seen
+                    .iter()
+                    .filter(|(_, at)| *at >= frame.top() - px(2.) && *at <= frame.top() + px(36.))
+                    .map(|(ix, _)| *ix)
+                    .max();
+                let inside = seen
+                    .iter()
+                    .filter(|(_, at)| *at < frame.top() - px(2.))
+                    .map(|(ix, _)| *ix)
+                    .max()
+                    .or_else(|| seen.iter().map(|(ix, _)| *ix).min().map(|ix| ix.saturating_sub(1)))
+                    .or(was_sticky)
+                    .unwrap_or(was_current);
+                let sticky = if at_top.is_some() { None } else { Some(inside) };
+                let current = if pinned { was_current } else { at_top.unwrap_or(inside) };
+                if current != was_current || sticky != was_sticky {
+                    cx.defer(move |cx| {
+                        view.update(cx, |v, cx| {
+                            v.current_file = current;
+                            v.sticky_file = sticky;
+                            cx.notify();
+                        })
+                    });
+                }
+            },
+            // Scrolling or clicking in the diff ends a pick by Previous/Next file.
+            move |_, _, window, _| {
+                if !pinned {
+                    return;
+                }
+                let (wheel, press) = (unpin.clone(), unpin.clone());
+                let (b1, b2) = (input_bounds.clone(), input_bounds.clone());
+                window.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Capture && b1.get().contains(&event.position) {
+                        wheel.update(cx, |v, cx| {
+                            v.file_pinned = false;
+                            cx.notify();
+                        });
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Capture && b2.get().contains(&event.position) {
+                        press.update(cx, |v, cx| {
+                            v.file_pinned = false;
+                            cx.notify();
+                        });
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full();
+        let sticky = self.sticky_file.and_then(|ix| {
+            let file = self.diff.read(cx).files().get(ix)?;
+            let path = file.path().clone();
+            let name: SharedString = match (file.original_path(), file.modified_path()) {
+                (Some(old), Some(new)) if old != new => format!("{old} → {new}").into(),
+                _ => path.clone(),
+            };
+            let status = match file.status() {
+                DiffFileStatus::Added => Some("Added file"),
+                DiffFileStatus::Deleted => Some("Deleted file"),
+                DiffFileStatus::Renamed => Some("Renamed file"),
+                DiffFileStatus::Copied => Some("Copied file"),
+                _ => None,
+            };
+            let (adds, dels) = (file.additions(), file.deletions());
+            let (collapse_path, header_path, expand_path) = (path.clone(), path.clone(), path);
+            Some(
+                h_flex()
+                    .id("github-sticky-file")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .pl_1()
+                    .pr_3()
+                    .py_1()
+                    .gap_1()
+                    .bg(c.bg)
+                    .border_b_1()
+                    .border_color(c.border)
+                    .shadow_sm()
+                    .text_sm()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let path = header_path.clone();
+                        this.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
+                    }))
+                    .child(
+                        Button::new("github-sticky-collapse")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::ChevronDown)
+                            .tooltip("Collapse this file")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                let path = collapse_path.clone();
+                                this.diff.update(cx, |d, cx| {
+                                    d.set_file_collapsed(&path, true, cx);
+                                    d.scroll_to_file(&path, cx);
+                                });
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(name),
+                    )
+                    .child(div().text_xs().text_color(c.muted).child(format!("+{adds} −{dels}")))
+                    .children(status.map(|s| div().text_xs().text_color(c.muted).child(s)))
+                    .child(
+                        Button::new("github-sticky-expand")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Maximize2)
+                            .tooltip("Open with its summary")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.expand_file(expand_path.to_string(), cx);
+                            })),
+                    ),
+            )
         });
-        v_flex().size_full().children(review_bar).child(if detail.patch.trim().is_empty() {
-            div().p_5().text_sm().text_color(c.muted).child("No changes to show.").into_any_element()
-        } else {
-            div().flex_1().min_h_0().child(diff).into_any_element()
-        })
+        let current = self.current_file.min(file_count.saturating_sub(1));
+        let nav_button = |id: &'static str, icon: IconName, tip: &'static str, disabled: bool| {
+            Button::new(id).ghost().small().icon(icon).tooltip(tip).rounded(cx.theme().radius_full()).disabled(disabled)
+        };
+        let nav = (file_count > 0).then(|| {
+            div().absolute().left_0().right_0().bottom_4().flex().justify_center().child(
+                h_flex()
+                    .gap_0p5()
+                    .p_1()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(c.border)
+                    .bg(c.bg)
+                    .shadow_md()
+                    .child(
+                        nav_button("github-files-top", IconName::ArrowUpToLine, "Back to the top", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.scroll_to_file_ix(0, cx))),
+                    )
+                    .child(
+                        nav_button("github-files-previous", IconName::ChevronUp, "Previous file", current == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_file(-1, cx))),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .text_xs()
+                            .text_color(c.muted)
+                            .child(format!("File {} of {file_count}", current + 1)),
+                    )
+                    .child(
+                        nav_button("github-files-next", IconName::ChevronDown, "Next file", current + 1 >= file_count)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_file(1, cx))),
+                    )
+                    .child(
+                        nav_button(
+                            "github-files-bottom",
+                            IconName::ArrowDownToLine,
+                            if open { "Down to the review" } else { "Down to the bottom" },
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.jump_to_review(cx))),
+                    ),
+            )
+        });
+        if detail.patch.trim().is_empty() {
+            return v_flex()
+                .size_full()
+                .child(div().p_5().text_sm().text_color(c.muted).child("No changes to show."))
+                .when(open, |el| el.child(review_card(cx)))
+                .into_any_element();
+        }
+        div()
+            .relative()
+            .size_full()
+            // Keys that scroll the diff end a pick by Previous/Next file too.
+            .capture_key_down(cx.listener(|this, _, _, cx| {
+                if this.file_pinned {
+                    this.file_pinned = false;
+                    cx.notify();
+                }
+            }))
+            .child(before)
+            .child(div().size_full().child(diff))
+            .child(after)
+            .children(sticky)
+            .children(nav)
+            .into_any_element()
     }
 
     fn render_commits(&self, detail: &PrDetail, c: &Colors) -> impl IntoElement {
@@ -2168,19 +2696,38 @@ impl Render for GitHubView {
             Phase::Ready => v_flex()
                 .size_full()
                 .child(self.render_header(&c, cx))
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .items_start()
-                        .child(self.render_list(&c, cx))
-                        .child(self.render_detail(window, &c, cx)),
-                )
+                .child(h_flex().flex_1().min_h_0().items_start().map(|el| {
+                    if !self.narrow() {
+                        el.child(self.render_list(&c, cx)).child(self.render_detail(window, &c, cx))
+                    } else if self.list_page || self.selected.is_none() {
+                        el.child(self.render_list(&c, cx))
+                    } else {
+                        el.child(self.render_detail(window, &c, cx))
+                    }
+                }))
                 .into_any_element(),
         };
+        let this = cx.entity();
+        let width = self.width;
+        let measure = canvas(
+            move |bounds, _, cx| {
+                if width != Some(bounds.size.width) {
+                    cx.defer(move |cx| {
+                        this.update(cx, |v, cx| {
+                            v.width = Some(bounds.size.width);
+                            cx.notify();
+                        })
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
         div()
             .id("github")
             .key_context(CONTEXT)
+            .relative()
             .track_focus(&self.focus)
             .size_full()
             .rounded_t(px(crate::panes::CONTENT_RADIUS))
@@ -2189,6 +2736,20 @@ impl Render for GitHubView {
             .text_color(c.fg)
             .on_action(cx.listener(|this, _: &NextPullRequest, _, cx| this.select_step(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousPullRequest, _, cx| this.select_step(-1, cx)))
+            .on_action(cx.listener(|this, _: &OpenPullRequest, _, cx| {
+                if this.selected.is_some() {
+                    this.list_page = false;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &BackToList, _, cx| {
+                if this.narrow() {
+                    this.list_page = true;
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ShowConversation, _, cx| {
                 this.section = Section::Conversation;
                 cx.notify();
@@ -2208,6 +2769,7 @@ impl Render for GitHubView {
             ))
             .on_action(cx.listener(|this, _: &Pull, _, cx| this.pull(cx)))
             .child(body)
+            .child(measure)
     }
 }
 
