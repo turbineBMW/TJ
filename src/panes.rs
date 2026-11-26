@@ -1,9 +1,9 @@
-//! A project's main area, laid out like Vmux: panes split right or down, each with its own
-//! tabs. A tab is the project's agent, a terminal, the review of the project's changes, or its
-//! GitHub page.
-//! There is one agent tab per project: picking a thread in the sidebar changes what it shows,
-//! and leaves every other tab where it is. Closing a pane's last tab folds its split back up.
-//! Shortcuts match Vmux's.
+//! A project's main area, laid out like Vmux: tabs along the top bar, each with its own panes
+//! split right or down. A pane shows the project's agent, a terminal, the review of the
+//! project's changes, or its GitHub page, and a tab takes its title from its focused pane.
+//! There is one agent per project, shown in one pane: picking a thread in the sidebar changes
+//! what it shows, and leaves every other pane where it is. Splitting a pane stays in its tab;
+//! closing a tab's last pane closes the tab. Shortcuts match Vmux's.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -17,7 +17,7 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use crate::agent_slot::AgentSlot;
 use crate::changes::ReviewView;
 use crate::github_view::GitHubView;
-use crate::store::{PaneLayout, SplitDirection, TabState};
+use crate::store::{AreaLayout, SplitDirection, SplitLayout, TabState};
 use crate::terminal::{TerminalExited, TerminalView};
 use crate::thread::{Status, ThreadView};
 
@@ -61,9 +61,9 @@ gpui_kit::actions!(
     ]
 );
 
-/// What a tab shows.
+/// What a pane shows.
 #[derive(Clone)]
-pub enum Tab {
+pub enum View {
     /// The project's agent: whichever thread is picked, with its status column.
     Agent(Entity<AgentSlot>),
     Terminal(Entity<TerminalView>),
@@ -71,31 +71,31 @@ pub enum Tab {
     GitHub(Entity<GitHubView>),
 }
 
-impl Tab {
+impl View {
     fn entity_id(&self) -> EntityId {
         match self {
-            Tab::Agent(agent) => agent.entity_id(),
-            Tab::Terminal(term) => term.entity_id(),
-            Tab::Review(review) => review.entity_id(),
-            Tab::GitHub(github) => github.entity_id(),
+            View::Agent(agent) => agent.entity_id(),
+            View::Terminal(term) => term.entity_id(),
+            View::Review(review) => review.entity_id(),
+            View::GitHub(github) => github.entity_id(),
         }
     }
 
     fn state(&self, project_dir: &std::path::Path, cx: &App) -> TabState {
         match self {
-            Tab::Agent(_) => TabState::Agent,
-            Tab::Terminal(term) => {
+            View::Agent(_) => TabState::Agent,
+            View::Terminal(term) => {
                 TabState::Terminal { cwd: term.read(cx).cwd().unwrap_or_else(|| project_dir.to_path_buf()) }
             }
-            Tab::Review(_) => TabState::Review,
-            Tab::GitHub(_) => TabState::GitHub,
+            View::Review(_) => TabState::Review,
+            View::GitHub(_) => TabState::GitHub,
         }
     }
 
-    /// The thread the agent tab shows.
+    /// The thread the agent shows.
     fn thread_id(&self, cx: &App) -> Option<String> {
         match self {
-            Tab::Agent(agent) => agent.read(cx).thread_id().map(str::to_owned),
+            View::Agent(agent) => agent.read(cx).thread_id().map(str::to_owned),
             _ => None,
         }
     }
@@ -103,32 +103,7 @@ impl Tab {
 
 struct Pane {
     id: usize,
-    tabs: Vec<Tab>,
-    active: usize,
-    /// Tabs in the order they were last shown, most recent last; closing a tab goes back to
-    /// the one used before it.
-    recent: Vec<EntityId>,
-}
-
-impl Pane {
-    fn new(id: usize, tabs: Vec<Tab>, active: usize) -> Self {
-        let mut pane = Self { id, tabs, active, recent: Vec::new() };
-        pane.touch();
-        pane
-    }
-
-    /// Record the visible tab as the most recently used.
-    fn touch(&mut self) {
-        if let Some(id) = self.tabs.get(self.active).map(Tab::entity_id) {
-            self.recent.retain(|r| *r != id);
-            self.recent.push(id);
-        }
-    }
-
-    fn set_active(&mut self, ix: usize) {
-        self.active = ix.min(self.tabs.len().saturating_sub(1));
-        self.touch();
-    }
+    view: View,
 }
 
 enum Node {
@@ -136,7 +111,7 @@ enum Node {
     Split { direction: SplitDirection, ratio: f32, first: Box<Node>, second: Box<Node> },
 }
 
-/// A pane's place in the area, as fractions of its width and height.
+/// A pane's place in the tab, as fractions of its width and height.
 #[derive(Clone, Copy, Debug)]
 struct Rect {
     x: f32,
@@ -163,13 +138,21 @@ impl Node {
         }
     }
 
-    fn pane_mut(&mut self, id: usize) -> Option<&mut Pane> {
+    /// The first pane whose view matches.
+    fn find(&self, matches: &dyn Fn(&View) -> bool) -> Option<&Pane> {
         match self {
-            Node::Pane(pane) => (pane.id == id).then_some(pane),
-            Node::Split { first, second, .. } => match first.pane_mut(id) {
-                Some(pane) => Some(pane),
-                None => second.pane_mut(id),
-            },
+            Node::Pane(pane) => matches(&pane.view).then_some(pane),
+            Node::Split { first, second, .. } => first.find(matches).or_else(|| second.find(matches)),
+        }
+    }
+
+    fn views(&self, out: &mut Vec<View>) {
+        match self {
+            Node::Pane(pane) => out.push(pane.view.clone()),
+            Node::Split { first, second, .. } => {
+                first.views(out);
+                second.views(out);
+            }
         }
     }
 
@@ -270,13 +253,10 @@ impl Node {
         }
     }
 
-    fn snapshot(&self, project_dir: &std::path::Path, cx: &App) -> PaneLayout {
+    fn snapshot(&self, project_dir: &std::path::Path, cx: &App) -> SplitLayout {
         match self {
-            Node::Pane(pane) => PaneLayout::Pane {
-                tabs: pane.tabs.iter().map(|t| t.state(project_dir, cx)).collect(),
-                active: pane.active,
-            },
-            Node::Split { direction, ratio, first, second } => PaneLayout::Split {
+            Node::Pane(pane) => SplitLayout::Pane { view: pane.view.state(project_dir, cx) },
+            Node::Split { direction, ratio, first, second } => SplitLayout::Split {
                 direction: *direction,
                 ratio: *ratio,
                 first: Box::new(first.snapshot(project_dir, cx)),
@@ -286,35 +266,74 @@ impl Node {
     }
 }
 
+/// A tab in the top bar: its own panes, one of them focused, which names the tab.
+struct Tab {
+    id: usize,
+    root: Node,
+    focused: usize,
+}
+
+impl Tab {
+    fn new(id: usize, root: Node) -> Self {
+        let mut ids = Vec::new();
+        root.pane_ids(&mut ids);
+        Self { id, focused: ids.first().copied().unwrap_or(0), root }
+    }
+
+    fn pane_ids(&self) -> Vec<usize> {
+        let mut ids = Vec::new();
+        self.root.pane_ids(&mut ids);
+        ids
+    }
+
+    /// What the focused pane shows.
+    fn view(&self) -> Option<&View> {
+        self.root.pane(self.focused).map(|p| &p.view)
+    }
+}
+
+/// Which of the project's one-of-a-kind views a restored layout has placed already.
+#[derive(Default)]
+struct Placed {
+    agent: bool,
+    review: bool,
+    github: bool,
+}
+
 /// Something the workspace acts on.
 pub enum PaneEvent {
-    /// Panes or tabs opened, closed or moved; worth saving.
+    /// Tabs or panes opened, closed or moved; worth saving.
     LayoutChanged,
-    /// The agent tab got focus, showing this thread; the header follows it.
+    /// The agent got focus, showing this thread; the header follows it.
     ThreadFocused(String),
-    /// The last review tab closed.
+    /// The review closed.
     ReviewClosed,
 }
 
 impl EventEmitter<PaneEvent> for Panes {}
 
-/// What a new area starts with. The thread is shown in the agent tab; with no saved layout,
-/// that tab (and a terminal, if asked for) is all there is.
+/// What a new area starts with. The thread is shown in the agent's tab; with no saved layout,
+/// that tab (and a terminal tab, if asked for) is all there is.
 pub struct Start {
     pub thread: Option<(String, Entity<ThreadView>)>,
     pub terminal: bool,
 }
 
 pub struct Panes {
-    root: Option<Node>,
-    focused: usize,
-    next_pane: usize,
+    tabs: Vec<Tab>,
+    /// The tab on show.
+    active: usize,
+    /// Tab ids in the order they were last shown, most recent last; closing a tab goes back
+    /// to the one used before it.
+    recent: Vec<usize>,
+    /// Ids for tabs and panes alike.
+    next_id: usize,
     project_dir: PathBuf,
-    /// The project's agent, shown in its one agent tab.
+    /// The project's agent, shown in its one pane.
     agent: Entity<AgentSlot>,
-    /// The project's review, shared by any review tab.
+    /// The project's review, shown in at most one pane.
     review: Entity<ReviewView>,
-    /// The project's GitHub page, shared by any GitHub tab.
+    /// The project's GitHub page, shown in at most one pane.
     github: Entity<GitHubView>,
     /// The shell to run; the user's login shell when `None` (tests use `/bin/sh`).
     shell: Option<Shell>,
@@ -327,12 +346,12 @@ pub struct Panes {
 
 impl Panes {
     /// Restore `layout`, or start with `start` when there's nothing to restore. A layout from
-    /// before there was one agent tab may have several conversation tabs: the first becomes the
-    /// agent tab and the rest are dropped.
+    /// before there was one agent may show several conversations: the first becomes the agent
+    /// and the rest are dropped.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_dir: PathBuf,
-        layout: Option<&PaneLayout>,
+        layout: Option<&AreaLayout>,
         agent: Entity<AgentSlot>,
         review: Entity<ReviewView>,
         github: Entity<GitHubView>,
@@ -342,9 +361,10 @@ impl Panes {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self {
-            root: None,
-            focused: 0,
-            next_pane: 0,
+            tabs: Vec::new(),
+            active: 0,
+            recent: Vec::new(),
+            next_id: 0,
             project_dir,
             agent: agent.clone(),
             review,
@@ -361,53 +381,57 @@ impl Panes {
         if let Some((id, view)) = start.thread {
             agent.update(cx, |a, cx| a.set_thread(&id, view, cx));
         }
-        let mut agent_placed = false;
-        this.root = layout.and_then(|layout| this.restore(layout, &mut agent_placed, window, cx));
-        if this.root.is_none() {
-            let mut tabs: Vec<Tab> = has_thread.then(|| Tab::Agent(agent)).into_iter().collect();
-            if start.terminal || tabs.is_empty() {
-                tabs.extend(this.spawn(None, window, cx).map(Tab::Terminal));
+        if let Some(layout) = layout {
+            let mut placed = Placed::default();
+            for tab in &layout.tabs {
+                if let Some(root) = this.restore(tab, &mut placed, window, cx) {
+                    let id = this.next_id();
+                    this.tabs.push(Tab::new(id, root));
+                }
             }
-            if !tabs.is_empty() {
-                let id = this.next_id();
-                this.root = Some(Node::Pane(Pane::new(id, tabs, 0)));
-            }
+            this.active = layout.active.min(this.tabs.len().saturating_sub(1));
         }
-        this.focused = this.pane_ids().first().copied().unwrap_or(0);
+        if this.tabs.is_empty() {
+            let mut views: Vec<View> = has_thread.then(|| View::Agent(agent)).into_iter().collect();
+            if start.terminal || views.is_empty() {
+                views.extend(this.spawn(None, window, cx).map(View::Terminal));
+            }
+            for view in views {
+                let root = this.leaf(view);
+                let id = this.next_id();
+                this.tabs.push(Tab::new(id, root));
+            }
+            this.active = 0;
+        }
+        this.touch();
         this
     }
 
     fn restore(
         &mut self,
-        layout: &PaneLayout,
-        agent_placed: &mut bool,
+        layout: &SplitLayout,
+        placed: &mut Placed,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Node> {
         match layout {
-            PaneLayout::Pane { tabs, active } => {
-                let id = self.next_id();
-                let tabs: Vec<Tab> = tabs
-                    .iter()
-                    .filter_map(|tab| match tab {
-                        TabState::Agent | TabState::Thread { .. } => {
-                            (!std::mem::replace(agent_placed, true)).then(|| Tab::Agent(self.agent.clone()))
-                        }
-                        // A directory that no longer exists falls back to the project folder.
-                        TabState::Terminal { cwd } => {
-                            self.spawn(Some(cwd.clone()).filter(|d| d.is_dir()), window, cx).map(Tab::Terminal)
-                        }
-                        TabState::Review => Some(Tab::Review(self.review.clone())),
-                        TabState::GitHub => Some(Tab::GitHub(self.github.clone())),
-                    })
-                    .collect();
-                (!tabs.is_empty()).then(|| {
-                    let active = (*active).min(tabs.len() - 1);
-                    Node::Pane(Pane::new(id, tabs, active))
-                })
+            SplitLayout::Pane { view } => {
+                let once = |seen: &mut bool| !std::mem::replace(seen, true);
+                let view = match view {
+                    TabState::Agent | TabState::Thread { .. } => {
+                        once(&mut placed.agent).then(|| View::Agent(self.agent.clone()))
+                    }
+                    // A directory that no longer exists falls back to the project folder.
+                    TabState::Terminal { cwd } => {
+                        self.spawn(Some(cwd.clone()).filter(|d| d.is_dir()), window, cx).map(View::Terminal)
+                    }
+                    TabState::Review => once(&mut placed.review).then(|| View::Review(self.review.clone())),
+                    TabState::GitHub => once(&mut placed.github).then(|| View::GitHub(self.github.clone())),
+                }?;
+                Some(self.leaf(view))
             }
-            PaneLayout::Split { direction, ratio, first, second } => {
-                match (self.restore(first, agent_placed, window, cx), self.restore(second, agent_placed, window, cx)) {
+            SplitLayout::Split { direction, ratio, first, second } => {
+                match (self.restore(first, placed, window, cx), self.restore(second, placed, window, cx)) {
                     (Some(first), Some(second)) => Some(Node::Split {
                         direction: *direction,
                         ratio: ratio.clamp(MIN_RATIO, 1.0 - MIN_RATIO),
@@ -422,8 +446,13 @@ impl Panes {
     }
 
     fn next_id(&mut self) -> usize {
-        self.next_pane += 1;
-        self.next_pane
+        self.next_id += 1;
+        self.next_id
+    }
+
+    /// A new pane showing `view`.
+    fn leaf(&mut self, view: View) -> Node {
+        Node::Pane(Pane { id: self.next_id(), view })
     }
 
     fn spawn(
@@ -453,23 +482,23 @@ impl Panes {
         }
     }
 
-    pub fn pane_ids(&self) -> Vec<usize> {
-        let mut ids = Vec::new();
-        if let Some(root) = &self.root {
-            root.pane_ids(&mut ids);
+    /// Record the tab on show as the most recently used.
+    fn touch(&mut self) {
+        if let Some(id) = self.tabs.get(self.active).map(|t| t.id) {
+            self.recent.retain(|r| *r != id);
+            self.recent.push(id);
         }
-        ids
     }
 
-    fn active_tab(&self) -> Option<&Tab> {
-        let pane = self.root.as_ref()?.pane(self.focused)?;
-        pane.tabs.get(pane.active)
+    /// What the focused pane of the tab on show shows.
+    fn active_view(&self) -> Option<&View> {
+        self.tabs.get(self.active)?.view()
     }
 
-    /// The focused pane's terminal, if its visible tab is one.
+    /// The focused pane's terminal, if it shows one.
     pub fn active_terminal(&self) -> Option<Entity<TerminalView>> {
-        match self.active_tab()? {
-            Tab::Terminal(term) => Some(term.clone()),
+        match self.active_view()? {
+            View::Terminal(term) => Some(term.clone()),
             _ => None,
         }
     }
@@ -477,56 +506,54 @@ impl Panes {
     /// A terminal to type into: the focused one, else the first open one.
     pub fn any_terminal(&self) -> Option<Entity<TerminalView>> {
         self.active_terminal().or_else(|| {
-            let root = self.root.as_ref()?;
-            self.pane_ids().into_iter().find_map(|id| {
-                root.pane(id)?.tabs.iter().find_map(|t| match t {
-                    Tab::Terminal(term) => Some(term.clone()),
-                    _ => None,
-                })
+            self.tabs.iter().find_map(|tab| match &tab.root.find(&|v| matches!(v, View::Terminal(_)))?.view {
+                View::Terminal(term) => Some(term.clone()),
+                _ => None,
             })
         })
     }
 
-    pub fn snapshot(&self, cx: &App) -> Option<PaneLayout> {
-        self.root.as_ref().map(|root| root.snapshot(&self.project_dir, cx))
+    pub fn snapshot(&self, cx: &App) -> Option<AreaLayout> {
+        (!self.tabs.is_empty()).then(|| AreaLayout {
+            tabs: self.tabs.iter().map(|t| t.root.snapshot(&self.project_dir, cx)).collect(),
+            active: self.active,
+        })
     }
 
-    /// Where a tab is: (pane id, index).
-    fn find(&self, matches: impl Fn(&Tab) -> bool) -> Option<(usize, usize)> {
-        let root = self.root.as_ref()?;
-        self.pane_ids().into_iter().find_map(|id| root.pane(id)?.tabs.iter().position(&matches).map(|ix| (id, ix)))
+    /// Where a view is: (tab index, pane id).
+    fn find(&self, matches: impl Fn(&View) -> bool) -> Option<(usize, usize)> {
+        self.tabs.iter().enumerate().find_map(|(ix, tab)| tab.root.find(&matches).map(|p| (ix, p.id)))
     }
 
-    /// Whether the tabs live in the top bar instead of a strip over the pane: when the project
-    /// is a single pane, so there's no doubt which pane they switch.
-    pub fn tabs_in_header(&self) -> bool {
-        matches!(self.root, Some(Node::Pane(_)))
-    }
-
-    /// The single pane's tabs for the top bar, every one floating on the frame; the shown one
-    /// stands out by its colour. `favicon` goes on the agent tab.
+    /// The tabs for the top bar, each floating on the frame and titled after its focused pane;
+    /// the one on show stands out by its colour. `favicon` goes on the tab showing the agent.
     pub fn header_tabs(&self, this: Entity<Self>, favicon: Option<AnyElement>, cx: &App) -> Option<AnyElement> {
-        let Some(Node::Pane(pane)) = &self.root else { return None };
+        if self.tabs.is_empty() {
+            return None;
+        }
         let theme = cx.theme();
         let (fg, muted, shown) = (theme.foreground, theme.muted_foreground, theme.tab_active);
         // Every tab floats on the see-through frame, solid: the one on show in Chrome's colour
         // for a shown tab, the others in the frame's; hovering one lifts it to the shown colour.
         let (tab_bg, tab_fg) = (theme.tab, theme.tab_foreground);
         let mut favicon = favicon;
-        let pane_id = pane.id;
-        let tabs = pane.tabs.iter().enumerate().map(|(ix, tab)| {
-            let (title, dot) = tab_label(tab, cx);
-            let active = ix == pane.active;
-            let id = tab.entity_id();
-            let icon = match tab {
-                Tab::Agent(_) => favicon.take(),
-                Tab::Terminal(_) => {
+        let tabs = self.tabs.iter().enumerate().map(|(ix, tab)| {
+            let view = tab.view();
+            let (title, dot) = view.map(|v| view_label(v, cx)).unwrap_or_default();
+            let active = ix == self.active;
+            let icon = match view {
+                Some(View::Agent(_)) => favicon.take(),
+                Some(View::Terminal(_)) => {
                     Some(Icon::new(IconName::SquareTerminal).small().text_color(muted).into_any_element())
                 }
-                Tab::Review(_) => Some(Icon::new(IconName::FileDiff).small().text_color(muted).into_any_element()),
-                Tab::GitHub(_) => Some(Icon::new(IconName::Github).small().text_color(muted).into_any_element()),
+                Some(View::Review(_)) => {
+                    Some(Icon::new(IconName::FileDiff).small().text_color(muted).into_any_element())
+                }
+                Some(View::GitHub(_)) => Some(Icon::new(IconName::Github).small().text_color(muted).into_any_element()),
+                None => None,
             };
             let (activate, close) = (this.clone(), this.clone());
+            let tab_id = tab.id;
             h_flex()
                 .id(SharedString::from(format!("header-tab-{ix}")))
                 .test_support()
@@ -548,7 +575,7 @@ impl Panes {
                         el.text_color(tab_fg).bg(tab_bg).hover(|el| el.bg(shown).text_color(fg))
                     }
                 })
-                .on_click(move |_, window, cx| activate.update(cx, |p, cx| p.activate_at((pane_id, ix), window, cx)))
+                .on_click(move |_, window, cx| activate.update(cx, |p, cx| p.select_tab(tab_id, window, cx)))
                 .children(icon.map(|icon| div().flex_none().child(icon)))
                 .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(title))
                 .when_some(dot, |el, color| el.child(div().flex_none().size_1p5().rounded_full().bg(color)))
@@ -566,7 +593,7 @@ impl Panes {
                         .child(Icon::new(IconName::X).xsmall())
                         .on_click(move |_, window, cx| {
                             cx.stop_propagation();
-                            close.update(cx, |p, cx| p.close_entity(id, window, cx));
+                            close.update(cx, |p, cx| p.close_whole_tab(tab_id, window, cx));
                         }),
                 )
         });
@@ -582,28 +609,34 @@ impl Panes {
         )
     }
 
-    /// The tab count of each pane, in order.
+    /// How many panes each tab has, in order.
     #[cfg(test)]
     pub fn shape(&self) -> Vec<usize> {
-        self.pane_ids().iter().filter_map(|id| self.root.as_ref()?.pane(*id).map(|p| p.tabs.len())).collect()
+        self.tabs.iter().map(|t| t.pane_ids().len()).collect()
+    }
+
+    /// The tab on show.
+    #[cfg(test)]
+    pub fn active_tab(&self) -> usize {
+        self.active
     }
 
     #[cfg(test)]
     pub fn focused_pane(&self) -> usize {
-        self.focused
+        self.tabs.get(self.active).map(|t| t.focused).unwrap_or(0)
     }
 
     #[cfg(test)]
     pub fn review_is_showing(&self) -> bool {
-        matches!(self.active_tab(), Some(Tab::Review(_)))
+        matches!(self.active_view(), Some(View::Review(_)))
     }
 
-    /// The thread showing in the focused pane, if its visible tab is the agent.
+    /// The thread showing in the focused pane, if it shows the agent.
     pub fn active_thread_id(&self, cx: &App) -> Option<String> {
-        self.active_tab().and_then(|t| t.thread_id(cx))
+        self.active_view().and_then(|v| v.thread_id(cx))
     }
 
-    /// Tell the workspace which thread the agent tab shows, if that changed.
+    /// Tell the workspace which thread the agent shows, if that changed.
     fn report_thread(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.active_thread_id(cx)
             && self.reported_thread.as_deref() != Some(&id)
@@ -619,22 +652,22 @@ impl Panes {
         cx.notify();
     }
 
-    /// Focus the focused pane's visible tab, and tell the workspace if it's the agent.
+    /// Focus the focused pane of the tab on show, and tell the workspace if it's the agent.
     pub fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.active_tab().cloned() {
-            Some(Tab::Agent(agent)) => {
+        match self.active_view().cloned() {
+            Some(View::Agent(agent)) => {
                 match agent.read(cx).thread().map(|view| view.read(cx).prompt_focus(cx)) {
                     Some(focus) => window.focus(&focus, cx),
                     None => self.focus.focus(window, cx),
                 }
                 self.report_thread(cx);
             }
-            Some(Tab::Terminal(term)) => {
+            Some(View::Terminal(term)) => {
                 let focus = Focusable::focus_handle(term.read(cx), cx);
                 window.focus(&focus, cx);
             }
-            Some(Tab::GitHub(github)) => github.update(cx, |g, cx| g.shown(window, cx)),
-            Some(Tab::Review(_)) | None => self.focus.focus(window, cx),
+            Some(View::GitHub(github)) => github.update(cx, |g, cx| g.shown(window, cx)),
+            Some(View::Review(_)) | None => self.focus.focus(window, cx),
         }
     }
 
@@ -643,88 +676,91 @@ impl Panes {
         self.active_terminal().and_then(|t| t.read(cx).cwd())
     }
 
-    fn push_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
-        match self.root.as_mut().and_then(|r| r.pane_mut(self.focused)) {
-            Some(pane) => {
-                pane.tabs.push(tab);
-                pane.set_active(pane.tabs.len() - 1);
-            }
-            None => {
-                let id = self.next_id();
-                let pane = Pane::new(id, vec![tab], 0);
-                self.root = Some(match self.root.take() {
-                    Some(root) => root.split(self.focused, SplitDirection::Right, pane).0,
-                    None => Node::Pane(pane),
-                });
-                self.focused = id;
-            }
-        }
+    /// Open `view` in a new tab at the end of the top bar, and show it.
+    fn push_tab(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.leaf(view);
+        let id = self.next_id();
+        self.tabs.push(Tab::new(id, root));
+        self.active = self.tabs.len() - 1;
+        self.touch();
         self.changed(window, cx);
     }
 
-    fn activate_at(&mut self, (pane, ix): (usize, usize), window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(p) = self.root.as_mut().and_then(|r| r.pane_mut(pane)) {
-            p.set_active(ix);
-        }
-        self.focused = pane;
+    /// Show tab `ix` with pane `pane` focused.
+    fn activate_at(&mut self, (ix, pane): (usize, usize), window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(ix) else { return };
+        tab.focused = pane;
+        self.active = ix;
+        self.touch();
         self.focus_active(window, cx);
         cx.notify();
     }
 
-    /// Show a thread in the agent tab, in place of the one there, and focus it. If the agent
-    /// tab was closed, it opens again in the focused pane.
+    /// Show the tab with id `id`, as its panes were.
+    fn select_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((ix, tab)) = self.tabs.iter().enumerate().find(|(_, t)| t.id == id) {
+            let pane = tab.focused;
+            self.activate_at((ix, pane), window, cx);
+        }
+    }
+
+    /// Show a thread in the agent's pane, in place of the one there, and focus it. If the
+    /// agent was closed, it opens again in a tab of its own.
     pub fn show_thread(&mut self, id: &str, view: Entity<ThreadView>, window: &mut Window, cx: &mut Context<Self>) {
         self.agent.update(cx, |a, cx| a.set_thread(id, view, cx));
-        match self.find(|t| matches!(t, Tab::Agent(_))) {
+        match self.find(|v| matches!(v, View::Agent(_))) {
             Some(at) => self.activate_at(at, window, cx),
-            None => self.push_tab(Tab::Agent(self.agent.clone()), window, cx),
+            None => self.push_tab(View::Agent(self.agent.clone()), window, cx),
         }
     }
 
-    /// Show the review tab, opening it in the focused pane if needed.
+    /// Show the review, opening it in a new tab if needed.
     pub fn show_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.find(|t| matches!(t, Tab::Review(_))) {
+        match self.find(|v| matches!(v, View::Review(_))) {
             Some(at) => self.activate_at(at, window, cx),
-            None => self.push_tab(Tab::Review(self.review.clone()), window, cx),
+            None => self.push_tab(View::Review(self.review.clone()), window, cx),
         }
     }
 
-    /// Show the GitHub tab, opening it in the focused pane if needed.
+    /// Show the GitHub page, opening it in a new tab if needed.
     pub fn show_github(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.find(|t| matches!(t, Tab::GitHub(_))) {
+        match self.find(|v| matches!(v, View::GitHub(_))) {
             Some(at) => self.activate_at(at, window, cx),
-            None => self.push_tab(Tab::GitHub(self.github.clone()), window, cx),
+            None => self.push_tab(View::GitHub(self.github.clone()), window, cx),
         }
     }
 
     #[cfg(test)]
     pub fn github_is_showing(&self) -> bool {
-        matches!(self.active_tab(), Some(Tab::GitHub(_)))
+        matches!(self.active_view(), Some(View::GitHub(_)))
     }
 
+    /// A terminal in a new tab.
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = self.focused_cwd(cx);
         if let Some(term) = self.spawn(cwd, window, cx) {
-            self.push_tab(Tab::Terminal(term), window, cx);
+            self.push_tab(View::Terminal(term), window, cx);
         }
     }
 
-    /// Split the focused pane; the new pane starts with a terminal.
+    /// Split the focused pane of the tab on show; the new pane, in the same tab, starts with a
+    /// terminal.
     pub fn split(&mut self, direction: SplitDirection, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = self.focused_cwd(cx);
         let Some(term) = self.spawn(cwd, window, cx) else { return };
+        if self.tabs.is_empty() {
+            return self.push_tab(View::Terminal(term), window, cx);
+        }
         let id = self.next_id();
-        let pane = Pane::new(id, vec![Tab::Terminal(term)], 0);
-        self.root = Some(match self.root.take() {
-            Some(root) => root.split(self.focused, direction, pane).0,
-            None => Node::Pane(pane),
-        });
-        self.focused = id;
+        let ix = self.active;
+        let Tab { id: tab_id, root, focused } = self.tabs.remove(ix);
+        let (root, _) = root.split(focused, direction, Pane { id, view: View::Terminal(term) });
+        self.tabs.insert(ix, Tab { id: tab_id, root, focused: id });
         self.changed(window, cx);
     }
 
-    /// Stop showing a thread (archived or deleted): the agent tab empties until another
-    /// thread is picked.
+    /// Stop showing a thread (archived or deleted): the agent empties until another thread is
+    /// picked.
     pub fn close_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         if self.agent.read(cx).thread_id() == Some(thread_id) {
             self.agent.update(cx, |a, cx| a.clear(cx));
@@ -734,63 +770,102 @@ impl Panes {
         }
     }
 
+    /// Close the focused pane; with the tab's last pane, the tab goes too.
     pub fn close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.active_tab().map(Tab::entity_id) {
+        if let Some(id) = self.active_view().map(View::entity_id) {
             self.close_entity(id, window, cx);
         }
     }
 
-    /// Close the tab showing `id`. A closed agent tab opens again when a thread is picked; a
-    /// closed terminal's shell ends. An emptied pane is removed and its split folds.
-    fn close_entity(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((pane_id, ix)) = self.find(|t| t.entity_id() == id) else { return };
-        let Some(root) = self.root.as_mut() else { return };
-        let pane = root.pane_mut(pane_id).expect("pane exists");
-        let closed = pane.tabs.remove(ix);
-        pane.recent.retain(|r| *r != id);
-        // Go back to the tab used before; failing that, the neighbour.
-        let back = pane.recent.iter().rev().find_map(|r| pane.tabs.iter().position(|t| t.entity_id() == *r));
-        let next = back.unwrap_or(pane.active.min(pane.tabs.len().saturating_sub(1)));
-        pane.set_active(next);
-        if pane.tabs.is_empty() {
-            let order = self.pane_ids();
-            let at = order.iter().position(|p| *p == pane_id).unwrap_or(0);
-            self.root = self.root.take().and_then(|root| root.remove(pane_id));
-            let remaining = self.pane_ids();
-            if self.focused == pane_id {
-                self.focused = remaining.get(at.min(remaining.len().saturating_sub(1))).copied().unwrap_or(0);
-            }
-        }
-        if matches!(closed, Tab::Agent(_)) {
-            self.reported_thread = None;
-        }
-        if matches!(closed, Tab::Review(_)) && self.find(|t| matches!(t, Tab::Review(_))).is_none() {
-            cx.emit(PaneEvent::ReviewClosed);
-        }
+    /// Close a tab and every pane in it (the top bar's ×).
+    fn close_whole_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.tabs.iter().position(|t| t.id == id) else { return };
+        let tab = self.tabs.remove(ix);
+        let mut closed = Vec::new();
+        tab.root.views(&mut closed);
+        self.tab_removed(ix, tab.id);
+        self.closed(&closed, cx);
         self.changed(window, cx);
     }
 
+    /// Close the pane showing `id`. A closed agent opens again when a thread is picked; a
+    /// closed terminal's shell ends. The pane's split folds, and an emptied tab closes.
+    fn close_entity(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((ix, pane_id)) = self.find(|v| v.entity_id() == id) else { return };
+        let Tab { id: tab_id, root, focused } = self.tabs.remove(ix);
+        let order = {
+            let mut ids = Vec::new();
+            root.pane_ids(&mut ids);
+            ids
+        };
+        let closed = root.pane(pane_id).map(|p| p.view.clone());
+        match root.remove(pane_id) {
+            Some(root) => {
+                let mut tab = Tab { id: tab_id, root, focused };
+                if focused == pane_id {
+                    // The pane before it takes focus; failing that, the one after.
+                    let at = order.iter().position(|p| *p == pane_id).unwrap_or(0);
+                    let remaining = tab.pane_ids();
+                    tab.focused = remaining[at.saturating_sub(1).min(remaining.len() - 1)];
+                }
+                self.tabs.insert(ix, tab);
+            }
+            None => self.tab_removed(ix, tab_id),
+        }
+        self.closed(closed.as_slice(), cx);
+        self.changed(window, cx);
+    }
+
+    /// After the tab at `ix` (id `gone`) was taken out: forget it, and if it was on show, go
+    /// back to the tab used before it, failing that its neighbour.
+    fn tab_removed(&mut self, ix: usize, gone: usize) {
+        self.recent.retain(|r| *r != gone);
+        if self.active == ix {
+            self.active = self
+                .recent
+                .iter()
+                .rev()
+                .find_map(|r| self.tabs.iter().position(|t| t.id == *r))
+                .unwrap_or(ix.min(self.tabs.len().saturating_sub(1)));
+            self.touch();
+        } else if self.active > ix {
+            self.active -= 1;
+        }
+    }
+
+    /// Views that just closed: the agent is reported again when it comes back, and the
+    /// workspace hears when the review is gone.
+    fn closed(&mut self, views: &[View], cx: &mut Context<Self>) {
+        if views.iter().any(|v| matches!(v, View::Agent(_))) {
+            self.reported_thread = None;
+        }
+        if views.iter().any(|v| matches!(v, View::Review(_))) && self.find(|v| matches!(v, View::Review(_))).is_none() {
+            cx.emit(PaneEvent::ReviewClosed);
+        }
+    }
+
     pub fn focus_next_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = self.pane_ids();
-        if let Some(ix) = ids.iter().position(|id| *id == self.focused) {
-            self.focused = ids[(ix + 1) % ids.len()];
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let ids = tab.pane_ids();
+        if let Some(ix) = ids.iter().position(|id| *id == tab.focused) {
+            tab.focused = ids[(ix + 1) % ids.len()];
             self.focus_active(window, cx);
             cx.notify();
         }
     }
 
-    /// Move focus to the nearest pane in a direction (dx, dy are -1, 0 or 1).
+    /// Move focus to the nearest pane of the tab in a direction (dx, dy are -1, 0 or 1).
     pub fn focus_direction(&mut self, dx: f32, dy: f32, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = &self.root else { return };
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let mut rects = Vec::new();
-        root.rects(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }, &mut rects);
-        let Some((_, from)) = rects.iter().find(|(id, _)| *id == self.focused).copied() else { return };
+        tab.root.rects(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }, &mut rects);
+        let Some((_, from)) = rects.iter().find(|(id, _)| *id == tab.focused).copied() else { return };
         let center = |r: &Rect| (r.x + r.w / 2.0, r.y + r.h / 2.0);
         let (fx, fy) = center(&from);
         let best = rects
             .iter()
             .filter(|(id, r)| {
-                *id != self.focused
+                *id != tab.focused
                     && match (dx as i32, dy as i32) {
                         (1, _) => r.x >= from.x + from.w - 1e-4,
                         (-1, _) => r.x + r.w <= from.x + 1e-4,
@@ -806,25 +881,24 @@ impl Panes {
                 dist(a).total_cmp(&dist(b))
             });
         if let Some((id, _)) = best {
-            self.focused = *id;
+            tab.focused = *id;
             self.focus_active(window, cx);
             cx.notify();
         }
     }
 
     pub fn resize(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
-        let focused = self.focused;
-        if self.root.as_mut().is_some_and(|root| root.resize(focused, delta)) {
+        if self.tabs.get_mut(self.active).is_some_and(|tab| tab.root.resize(tab.focused, delta)) {
             self.changed(window, cx);
         }
     }
 
+    /// Show the next (or, with a negative step, previous) tab.
     pub fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(pane) = self.root.as_mut().and_then(|r| r.pane_mut(self.focused))
-            && !pane.tabs.is_empty()
-        {
-            let len = pane.tabs.len() as isize;
-            pane.set_active((pane.active as isize + step).rem_euclid(len) as usize);
+        if !self.tabs.is_empty() {
+            let len = self.tabs.len() as isize;
+            self.active = (self.active as isize + step).rem_euclid(len) as usize;
+            self.touch();
             self.focus_active(window, cx);
             cx.notify();
         }
@@ -834,7 +908,7 @@ impl Panes {
 
     /// Drag a divider: the split takes the pointer's position within it as its ratio.
     fn drag_divider(&mut self, path: &[bool], ratio: f32, cx: &mut Context<Self>) {
-        if self.root.as_mut().is_some_and(|root| root.set_ratio(path, ratio)) {
+        if self.tabs.get_mut(self.active).is_some_and(|tab| tab.root.set_ratio(path, ratio)) {
             cx.notify();
         }
     }
@@ -920,83 +994,44 @@ impl Panes {
     }
 
     fn render_pane(&self, pane: &Pane, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let (muted, fg, accent, hover, border) =
-            (theme.muted_foreground, theme.foreground, theme.primary, theme.secondary, theme.border);
-        let focused = pane.id == self.focused;
+        let accent = cx.theme().primary;
+        let tab = self.tabs.get(self.active);
+        let split = tab.is_some_and(|t| matches!(t.root, Node::Split { .. }));
+        let focused = tab.is_some_and(|t| t.focused == pane.id);
         let pane_id = pane.id;
-        let tabs = pane.tabs.iter().enumerate().map(|(ix, tab)| {
-            let (title, dot) = tab_label(tab, cx);
-            let active = ix == pane.active;
-            let id = tab.entity_id();
-            h_flex()
-                .id(SharedString::from(format!("tab-{pane_id}-{ix}")))
-                .test_support()
-                .gap_1()
-                .max_w(px(220.))
-                .px_2()
-                .h_full()
-                .cursor_pointer()
-                .text_xs()
-                .when(active, |el| el.border_b_2().border_color(if focused { accent } else { muted }))
-                .text_color(if active { fg } else { muted })
-                .hover(|el| el.bg(hover))
-                .on_click(cx.listener(move |this, _, window, cx| this.activate_at((pane_id, ix), window, cx)))
-                .when_some(dot, |el, color| el.child(div().flex_none().size_1p5().rounded_full().bg(color)))
-                .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().child(title))
-                .child(
-                    div()
-                        .id(SharedString::from(format!("close-tab-{pane_id}-{ix}")))
-                        .px_0p5()
-                        .text_color(muted)
-                        .hover(|el| el.text_color(fg))
-                        .child("×")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.close_entity(id, window, cx);
-                        })),
-                )
-        });
-        let content: Option<AnyElement> = pane.tabs.get(pane.active).map(|tab| match tab {
-            Tab::Agent(agent) => agent.clone().into_any_element(),
-            Tab::Terminal(term) => term.clone().into_any_element(),
-            Tab::Review(review) => review.clone().into_any_element(),
-            Tab::GitHub(github) => github.clone().into_any_element(),
-        });
+        let content = match &pane.view {
+            View::Agent(agent) => agent.clone().into_any_element(),
+            View::Terminal(term) => term.clone().into_any_element(),
+            View::Review(review) => review.clone().into_any_element(),
+            View::GitHub(github) => github.clone().into_any_element(),
+        };
         v_flex()
             .size_full()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    if this.focused != pane_id {
-                        this.focused = pane_id;
+                    if let Some(tab) = this.tabs.get_mut(this.active)
+                        && tab.focused != pane_id
+                    {
+                        tab.focused = pane_id;
                         this.report_thread(cx);
                         cx.notify();
                     }
                 }),
             )
-            // The tab strip only shows when there's more than one tab to switch between.
-            .when(pane.tabs.len() > 1 && !self.tabs_in_header(), |el| {
-                el.child(
-                    h_flex()
-                        .h(px(30.))
-                        .flex_none()
-                        .px_1()
-                        .border_b_1()
-                        .border_color(border)
-                        .child(h_flex().flex_1().min_w_0().h_full().overflow_hidden().children(tabs)),
-                )
-            })
-            .child(div().flex_1().min_h_0().children(content))
+            // The tab is titled after its focused pane; when split, a line over that pane says
+            // which one it is.
+            .when(split, |el| el.child(div().h(px(2.)).flex_none().when(focused, |el| el.bg(accent))))
+            .child(div().flex_1().min_h_0().child(content))
             .into_any_element()
     }
 }
 
-/// A tab's title, and the colour of its dot when its thread is working or waiting.
-fn tab_label(tab: &Tab, cx: &App) -> (String, Option<Hsla>) {
+/// A view's title, and the colour of its dot when its thread is working or waiting.
+fn view_label(view: &View, cx: &App) -> (String, Option<Hsla>) {
     let theme = cx.theme();
-    match tab {
-        Tab::Agent(agent) => match agent.read(cx).thread().map(|v| v.read(cx)) {
+    match view {
+        View::Agent(agent) => match agent.read(cx).thread().map(|v| v.read(cx)) {
             Some(t) => {
                 let dot = match t.status {
                     Status::Idle => None,
@@ -1007,12 +1042,12 @@ fn tab_label(tab: &Tab, cx: &App) -> (String, Option<Hsla>) {
             }
             None => ("Agent".into(), None),
         },
-        Tab::Terminal(term) => {
+        View::Terminal(term) => {
             let t = term.read(cx);
             (tab_title(t.title(), t.cwd()), None)
         }
-        Tab::Review(review) => (review.read(cx).title(cx), None),
-        Tab::GitHub(github) => (github.read(cx).title(), None),
+        View::Review(review) => (review.read(cx).title(cx), None),
+        View::GitHub(github) => (github.read(cx).title(), None),
     }
 }
 
@@ -1051,8 +1086,8 @@ fn tab_title(title: Option<&str>, cwd: Option<PathBuf>) -> String {
 impl Render for Panes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        let body = match &self.root {
-            Some(root) => self.render_node(root, Vec::new(), cx),
+        let body = match self.tabs.get(self.active) {
+            Some(tab) => self.render_node(&tab.root, Vec::new(), cx),
             None => v_flex()
                 .size_full()
                 .items_center()
@@ -1094,7 +1129,7 @@ impl Render for Panes {
 mod tests {
     use super::{PaneEvent, Panes, Start};
     use crate::changes::{ProjectChanges, ReviewView};
-    use crate::store::{PaneLayout, SplitDirection, TabState};
+    use crate::store::{AreaLayout, PaneLayout, SplitDirection, SplitLayout, TabState};
     use crate::thread::{Backend, ThreadView};
     use alacritty_terminal::tty::Shell;
     use gpui_kit::test::TestWindowExt as _;
@@ -1113,7 +1148,7 @@ mod tests {
     }
 
     /// Panes for a temp project with one known thread ("t1"), running `/bin/sh` terminals.
-    fn open(cx: &mut TestAppContext, layout: Option<PaneLayout>, start_thread: bool) -> Setup {
+    fn open(cx: &mut TestAppContext, layout: Option<AreaLayout>, start_thread: bool) -> Setup {
         open_with(cx, layout, start_thread, Shell::new("/bin/sh".into(), vec![]))
     }
 
@@ -1123,7 +1158,7 @@ mod tests {
         open_with(cx, None, false, Shell::new("sleep".into(), vec!["60".into()]))
     }
 
-    fn open_with(cx: &mut TestAppContext, layout: Option<PaneLayout>, start_thread: bool, shell: Shell) -> Setup {
+    fn open_with(cx: &mut TestAppContext, layout: Option<AreaLayout>, start_thread: bool, shell: Shell) -> Setup {
         let dir = std::env::temp_dir().join(format!("tj-panes-{}", crate::store::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         cx.update(|cx| {
@@ -1180,12 +1215,11 @@ mod tests {
     fn a_new_project_starts_with_its_conversation_and_a_terminal(cx: &mut TestAppContext) {
         let s = open(cx, None, true);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2]);
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1], "two tabs of one pane each");
         assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t1".into()));
         let layout = s.panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
-        let PaneLayout::Pane { tabs, .. } = layout else { panic!() };
-        assert_eq!(tabs[0], TabState::Agent);
-        assert!(matches!(tabs[1], TabState::Terminal { .. }));
+        assert_eq!(layout.tabs[0], SplitLayout::Pane { view: TabState::Agent });
+        assert!(matches!(layout.tabs[1], SplitLayout::Pane { view: TabState::Terminal { .. } }));
     }
 
     #[gpui_kit::test]
@@ -1196,33 +1230,38 @@ mod tests {
             p.split(SplitDirection::Right, window, cx);
             p.new_terminal(window, cx);
         });
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 2]);
-        let before = s.panes.read_with(cx, |p, cx| p.snapshot(cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1, 1]);
+        let before = s.panes.read_with(cx, |p, cx| p.snapshot(cx)).map(|l| l.tabs);
 
         let other = cx.update(|window, cx| cx.new(|cx| ThreadView::new(Backend::Scripted(Vec::new()), window, cx)));
         s.panes.update_in(cx, |p, window, cx| p.show_thread("t2", other, window, cx));
         cx.run_until_parked();
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 2], "no tab added for the second thread");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1, 1], "no tab added for the second thread");
         assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t2".into()));
-        assert_eq!(s.panes.read_with(cx, |p, cx| p.snapshot(cx)), before, "terminals and splits are untouched");
+        assert_eq!(
+            s.panes.read_with(cx, |p, cx| p.snapshot(cx)).map(|l| l.tabs),
+            before,
+            "terminals and splits are untouched"
+        );
+        assert_eq!(s.panes.read_with(cx, |p, _| p.active_tab()), 0, "the agent's tab is on show again");
         assert!(s.events.borrow().iter().any(|e| e == "focus:t2"));
 
         // Back to the first: still the same one tab.
         let thread = s.thread.clone();
         s.panes.update_in(cx, |p, window, cx| p.show_thread("t1", thread, window, cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 2]);
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1, 1]);
         assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t1".into()));
     }
 
     #[gpui_kit::test]
-    fn a_closed_agent_tab_opens_again_in_the_focused_pane(cx: &mut TestAppContext) {
+    fn a_closed_agent_opens_again_in_a_tab_of_its_own(cx: &mut TestAppContext) {
         let s = open(cx, None, true);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
         s.panes.update_in(cx, |p, window, cx| p.close_tab(window, cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1], "just the terminal is left");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1], "just the terminal's tab is left");
         let thread = s.thread.clone();
         s.panes.update_in(cx, |p, window, cx| p.show_thread("t1", thread, window, cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2]);
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1]);
         assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t1".into()));
     }
 
@@ -1235,7 +1274,7 @@ mod tests {
         let thread = s.thread.clone();
         s.panes.update_in(cx, |p, window, cx| p.show_thread("t1", thread, window, cx));
         cx.run_until_parked();
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2], "no second tab");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1], "no third tab");
         assert_eq!(s.panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some("t1".into()));
         assert!(s.events.borrow().iter().any(|e| e == "focus:t1"));
     }
@@ -1249,21 +1288,25 @@ mod tests {
             p.split(SplitDirection::Down, window, cx);
             p.new_terminal(window, cx);
         });
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1, 2]);
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![3, 1], "the splits stay in their tab");
         let layout = s.panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
-        let PaneLayout::Split { direction: SplitDirection::Right, first, second, .. } = layout else {
+        assert_eq!(layout.active, 1, "the new terminal's tab is on show");
+        let SplitLayout::Split { direction: SplitDirection::Right, first, second, .. } = &layout.tabs[0] else {
             panic!("expected a right split: {layout:?}");
         };
         let cwd = s.dir.canonicalize().unwrap();
-        assert!(matches!(*first, PaneLayout::Pane { ref tabs, .. } if tabs == &vec![TabState::Terminal { cwd }]));
-        assert!(matches!(*second, PaneLayout::Split { direction: SplitDirection::Down, .. }));
+        assert_eq!(**first, SplitLayout::Pane { view: TabState::Terminal { cwd } });
+        assert!(matches!(**second, SplitLayout::Split { direction: SplitDirection::Down, .. }));
     }
 
     use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
 
     fn root_ratio(panes: &Entity<Panes>, cx: &mut VisualTestContext) -> f32 {
         match panes.read_with(cx, |p, cx| p.snapshot(cx)) {
-            Some(PaneLayout::Split { ratio, .. }) => ratio,
+            Some(AreaLayout { tabs, .. }) => match tabs[0] {
+                SplitLayout::Split { ratio, .. } => ratio,
+                ref other => panic!("expected a split: {other:?}"),
+            },
             other => panic!("expected a split: {other:?}"),
         }
     }
@@ -1328,12 +1371,15 @@ mod tests {
         let first = s.panes.read_with(cx, |p, _| p.focused_pane());
 
         cx.update(|window, cx| window.press("ctrl-alt-h", cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1], "Ctrl+Alt+H splits right");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2], "Ctrl+Alt+H splits right, in the same tab");
         let right = s.panes.read_with(cx, |p, _| p.focused_pane());
         assert_ne!(right, first, "focus moves to the new pane");
 
         cx.update(|window, cx| window.press("ctrl-shift-t", cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 2], "Ctrl+Shift+T opens a tab in the focused pane");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "Ctrl+Shift+T opens a new tab");
+        cx.update(|window, cx| window.press("ctrl-pageup", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.active_tab()), 0, "Ctrl+PageUp goes back to the split tab");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), right, "with the same pane focused");
 
         cx.update(|window, cx| window.press("ctrl-alt-s", cx));
         assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), first, "Ctrl+Alt+S moves to the left pane");
@@ -1343,8 +1389,14 @@ mod tests {
         assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), first, "Ctrl+Alt+Left still moves left");
 
         cx.update(|window, cx| window.press("ctrl-shift-w", cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2], "closing a pane's last tab folds the split");
+        assert_eq!(
+            s.panes.read_with(cx, |p, _| p.shape()),
+            vec![1, 1],
+            "Ctrl+Shift+W closes the pane; the split folds"
+        );
         assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), right);
+        cx.update(|window, cx| window.press("ctrl-shift-w", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1], "closing a tab's last pane closes the tab");
     }
 
     #[gpui_kit::test]
@@ -1357,9 +1409,41 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn a_saved_layout_restores_every_kind_of_tab(cx: &mut TestAppContext) {
-        // Saved before there was one agent tab: two conversation tabs, one of a deleted thread.
-        let layout = PaneLayout::Split {
+    fn a_saved_layout_restores_every_kind_of_pane(cx: &mut TestAppContext) {
+        let layout = AreaLayout {
+            tabs: vec![
+                SplitLayout::Split {
+                    direction: SplitDirection::Right,
+                    ratio: 0.6,
+                    first: Box::new(SplitLayout::Pane { view: TabState::Agent }),
+                    second: Box::new(SplitLayout::Pane { view: TabState::Terminal { cwd: "/no/such/dir".into() } }),
+                },
+                SplitLayout::Pane { view: TabState::Review },
+                SplitLayout::Pane { view: TabState::GitHub },
+                // Each one-of-a-kind view is shown once.
+                SplitLayout::Pane { view: TabState::Review },
+            ],
+            active: 2,
+        };
+        let s = open(cx, Some(layout), false);
+        let cx = &mut VisualTestContext::from_window(s.window, cx);
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1, 1]);
+        let restored = s.panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
+        assert_eq!(restored.active, 2);
+        let SplitLayout::Split { ratio, first, second, .. } = &restored.tabs[0] else { panic!("{restored:?}") };
+        assert_eq!(*ratio, 0.6);
+        assert_eq!(**first, SplitLayout::Pane { view: TabState::Agent });
+        assert_eq!(
+            **second,
+            SplitLayout::Pane { view: TabState::Terminal { cwd: s.dir.canonicalize().unwrap() } },
+            "a missing folder opens in the project"
+        );
+    }
+
+    #[test]
+    fn a_layout_from_before_keeps_its_splits_in_the_first_tab() {
+        // Saved when each pane had tabs, and before there was one agent: two conversations.
+        let old = PaneLayout::Split {
             direction: SplitDirection::Right,
             ratio: 0.6,
             first: Box::new(PaneLayout::Pane {
@@ -1367,28 +1451,26 @@ mod tests {
                     TabState::Thread { id: "t1".into() },
                     TabState::Thread { id: "gone".into() },
                     TabState::Review,
-                    TabState::GitHub,
                 ],
-                active: 1,
+                active: 2,
             }),
-            second: Box::new(PaneLayout::Pane {
-                tabs: vec![TabState::Terminal { cwd: "/no/such/dir".into() }],
-                active: 0,
-            }),
+            second: Box::new(PaneLayout::Pane { tabs: vec![TabState::GitHub], active: 0 }),
         };
-        let s = open(cx, Some(layout), false);
-        let cx = &mut VisualTestContext::from_window(s.window, cx);
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![3, 1], "the conversations become one agent tab");
-        let restored = s.panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
-        let PaneLayout::Split { ratio, first, second, .. } = restored else { panic!("{restored:?}") };
-        assert_eq!(ratio, 0.6);
-        let expected = vec![TabState::Agent, TabState::Review, TabState::GitHub];
-        assert!(matches!(*first, PaneLayout::Pane { ref tabs, .. } if *tabs == expected));
-        let PaneLayout::Pane { tabs, .. } = *second else { panic!() };
+        let area = old.to_area();
+        assert_eq!(area.active, 0);
         assert_eq!(
-            tabs,
-            vec![TabState::Terminal { cwd: s.dir.canonicalize().unwrap() }],
-            "a missing folder opens in the project"
+            area.tabs,
+            vec![
+                SplitLayout::Split {
+                    direction: SplitDirection::Right,
+                    ratio: 0.6,
+                    first: Box::new(SplitLayout::Pane { view: TabState::Review }),
+                    second: Box::new(SplitLayout::Pane { view: TabState::GitHub }),
+                },
+                SplitLayout::Pane { view: TabState::Thread { id: "t1".into() } },
+                SplitLayout::Pane { view: TabState::Thread { id: "gone".into() } },
+            ],
+            "what was on show keeps its splits; what was behind gets a tab each"
         );
     }
 
@@ -1397,7 +1479,7 @@ mod tests {
         let s = open(cx, None, true);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
         s.panes.update_in(cx, |p, window, cx| p.show_review(window, cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![3]);
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1, 1]);
         assert!(s.panes.read_with(cx, |p, _| p.review_is_showing()));
         s.panes.update_in(cx, |p, window, cx| p.close_tab(window, cx));
         cx.run_until_parked();
@@ -1417,11 +1499,11 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn a_shell_that_exits_closes_its_tab(cx: &mut TestAppContext) {
+    fn a_shell_that_exits_closes_its_pane(cx: &mut TestAppContext) {
         let s = open(cx, None, false);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
         s.panes.update_in(cx, |p, window, cx| p.new_terminal(window, cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2]);
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1]);
         let term = s.panes.read_with(cx, |p, _| p.active_terminal().unwrap());
         term.update(cx, |t, _| t.type_text("exit\r"));
         for _ in 0..300 {
@@ -1431,6 +1513,6 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1]);
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1], "its pane, and with it its tab, closes");
     }
 }

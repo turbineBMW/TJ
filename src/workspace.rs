@@ -1262,10 +1262,11 @@ impl Workspace {
         self._subscriptions.push(cx.observe(&agent, |_, _, cx| cx.notify()));
         self.agents.insert(project.id.clone(), agent.clone());
         let shell = self.shell.clone();
+        let area = project.area_layout();
         let panes = cx.new(|cx| {
             Panes::new(
                 project.path.clone(),
-                project.layout.as_ref(),
+                area.as_ref(),
                 agent,
                 review,
                 github,
@@ -1280,7 +1281,8 @@ impl Workspace {
             PaneEvent::LayoutChanged => {
                 let layout = panes.read(cx).snapshot(cx);
                 if let Some(project) = this.state.project_mut(&id) {
-                    project.layout = layout;
+                    project.area = layout;
+                    project.layout = None;
                 }
                 this.save();
             }
@@ -1310,7 +1312,8 @@ impl Workspace {
         let layouts: Vec<_> = self.panes.iter().map(|(id, panes)| (id.clone(), panes.read(cx).snapshot(cx))).collect();
         for (id, layout) in layouts {
             if let Some(project) = self.state.project_mut(&id) {
-                project.layout = layout;
+                project.area = layout;
+                project.layout = None;
             }
         }
         self.save();
@@ -1616,8 +1619,7 @@ impl Workspace {
         };
         let panes = self.active_project().and_then(|p| self.panes.get(&p.id)).cloned();
         let has_panes = panes.is_some();
-        // One pane: its tabs are the top bar's. Split: each pane keeps its strip and the bar
-        // names the project and thread.
+        // The tabs are the top bar's, each titled after its focused pane.
         let tabs = panes.as_ref().and_then(|panes| panes.read(cx).header_tabs(panes.clone(), avatar(16.), cx));
 
         // Every action is its own round chip.
@@ -2118,13 +2120,13 @@ mod tests {
         let (_, first, second) = two_threads(&workspace, cx);
         let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
         panes.update_in(cx, |p, window, cx| p.new_terminal(window, cx));
-        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2], "the agent tab and a terminal");
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![1, 1], "the agent's tab and a terminal's");
 
         cx.update(|window, cx| {
             window.render_frame(cx);
             window.click(SharedString::from(format!("thread-{first}")), cx);
         });
-        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2], "no tab per thread");
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![1, 1], "no tab per thread");
         assert_eq!(panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some(first.clone()));
         assert_eq!(workspace.read_with(cx, |w, _| w.active.clone()), Some(first));
 
@@ -2132,11 +2134,14 @@ mod tests {
             window.render_frame(cx);
             window.click(SharedString::from(format!("thread-{second}")), cx);
         });
-        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2]);
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![1, 1]);
         assert_eq!(panes.read_with(cx, |p, cx| p.active_thread_id(cx)), Some(second));
         let layout = panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
-        let crate::store::PaneLayout::Pane { tabs, .. } = layout else { panic!("{layout:?}") };
-        assert_eq!(tabs[0], crate::store::TabState::Agent, "saved without a thread id");
+        assert_eq!(
+            layout.tabs[0],
+            crate::store::SplitLayout::Pane { view: crate::store::TabState::Agent },
+            "saved without a thread id"
+        );
     }
 
     #[gpui_kit::test]
@@ -2360,13 +2365,12 @@ mod tests {
         });
         let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
         assert!(panes.read_with(cx, |p, _| p.github_is_showing()), "the GitHub page opens as a tab");
-        assert!(panes.read_with(cx, |p, cx| p.snapshot(cx)).is_some_and(|l| matches!(
-            l,
-            crate::store::PaneLayout::Pane { ref tabs, .. } if tabs.contains(&crate::store::TabState::GitHub)
-        )));
+        assert!(panes.read_with(cx, |p, cx| p.snapshot(cx)).is_some_and(|l| {
+            l.tabs.contains(&crate::store::SplitLayout::Pane { view: crate::store::TabState::GitHub })
+        }));
         // Opening it again shows the same tab instead of another.
         workspace.update_in(cx, |w, window, cx| w.open_github(window, cx));
-        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2]);
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![1, 1]);
 
         // An account picked in the tab is kept for the project.
         let github = workspace.read_with(cx, |w, _| w.githubs.values().next().cloned().unwrap());
@@ -2539,7 +2543,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_top_bar_holds_a_single_panes_tabs_and_splits_hand_them_back(cx: &mut TestAppContext) {
+    fn a_split_stays_in_its_tab_and_the_tab_is_named_after_its_focused_pane(cx: &mut TestAppContext) {
         let (window, workspace, _, _) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
@@ -2549,14 +2553,29 @@ mod tests {
             assert!(window.try_find(SharedString::from("header-tab-0")).is_some(), "the agent is a tab in the top bar");
             window.click(SharedString::from("header-new-terminal"), cx);
             window.render_frame(cx);
-            assert!(window.try_find(SharedString::from("header-tab-1")).is_some(), "a terminal joins it there");
-            assert!(window.try_find(SharedString::from("tab-1-1")).is_none(), "no strip over a single pane");
+            assert!(window.try_find(SharedString::from("header-tab-1")).is_some(), "a terminal gets a tab of its own");
             window.click(SharedString::from("header-split-right"), cx);
             window.render_frame(cx);
-            assert!(window.try_find(SharedString::from("header-tab-0")).is_none(), "split panes keep their own tabs");
-            assert!(window.try_find(SharedString::from("tab-1-1")).is_some(), "so the strip comes back");
+            assert!(window.try_find(SharedString::from("header-tab-1")).is_some(), "split, the tabs stay");
+            assert!(window.try_find(SharedString::from("header-tab-2")).is_none(), "and the split adds none");
         });
-        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![2, 1]);
+        assert_eq!(panes.read_with(cx, |p, _| p.shape()), vec![1, 2], "the split lives in the terminal's tab");
+
+        cx.update(|window, cx| window.click(SharedString::from("header-tab-0"), cx));
+        assert_eq!(panes.read_with(cx, |p, _| p.active_tab()), 0);
+        assert!(panes.read_with(cx, |p, cx| p.active_thread_id(cx)).is_some(), "the agent's tab shows just the agent");
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(cx.debug_bounds("divider-").is_none(), "with no split in it");
+
+        let split_pane = cx.update(|window, cx| {
+            window.click(SharedString::from("header-tab-1"), cx);
+            window.render_frame(cx);
+            panes.read(cx).focused_pane()
+        });
+        assert!(cx.debug_bounds("divider-").is_some(), "back on the terminal's tab, the split is there");
+        cx.update(|window, cx| panes.update(cx, |p, cx| p.focus_direction(-1.0, 0.0, window, cx)));
+        assert_ne!(panes.read_with(cx, |p, _| p.focused_pane()), split_pane, "focus moves within the tab");
+        assert_eq!(panes.read_with(cx, |p, _| p.active_tab()), 1);
     }
 
     #[gpui_kit::test]
