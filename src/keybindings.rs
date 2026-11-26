@@ -74,6 +74,8 @@ pub static COMMANDS: &[Command] = &[
     command!("close_tab", "Close the pane (its tab, with the last)", Panes, PANES, ["ctrl-shift-w"], panes::CloseTab),
     command!("next_tab", "Next tab", Panes, PANES, ["ctrl-pagedown"], panes::NextTab),
     command!("previous_tab", "Previous tab", Panes, PANES, ["ctrl-pageup"], panes::PreviousTab),
+    command!("move_tab_right", "Move the tab right", Panes, PANES, ["ctrl-shift-pagedown"], panes::MoveTabRight),
+    command!("move_tab_left", "Move the tab left", Panes, PANES, ["ctrl-shift-pageup"], panes::MoveTabLeft),
     command!("split_right", "Split right", Panes, PANES, ["ctrl-alt-h"], panes::SplitRight),
     command!("split_down", "Split down", Panes, PANES, ["ctrl-alt-v"], panes::SplitDown),
     command!("focus_next_pane", "Focus the next pane", Panes, PANES, ["ctrl-shift-a"], panes::FocusNextPane),
