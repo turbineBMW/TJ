@@ -567,7 +567,13 @@ impl Parser {
             }
             Some("conversation_reset") => vec![AgentEvent::ConversationReset],
             // A slash command Claude Code ran itself: its output, written as an assistant message.
-            Some("assistant") if m.get("local_command_run").is_some_and(|r| !r.is_null()) => {
+            // Built-in commands (`/context`) name themselves in `local_command_run`; a skill run
+            // as a local command (`/code-review`) only carries `local_command_source`.
+            Some("assistant")
+                if ["local_command_run", "local_command_source"]
+                    .iter()
+                    .any(|key| m.get(*key).is_some_and(|v| !v.is_null())) =>
+            {
                 let command = str_at(&m["local_command_run"], "command").unwrap_or_default();
                 let text =
                     blocks(m).filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n");
@@ -1023,6 +1029,27 @@ mod tests {
                 AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, .. }
             )),
             "a local command costs nothing and has no time worth showing: {turns:?}"
+        );
+    }
+
+    #[test]
+    fn a_skill_run_as_a_local_command_prints_its_output() {
+        // What `/code-review` sends when it finishes (Claude Code 2.1.332): no
+        // `local_command_run`, only `local_command_source`.
+        let events = Parser::default().parse(&json!({
+            "type": "assistant", "session_id": "s", "parent_tool_use_id": null,
+            "local_command_source": "<local-command-stdout>2 findings</local-command-stdout>",
+            "message": {
+                "model": "<synthetic>", "role": "assistant", "type": "message",
+                "content": [{ "type": "text", "text": "2 findings:\n\n1. src/a.rs:3 Off by one" }],
+            },
+        }));
+        assert_eq!(
+            events,
+            vec![AgentEvent::CommandOutput {
+                command: String::new(),
+                text: "2 findings:\n\n1. src/a.rs:3 Off by one".into()
+            }]
         );
     }
 
