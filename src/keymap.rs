@@ -17,6 +17,8 @@ pub fn init(cx: &mut App) {
     cx.bind_keys(crate::settings_view::bindings());
     // Moving through pull requests and sections in the GitHub tab.
     cx.bind_keys(crate::github_view::bindings());
+    // Commenting on lines of the review and sending the comments to the agent.
+    cx.bind_keys(crate::changes::bindings());
     // Moving through notes and acting on them in the Notes tab.
     cx.bind_keys(crate::notes_view::bindings());
     // The shortcuts settings can change: Vmux's pane and tab keys inside the main area, and the

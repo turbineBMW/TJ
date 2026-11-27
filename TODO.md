@@ -21,6 +21,7 @@ TJ should work entirely from the keyboard (ROADMAP.md, "Keyboard rules"). Still 
 - [ ] Moving through the threads in the sidebar itself, and opening a project's history.
 - [ ] The account, mode and model menus under the prompt box.
 - [ ] Thread and project right-click menus (rename, archive, delete, remove, project picture).
+- [x] Commenting on lines of the review and sending the comments to the agent (Shift+↑/↓, Enter, Ctrl+Enter).
 - [ ] Opening and folding tool cards, opening a long Bash card ("Click to expand"), adding a card to the prompt, and opening the review from the changes list.
 - [x] Settings: a modal driven from the keyboard, with every app shortcut changeable.
 

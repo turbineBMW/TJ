@@ -2583,86 +2583,55 @@ impl GitHubView {
                     }
                     Note::Draft(ix, draft) => {
                         let (ix, this) = (*ix, this.clone());
-                        frame(c.yellow)
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .px_3()
-                                    .py_1()
-                                    .bg(c.yellow.opacity(0.10))
-                                    .text_xs()
-                                    .child(pill("Pending", c.yellow))
-                                    .child(div().text_color(c.muted).child(if draft.start_line < draft.line {
-                                        format!("Lines {}–{}", draft.start_line, draft.line)
-                                    } else {
-                                        format!("Line {}", draft.line)
-                                    }))
-                                    .child(div().flex_1())
-                                    .child(
-                                        Button::new(SharedString::from(format!("drop-draft-{ix}")))
-                                            .xsmall()
-                                            .ghost()
-                                            .icon(IconName::Trash)
-                                            .tooltip("Remove this comment")
-                                            .on_click(move |_, _, cx| {
-                                                let _ = this.update(cx, |v, cx| {
-                                                    if ix < v.drafts.len() {
-                                                        v.drafts.remove(ix);
-                                                    }
-                                                    cx.notify();
-                                                });
-                                            }),
-                                    ),
-                            )
-                            .child(div().px_3().py_2().text_sm().child(TextView::markdown(
-                                SharedString::from(format!("draft-body-{ix}")),
-                                draft.body.clone(),
-                            )))
-                            .into_any_element()
+                        crate::line_comment::pending_card(
+                            ix,
+                            crate::line_comment::lines_label(draft.start_line, draft.line),
+                            draft.body.clone(),
+                            move |_, _, cx| {
+                                let _ = this.update(cx, |v, cx| {
+                                    if ix < v.drafts.len() {
+                                        v.drafts.remove(ix);
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                            cx,
+                        )
                     }
                     Note::Compose(input, reply) => {
                         let reply = *reply;
                         let (t1, t2, t3) = (this.clone(), this.clone(), this.clone());
-                        frame(c.accent)
-                            .p_2()
-                            .gap_2()
-                            .child(Textarea::new(input))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .justify_end()
-                                    .child(Button::new("compose-cancel").xsmall().ghost().label("Cancel").on_click(
-                                        move |_, _, cx| {
-                                            let _ = t1.update(cx, |v, cx| {
-                                                v.compose = None;
-                                                cx.notify();
-                                            });
-                                        },
-                                    ))
-                                    .when(!reply, |el| {
-                                        el.child(
-                                            Button::new("compose-now")
-                                                .xsmall()
-                                                .outline()
-                                                .label("Add single comment")
-                                                .disabled(busy)
-                                                .on_click(move |_, _, cx| {
-                                                    let _ = t2.update(cx, |v, cx| v.finish_compose(true, cx));
-                                                }),
-                                        )
-                                    })
-                                    .child(
-                                        Button::new("compose-add")
-                                            .xsmall()
-                                            .primary()
-                                            .label(if reply { "Reply" } else { "Add to review" })
-                                            .disabled(busy)
-                                            .on_click(move |_, _, cx| {
-                                                let _ = t3.update(cx, |v, cx| v.finish_compose(false, cx));
-                                            }),
-                                    ),
-                            )
-                            .into_any_element()
+                        let cancel =
+                            Button::new("compose-cancel").xsmall().ghost().label("Cancel").on_click(move |_, _, cx| {
+                                let _ = t1.update(cx, |v, cx| {
+                                    v.compose = None;
+                                    cx.notify();
+                                });
+                            });
+                        let now = (!reply).then(|| {
+                            Button::new("compose-now")
+                                .xsmall()
+                                .outline()
+                                .label("Add single comment")
+                                .disabled(busy)
+                                .on_click(move |_, _, cx| {
+                                    let _ = t2.update(cx, |v, cx| v.finish_compose(true, cx));
+                                })
+                        });
+                        let add = Button::new("compose-add")
+                            .xsmall()
+                            .primary()
+                            .label(if reply { "Reply" } else { "Add to review" })
+                            .disabled(busy)
+                            .on_click(move |_, _, cx| {
+                                let _ = t3.update(cx, |v, cx| v.finish_compose(false, cx));
+                            });
+                        crate::line_comment::compose_card(
+                            input,
+                            None,
+                            std::iter::once(cancel).chain(now).chain(std::iter::once(add)),
+                            cx,
+                        )
                     }
                     Note::Review => div().into_any_element(),
                 }

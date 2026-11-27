@@ -327,9 +327,11 @@ struct Attachment {
     preview: Arc<gpui_kit::Image>,
 }
 
-/// A tool call added to the prompt box, so the next message asks about it.
+/// Something added to the prompt box for the next message to carry: a tool call to ask
+/// about, or comments from the review.
 struct Quote {
-    tool_id: String,
+    /// The tool call's, so it's added once.
+    tool_id: Option<String>,
     /// The chip: the tool's icon, its name and its one-line summary.
     icon: gpui_kit::assets::IconName,
     label: String,
@@ -1174,10 +1176,10 @@ impl ThreadView {
     /// Add the tool call in row `ix` to the prompt box (once), and put the keyboard there.
     fn quote_tool(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Row::Tool(tool)) = self.rows.get(ix) else { return };
-        if !self.quotes.iter().any(|quote| quote.tool_id == tool.id) {
+        if !self.quotes.iter().any(|quote| quote.tool_id.as_ref() == Some(&tool.id)) {
             let summary = tool_card::header_summary(&tool.name, &tool.input, &tool.summary, &self.project_dir());
             self.quotes.push(Quote {
-                tool_id: tool.id.clone(),
+                tool_id: Some(tool.id.clone()),
                 icon: tool_card::kind(&tool.name).1,
                 label: format!("{} · {}", tool_card::title(&tool.name), truncate(&summary, 60)),
                 text: tool_card::quote(&tool.name, &tool.input, &summary),
@@ -1185,6 +1187,27 @@ impl ThreadView {
         }
         self.prompt.update(cx, |p, cx| p.focus(window, cx));
         cx.notify();
+    }
+
+    /// Add `text` to the prompt box as a chip that reads `label` (the next message carries
+    /// it), and put the keyboard there.
+    pub fn add_quote(
+        &mut self,
+        icon: gpui_kit::assets::IconName,
+        label: String,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.quotes.push(Quote { tool_id: None, icon, label, text });
+        self.prompt.update(cx, |p, cx| p.focus(window, cx));
+        cx.notify();
+    }
+
+    /// The chips in the prompt box, and what each carries.
+    #[cfg(test)]
+    pub fn quote_parts(&self) -> (Vec<String>, Vec<String>) {
+        self.quotes.iter().map(|q| (q.label.clone(), q.text.clone())).unzip()
     }
 
     fn remove_quote(&mut self, ix: usize, cx: &mut Context<Self>) {
