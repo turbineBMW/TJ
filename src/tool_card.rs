@@ -10,7 +10,7 @@ use std::{cell::Cell, path::Path, rc::Rc, sync::Arc, time::Duration};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, dialog::Dialog, spinner::Spinner};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, spinner::Spinner};
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use serde_json::Value;
 
@@ -231,6 +231,12 @@ impl ShellText {
         self.output = (!output.trim().is_empty()).then(|| Highlighted::output(output));
         self.failed = failed;
         self.shorten();
+    }
+
+    /// What the command printed, as shown.
+    #[cfg(test)]
+    pub fn output_text(&self) -> String {
+        self.output.as_ref().map(|o| o.text.to_string()).unwrap_or_default()
     }
 
     /// Whether the card leaves some of the text out, so it opens in the dialog.
@@ -721,46 +727,21 @@ fn shell_body(
         .into_any_element()
 }
 
-/// A Bash card opened in a dialog: the whole command and output, scrolling inside it.
-pub fn shell_dialog(
-    dialog: Dialog,
-    summary: &str,
-    shell: &ShellText,
-    took: Option<Duration>,
-    window: &mut Window,
-    cx: &mut App,
-) -> Dialog {
+/// A shell's whole command and output, in the Bash card's colours, as the activity dialog
+/// shows it, with how long it took under it when that's known.
+pub fn shell_panel(shell: &ShellText, took: Option<Duration>, cx: &App) -> AnyElement {
     let look = look(Family::Shell, cx);
-    let theme = cx.theme();
-    let width = (window.viewport_size().width * 0.85).min(px(1400.));
-    let title = h_flex()
-        .gap_2()
-        .min_w_0()
-        .child(Icon::new(IconName::SquareTerminal).small())
-        .child(div().flex_shrink_0().font_weight(FontWeight::SEMIBOLD).child("Bash"))
-        .child(
-            div()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_color(theme.muted_foreground)
-                .child(summary.to_string()),
-        );
-    dialog.w(width).title(title).child(
-        div()
-            .rounded_md()
-            .border_1()
-            .border_color(look.border)
-            .when_some(look.body_bg, |el, bg| el.bg(bg))
-            .p_4()
-            .text_sm()
-            .font_family(theme.mono_font_family.clone())
-            .child(shell_body(&shell.command, false, shell.output.as_ref(), shell.failed, &look))
-            .when_some(took, |el, took| {
-                el.child(div().pt_2().text_color(look.dim.opacity(0.8)).child(took_label(took)))
-            }),
-    )
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(look.border)
+        .when_some(look.body_bg, |el, bg| el.bg(bg))
+        .p_4()
+        .text_sm()
+        .font_family(cx.theme().mono_font_family.clone())
+        .child(shell_body(&shell.command, false, shell.output.as_ref(), shell.failed, &look))
+        .when_some(took, |el, took| el.child(div().pt_2().text_color(look.dim.opacity(0.8)).child(took_label(took))))
+        .into_any_element()
 }
 
 /// Old lines in red with `-`, new ones in green with `+`, unchanged ones plain.
@@ -928,7 +909,8 @@ fn clean(text: &str) -> String {
     out.trim_end().to_string()
 }
 
-fn first_line(text: &str) -> String {
+/// The first line with something on it, trimmed.
+pub fn first_line(text: &str) -> String {
     text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim().to_string()
 }
 

@@ -315,11 +315,15 @@ pub enum AgentEvent {
         tool_use_id: String,
         text: String,
     },
-    /// A subagent finished; `summary` is its report.
+    /// A subagent finished; `summary` is its report. Claude Code reports a background shell
+    /// the same way, with a line saying how it exited.
     SubagentFinished {
         tool_use_id: String,
         status: String,
         summary: Option<String>,
+        /// Where Claude Code kept what the task printed (a background shell's output).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_file: Option<String>,
     },
     /// What a model response just added to the turn's cost, priced from its tokens while the
     /// turn runs. The turn's own cost in [`AgentEvent::TurnFinished`] replaces these.

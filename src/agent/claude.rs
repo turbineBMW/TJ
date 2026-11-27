@@ -554,6 +554,7 @@ impl Parser {
                     tool_use_id,
                     status: str_at(m, "status").unwrap_or_else(|| "completed".into()),
                     summary: str_at(m, "summary"),
+                    output_file: str_at(m, "output_file"),
                 }],
                 None => Vec::new(),
             },
@@ -1220,6 +1221,35 @@ mod tests {
         );
         let turns = events.iter().filter(|e| matches!(e, AgentEvent::TurnFinished { .. })).count();
         assert_eq!(turns, 2, "Claude reports the subagent's result in a turn of its own");
+    }
+
+    #[test]
+    fn a_background_shell_reports_where_its_output_went() {
+        let events = replay("2.1.332-background.jsonl");
+        let (id, input) = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolStarted { id, name, input } if name == "Bash" => Some((id.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("a Bash call");
+        assert_eq!(input["run_in_background"], true);
+        // The call returns at once, naming the file the output goes to.
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::ToolFinished { id: i, output, .. } if *i == id && output.contains("Output is being written to: "))
+        ));
+        let finished = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::SubagentFinished { tool_use_id, status, summary, output_file } if *tool_use_id == id => {
+                    Some((status.clone(), summary.clone(), output_file.clone()))
+                }
+                _ => None,
+            })
+            .expect("the shell's notification");
+        assert_eq!(finished.0, "completed");
+        assert!(finished.1.unwrap().contains("exit code 0"));
+        assert!(finished.2.unwrap().ends_with(".output"));
     }
 
     #[test]

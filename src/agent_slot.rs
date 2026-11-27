@@ -1,17 +1,19 @@
 //! A project's one agent tab: the conversation of the thread picked in the sidebar. Picking
 //! another thread swaps what's in it; the panes and terminals around it stay as they are.
 //!
-//! It also builds the thread's status column (the overview, the project's changed files and the
-//! agent's numbers), which the workspace shows at the right of the window, in the frame like the
+//! It also builds the thread's status column (the overview, the thread's background shells and
+//! subagents,
+//! the project's changed files and the agent's numbers), which the workspace shows at the right of the window, in the frame like the
 //! sidebar, whichever pane is focused. The changes and the numbers are cards in the sidebar's
 //! selected-row colour.
 
 use std::path::PathBuf;
 
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, button::Button, button::ButtonVariants as _};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, button::Button, button::ButtonVariants as _};
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
+use crate::activity::{Kind, State};
 use crate::changes::{ChangeKind, ProjectChanges};
 use crate::thread::ThreadView;
 
@@ -92,6 +94,7 @@ impl AgentSlot {
                 .pb_2()
                 // The overview takes the space, and scrolls when it runs out.
                 .child(self.overview(&view, cx).flex_1().min_h_0())
+                .children(self.activity_list(&view, card, cx).map(section))
                 .children(self.changes_list(&view, card, cx).map(section))
                 .child(section(self.metrics(&view, cx)).test_support())
                 .into_any_element(),
@@ -341,6 +344,82 @@ impl AgentSlot {
             )
             .children(quiet)
             .children(rows)
+    }
+
+    /// The thread's background shells and subagents still running, newest first; none when
+    /// nothing is. One opens in a dialog with its output, where ← and → reach the finished
+    /// ones too.
+    fn activity_list(&self, view: &Entity<ThreadView>, card: Hsla, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let mut items = view.read(cx).activity(true);
+        items.retain(|item| item.state == State::Running);
+        if items.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let (muted, accent) = (theme.muted_foreground, theme.primary);
+        let running = items.len();
+        let rows: Vec<_> = items
+            .into_iter()
+            .rev()
+            .enumerate()
+            .map(|(ix, item)| {
+                let (thread, id) = (view.downgrade(), item.id.clone());
+                h_flex()
+                    .id(SharedString::from(format!("activity-{ix}")))
+                    .test_support()
+                    .gap_2()
+                    .px_3()
+                    .py_0p5()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(card))
+                    .on_click(move |_, window, cx| {
+                        thread.update(cx, |t, cx| t.open_activity(&id, window, cx)).ok();
+                    })
+                    .child(Icon::new(item.kind.icon()).xsmall().text_color(if item.kind == Kind::Shell {
+                        muted
+                    } else {
+                        accent
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_sm()
+                            .child(if item.title.is_empty() { item.kind.label().to_string() } else { item.title }),
+                    )
+                    .children(item.note.map(|note| {
+                        div()
+                            .flex_shrink_0()
+                            .max_w(px(90.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(note)
+                    }))
+                    .child(div().flex_shrink_0().child(crate::activity::state_mark(item.state, cx)))
+            })
+            .collect();
+        Some(
+            v_flex()
+                .id("activity")
+                .max_h(relative(0.35))
+                .child(
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Activity ·")
+                        .child(div().text_color(accent).child(format!("{running} running"))),
+                )
+                .child(div().id("activity-list").pb_1().overflow_y_scroll().children(rows)),
+        )
     }
 
     /// The project's uncommitted changes; a dot marks files this thread edited. A file opens

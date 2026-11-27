@@ -18,6 +18,7 @@ use gpui_kit::component::{
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use serde_json::Value;
 
+use crate::activity;
 use crate::agent::{
     AgentEvent, AgentSession, Decision, ElicitAction, PermissionMode, PermissionRequest, ScriptedAgent, ScriptedCall,
     claude::{self, ClaudeSession, SessionOptions},
@@ -219,6 +220,64 @@ struct ToolRow {
     took: Option<std::time::Duration>,
     /// When this call started a subagent: what it's doing and what it did.
     subagent: Option<Subagent>,
+    /// When this call left a shell running in the background: where its output goes, and how
+    /// it ended.
+    background: Option<Background>,
+}
+
+/// A shell Claude left running in the background (Bash with `run_in_background`, or Monitor).
+/// Its call returns at once; Claude Code reports later, as a task, when it ends.
+#[derive(Default)]
+struct Background {
+    /// The file Claude Code writes what it prints to.
+    output_file: Option<PathBuf>,
+    /// Set when it ends: how, and Claude Code's line about it.
+    ended: Option<(activity::State, String)>,
+}
+
+/// A tool row as an entry in the activity list, if it's a shell command, a background shell or
+/// a subagent.
+fn activity_item(tool: &ToolRow) -> Option<activity::Item> {
+    let text = |key: &str| tool.input.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let state = |status: ToolStatus| match status {
+        ToolStatus::Running => activity::State::Running,
+        ToolStatus::Done => activity::State::Done,
+        ToolStatus::Failed => activity::State::Failed,
+    };
+    let command = || text("description").or(text("command")).map(tool_card::first_line).unwrap_or_default();
+    let (kind, title, state, note) = match (tool.name.as_str(), &tool.background, &tool.subagent) {
+        (_, Some(background), _) => {
+            let state = match &background.ended {
+                Some((state, _)) => *state,
+                // The call that started it failed: it never ran.
+                None if tool.status == ToolStatus::Failed => activity::State::Failed,
+                None => activity::State::Running,
+            };
+            (activity::Kind::Background, command(), state, Some("background".to_string()))
+        }
+        ("Bash", None, _) => (activity::Kind::Shell, command(), state(tool.status), tool.took.map(activity::took)),
+        ("Agent" | "Task", _, sub) => {
+            let sub = sub.as_ref();
+            let agent_type = sub.and_then(|s| s.agent_type.clone()).or(text("subagent_type").map(str::to_owned));
+            let tools = sub.and_then(|s| s.tool_uses).map(|n| format!("{n} tool{}", if n == 1 { "" } else { "s" }));
+            let note = [agent_type, tools].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+            (activity::Kind::Subagent, tool.summary.clone(), state(tool.status), Some(note).filter(|n| !n.is_empty()))
+        }
+        _ => return None,
+    };
+    Some(activity::Item { id: tool.id.clone(), kind, title, state, note })
+}
+
+/// Whether a call leaves a shell running after it returns.
+fn is_background(name: &str, input: &Value) -> bool {
+    name == "Monitor" || input.get("run_in_background").and_then(Value::as_bool) == Some(true)
+}
+
+/// The output file named in a background call's result ("Output is being written to: <path>.").
+fn background_output_file(output: &str) -> Option<PathBuf> {
+    let rest = output.split_once("Output is being written to: ")?.1;
+    let path = rest.split_whitespace().next()?.trim_end_matches('.');
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 /// A subagent's work, shown inside the Agent tool row that started it.
@@ -580,7 +639,8 @@ impl ThreadView {
                 }
             }
         }
-        // Whatever was waiting belonged to a process that is gone.
+        // Whatever was waiting or running belonged to a process that is gone.
+        self.end_orphaned_shells();
         for row in &mut self.rows {
             if let Row::Approval(row) = row
                 && row.outcome.is_none()
@@ -1759,15 +1819,89 @@ impl ThreadView {
         self.remeasure(ix, cx);
     }
 
-    /// Open a Bash card in a dialog, where all of its command and output can be read.
+    /// Open a Bash card in the activity dialog, where all of its command and output can be
+    /// read, with the thread's other commands a step away.
     fn expand_tool(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Row::Tool(tool)) = self.rows.get(ix) else { return };
-        let Some(shell) = tool.shell.clone() else { return };
-        let took = tool.took;
-        let summary = tool_card::header_summary(&tool.name, &tool.input, &tool.summary, &self.project_dir());
-        window.open_dialog(cx, move |dialog, window, cx| {
-            tool_card::shell_dialog(dialog, &summary, &shell, took, window, cx)
-        });
+        let id = tool.id.clone();
+        self.open_activity(&id, window, cx);
+    }
+
+    /// The thread's background shells and subagents (`tasks`), or else its ordinary shell
+    /// commands, oldest first.
+    pub fn activity(&self, tasks: bool) -> Vec<activity::Item> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Tool(tool) => activity_item(tool).filter(|item| item.kind.is_task() == tasks),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Everything the activity dialog shows for tool call `id`.
+    pub fn activity_detail(&self, id: &str) -> Option<activity::Detail> {
+        let Row::Tool(tool) = &self.rows[self.tool_row(id)?] else { return None };
+        let item = activity_item(tool)?;
+        let text = |key: &str| tool.input.get(key).and_then(Value::as_str).map(str::to_owned);
+        let sub = tool.subagent.as_ref();
+        let report = sub.and_then(|s| s.summary.clone());
+        let mut log = sub.map(|s| s.log.clone()).unwrap_or_default();
+        // The subagent's last message is usually its report, which has a section of its own.
+        if let (Some(last), Some(report)) = (log.last(), &report)
+            && report.trim().starts_with(last.trim_end_matches('…'))
+        {
+            log.pop();
+        }
+        Some(activity::Detail {
+            item,
+            command: text("command").unwrap_or_default(),
+            shell: tool.shell.clone(),
+            took: tool.took,
+            output: tool.output.clone(),
+            output_file: tool.background.as_ref().and_then(|b| b.output_file.clone()),
+            ended: tool
+                .background
+                .as_ref()
+                .and_then(|b| b.ended.as_ref().map(|(_, line)| line.clone()))
+                .or_else(|| sub.and_then(|s| s.finished.as_deref().map(capitalize))),
+            agent_type: sub.and_then(|s| s.agent_type.clone()).or_else(|| text("subagent_type")),
+            prompt: text("prompt"),
+            now: sub.and_then(|s| s.now.clone()).filter(|_| tool.status == ToolStatus::Running),
+            log,
+            report,
+        })
+    }
+
+    /// Show tool call `id` in a dialog, with the thread's others of its sort a step away (←
+    /// and →): background shells and subagents together, ordinary commands together.
+    pub fn open_activity(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<activity::ActivityViewer>> {
+        let detail = self.activity_detail(id)?;
+        let ids = self.activity(detail.item.kind.is_task()).into_iter().map(|item| item.id).collect();
+        let thread = cx.entity();
+        let viewer = cx.new(|cx| activity::ActivityViewer::new(thread, id, ids, Some(detail), cx));
+        let shown = viewer.clone();
+        window.open_dialog(cx, move |dialog, window, cx| activity::dialog(dialog, &shown, window, cx));
+        viewer.update(cx, |v, cx| v.focus(window, cx));
+        Some(viewer)
+    }
+
+    /// Open what's running in the background (the newest, if several), or else the newest
+    /// background shell or subagent. Says so when there's none.
+    pub fn open_latest_activity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = self.activity(true);
+        let latest = items.iter().rev().find(|item| item.state == activity::State::Running).or(items.last());
+        match latest.map(|item| item.id.clone()) {
+            Some(id) => {
+                self.open_activity(&id, window, cx);
+            }
+            None => window.push_notification("Nothing has run in the background in this thread.", cx),
+        }
     }
 
     /// The Markdown files Claude's replies in this thread link to, oldest first, each once.
@@ -1887,7 +2021,7 @@ impl ThreadView {
     fn track_background(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::ToolStarted { id, name, input } => {
-                if name == "Monitor" || input.get("run_in_background").and_then(Value::as_bool) == Some(true) {
+                if is_background(name, input) {
                     self.background.insert(id.clone());
                 }
             }
@@ -1898,6 +2032,18 @@ impl ThreadView {
             }
             AgentEvent::Exited { .. } => self.background.clear(),
             _ => {}
+        }
+    }
+
+    /// Background shells end with the process that ran them; one that never reported back is
+    /// marked as no longer running.
+    fn end_orphaned_shells(&mut self) {
+        for row in &mut self.rows {
+            if let Row::Tool(ToolRow { background: Some(background), .. }) = row
+                && background.ended.is_none()
+            {
+                background.ended = Some((activity::State::Gone, "No longer running: its Claude process ended.".into()));
+            }
         }
     }
 
@@ -2039,7 +2185,7 @@ impl ThreadView {
             AgentEvent::SubagentText { tool_use_id, text } => {
                 self.with_subagent(&tool_use_id, cx, |sub| sub.log.push(truncate(text.trim(), 600)));
             }
-            AgentEvent::SubagentFinished { tool_use_id, status, summary } => {
+            AgentEvent::SubagentFinished { tool_use_id, status, summary, output_file } => {
                 if let Some(ix) = self.subagent_row(&tool_use_id)
                     && let Row::Tool(tool) = &mut self.rows[ix]
                 {
@@ -2056,6 +2202,17 @@ impl ThreadView {
                     ));
                     self.plain_current = None;
                     self.remeasure(ix, cx);
+                } else if let Some(ix) = self.tool_row(&tool_use_id)
+                    && let Row::Tool(tool) = &mut self.rows[ix]
+                    && let Some(background) = &mut tool.background
+                {
+                    // A background shell: how it exited, and where its output is.
+                    let state = if status == "completed" { activity::State::Done } else { activity::State::Failed };
+                    background.ended = Some((state, summary.unwrap_or_else(|| capitalize(&status))));
+                    if let Some(file) = output_file {
+                        background.output_file = Some(PathBuf::from(file));
+                    }
+                    cx.notify();
                 }
             }
             AgentEvent::CommandOutput { command, text } => {
@@ -2145,6 +2302,7 @@ impl ThreadView {
                 self.plain.push(line);
                 self.plain_current = None;
                 let expanded = tool_card::opens_by_default(&name);
+                let background = is_background(&name, &input).then(Background::default);
                 let shell = (name == "Bash").then(|| {
                     tool_card::ShellText::new(input.get("command").and_then(Value::as_str).unwrap_or_default())
                 });
@@ -2163,6 +2321,7 @@ impl ThreadView {
                         started: (!self.replaying).then(std::time::Instant::now),
                         took: None,
                         subagent: None,
+                        background,
                     }),
                     cx,
                 );
@@ -2175,6 +2334,13 @@ impl ThreadView {
                         if !images.is_empty() {
                             tool.expanded = true;
                             tool.images = images;
+                        }
+                        if let Some(background) = &mut tool.background {
+                            if is_error {
+                                background.ended = Some((activity::State::Failed, tool_card::first_line(&output)));
+                            } else if let Some(file) = background_output_file(&output) {
+                                background.output_file = Some(file);
+                            }
                         }
                         // A background subagent's call returns at once ("Async agent launched");
                         // the row stays working until the subagent itself finishes.
@@ -2297,6 +2463,7 @@ impl ThreadView {
             AgentEvent::Exited { code, stderr } => {
                 self.agent = None;
                 self._pump = None;
+                self.end_orphaned_shells();
                 self.current_text = None;
                 // The turn it was on won't report its cost now; keep what it was estimated at.
                 self.cost_usd += std::mem::take(&mut self.cost_estimate);
@@ -3599,7 +3766,12 @@ mod tests {
             assert!(t.has_agent(), "so it isn't stopped");
 
             t.handle(
-                AgentEvent::SubagentFinished { tool_use_id: "bg".into(), status: "completed".into(), summary: None },
+                AgentEvent::SubagentFinished {
+                    tool_use_id: "bg".into(),
+                    status: "completed".into(),
+                    summary: None,
+                    output_file: None,
+                },
                 cx,
             );
             assert!(t.idle_for().is_some());
@@ -3791,7 +3963,15 @@ mod tests {
                 cx,
             );
             let summary = Some("Build the app".to_string());
-            t.handle(AgentEvent::SubagentFinished { tool_use_id: "b".into(), status: "completed".into(), summary }, cx);
+            t.handle(
+                AgentEvent::SubagentFinished {
+                    tool_use_id: "b".into(),
+                    status: "completed".into(),
+                    summary,
+                    output_file: None,
+                },
+                cx,
+            );
         });
         thread.read_with(cx, |t, _| {
             let Some(Row::Tool(tool)) = t.rows.last() else { panic!("not a tool row") };
@@ -3859,6 +4039,150 @@ mod tests {
         assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
         thread.update_in(cx, |t, window, cx| t.open_latest_markdown(window, cx));
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn a_reopened_thread_shows_its_unfinished_background_shell_as_gone(cx: &mut TestAppContext) {
+        use crate::activity::State;
+        let path = std::env::temp_dir().join(format!("tj-replay-{}.jsonl", crate::store::new_id()));
+        let setup = super::ThreadSetup { transcript: Some(path.clone()), ..Default::default() };
+        let (window, _thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let first = cx.update(|window, cx| {
+            cx.new(|cx| ThreadView::open(setup.clone(), Backend::Scripted(Vec::new()), window, cx))
+        });
+        first.update(cx, |t, cx| {
+            t.attach_scripted(ScriptedAgent::start(Vec::new()).0);
+            t.send("Watch it", cx);
+            for event in fixture("2.1.332-background.jsonl") {
+                // Without its notification, as if TJ quit while it ran.
+                if !matches!(event, AgentEvent::SubagentFinished { .. }) {
+                    t.handle(event, cx);
+                }
+            }
+        });
+        let state = |t: &ThreadView| t.activity(true).iter().map(|i| i.state).collect::<Vec<_>>();
+        assert_eq!(first.read_with(cx, |t, _| state(t)), [State::Running]);
+        let second =
+            cx.update(|window, cx| cx.new(|cx| ThreadView::open(setup, Backend::Scripted(Vec::new()), window, cx)));
+        assert_eq!(second.read_with(cx, |t, _| state(t)), [State::Gone]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[gpui_kit::test]
+    fn background_shells_and_subagents_are_listed_and_open_in_a_dialog(cx: &mut TestAppContext) {
+        use crate::activity::{Kind, State};
+        use gpui_kit::component::WindowExt as _;
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("tj-activity-thread-{}", crate::store::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("b1.output");
+        std::fs::write(&file, "tick 1\n").unwrap();
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let started = |id: &str, name: &str, input: serde_json::Value| AgentEvent::ToolStarted {
+            id: id.into(),
+            name: name.into(),
+            input,
+        };
+        let finished = |id: &str, output: String| AgentEvent::ToolFinished {
+            id: id.into(),
+            output,
+            is_error: false,
+            images: Vec::new(),
+            took_ms: Some(40),
+        };
+        thread.update(cx, |t, cx| {
+            t.handle(started("s1", "Bash", json!({ "command": "ls", "description": "List files" })), cx);
+            t.handle(finished("s1", "a\nb".into()), cx);
+            t.handle(started("r1", "Read", json!({ "file_path": "/x" })), cx);
+            t.handle(finished("r1", "x".into()), cx);
+            let input = json!({ "command": "./tick.sh", "run_in_background": true });
+            t.handle(started("b1", "Bash", input), cx);
+            let output = format!(
+                "Command running in background with ID: b1. Output is being written to: {}. You will be notified when it completes.",
+                file.display()
+            );
+            t.handle(finished("b1", output), cx);
+            let input = json!({ "description": "Survey", "prompt": "Look around", "subagent_type": "Explore" });
+            t.handle(started("a1", "Agent", input), cx);
+            let description = "Survey".to_string();
+            t.handle(AgentEvent::SubagentStarted { tool_use_id: "a1".into(), description, agent_type: None }, cx);
+        });
+        // The status column lists what runs in the background; ordinary commands stay apart.
+        let shape = |items: Vec<crate::activity::Item>| {
+            items.into_iter().map(|i| (i.id, i.kind, i.state, i.title, i.note)).collect::<Vec<_>>()
+        };
+        let (tasks, commands) = thread.read_with(cx, |t, _| (shape(t.activity(true)), shape(t.activity(false))));
+        let item = |id: &str, kind, state, title: &str, note: &str| {
+            (id.to_string(), kind, state, title.to_string(), Some(note.to_string()))
+        };
+        assert_eq!(
+            tasks,
+            [
+                item("b1", Kind::Background, State::Running, "./tick.sh", "background"),
+                item("a1", Kind::Subagent, State::Running, "Survey", "Explore"),
+            ]
+        );
+        assert_eq!(commands, [item("s1", Kind::Shell, State::Done, "List files", "40ms")], "Read isn't activity");
+
+        // Ctrl+Shift+J's choice: what's running in the background, newest first.
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        thread.update_in(cx, |t, window, cx| t.open_latest_activity(window, cx));
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+        cx.update(|window, cx| window.close_dialog(cx));
+
+        // The background shell's output is read from its file, and again when it grows.
+        let viewer = thread.update_in(cx, |t, window, cx| t.open_activity("b1", window, cx)).expect("a viewer");
+        let shown = |cx: &mut VisualTestContext| {
+            viewer.read_with(cx, |v, _| (v.position(), v.detail().map(|d| d.item.id.clone()), v.tail_text()))
+        };
+        assert_eq!(shown(cx), ((0, 2), Some("b1".into()), Some("tick 1".into())));
+        std::fs::write(&file, "tick 1\ntick 2\n").unwrap();
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(shown(cx).2.as_deref(), Some("tick 1\ntick 2"));
+
+        // It ends when Claude Code says so.
+        thread.update(cx, |t, cx| {
+            let summary = Some("Background command \"./tick.sh\" completed (exit code 0)".to_string());
+            let event = AgentEvent::SubagentFinished {
+                tool_use_id: "b1".into(),
+                status: "completed".into(),
+                summary,
+                output_file: Some(file.display().to_string()),
+            };
+            t.handle(event, cx);
+        });
+        let detail = viewer.read_with(cx, |v, _| v.detail().cloned()).unwrap();
+        assert_eq!(detail.item.state, State::Done);
+        assert!(detail.ended.unwrap().contains("exit code 0"));
+
+        // ← and → step through the others, and stop at the ends.
+        viewer.update(cx, |v, cx| v.step(1, cx));
+        assert_eq!(shown(cx).0, (1, 2));
+        let detail = viewer.read_with(cx, |v, _| v.detail().cloned()).unwrap();
+        assert_eq!((detail.prompt.as_deref(), detail.agent_type.as_deref()), (Some("Look around"), Some("Explore")));
+        viewer.update(cx, |v, cx| v.step(1, cx));
+        assert_eq!(shown(cx).0, (1, 2));
+        viewer.update(cx, |v, cx| v.step(-2, cx));
+        assert_eq!(shown(cx).1.as_deref(), Some("a1"));
+        cx.update(|window, cx| window.close_dialog(cx));
+
+        // An ordinary command opens from its card, among the thread's other commands.
+        let viewer = thread.update_in(cx, |t, window, cx| t.open_activity("s1", window, cx)).expect("a viewer");
+        let position = viewer.read_with(cx, |v, _| (v.position(), v.detail().map(|d| d.item.kind)));
+        assert_eq!(position, ((0, 1), Some(Kind::Shell)));
+        cx.update(|window, cx| window.close_dialog(cx));
+
+        // A background shell still running when the process ends is marked as gone.
+        thread.update(cx, |t, cx| {
+            t.handle(started("b2", "Monitor", json!({ "command": "tail -f log" })), cx);
+            t.handle(AgentEvent::Exited { code: Some(0), stderr: String::new() }, cx);
+        });
+        let last = thread.read_with(cx, |t, _| t.activity(true).pop().unwrap());
+        assert_eq!((last.id.as_str(), last.kind, last.state), ("b2", Kind::Background, State::Gone));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[gpui_kit::test]
