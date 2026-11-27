@@ -1012,6 +1012,299 @@ pub fn checkout(root: &Path, token: Option<&str>, remote: &str, pr: &PullRequest
     Ok(local)
 }
 
+// ---------- actions ----------
+
+/// Which workflow runs the Actions page lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunFilter {
+    #[default]
+    All,
+    Running,
+    Failed,
+}
+
+impl RunFilter {
+    pub const ALL: [RunFilter; 3] = [RunFilter::All, RunFilter::Running, RunFilter::Failed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RunFilter::All => "All",
+            RunFilter::Running => "Running",
+            RunFilter::Failed => "Failed",
+        }
+    }
+
+    /// The API's `status` query for it.
+    fn status(self) -> Option<&'static str> {
+        match self {
+            RunFilter::All => None,
+            RunFilter::Running => Some("in_progress"),
+            RunFilter::Failed => Some("failure"),
+        }
+    }
+}
+
+/// Where a run, job or step stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunState {
+    Queued,
+    Running,
+    Passed,
+    Failed,
+    Cancelled,
+    Skipped,
+}
+
+impl RunState {
+    /// From the API's `status` and `conclusion`.
+    pub fn of(status: &str, conclusion: &str) -> RunState {
+        match status {
+            "completed" => match conclusion {
+                "success" | "neutral" => RunState::Passed,
+                "cancelled" => RunState::Cancelled,
+                "skipped" | "stale" => RunState::Skipped,
+                _ => RunState::Failed,
+            },
+            "in_progress" => RunState::Running,
+            _ => RunState::Queued,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RunState::Queued => "Queued",
+            RunState::Running => "In progress",
+            RunState::Passed => "Success",
+            RunState::Failed => "Failure",
+            RunState::Cancelled => "Cancelled",
+            RunState::Skipped => "Skipped",
+        }
+    }
+
+    /// Still going: queued or running.
+    pub fn active(self) -> bool {
+        matches!(self, RunState::Queued | RunState::Running)
+    }
+}
+
+/// A run of a workflow.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowRun {
+    pub id: u64,
+    /// The run's number within its workflow (`#126`).
+    pub number: u64,
+    pub attempt: u64,
+    pub workflow: String,
+    /// What GitHub shows as its title: the commit headline or the pull request's title.
+    pub title: String,
+    /// `push`, `pull_request`, `schedule`, `workflow_dispatch`, …
+    pub event: String,
+    pub branch: String,
+    pub sha: String,
+    pub actor: String,
+    pub state: RunState,
+    pub started_at: String,
+    pub updated_at: String,
+    pub url: String,
+}
+
+pub fn workflow_runs(token: &str, remote: &Remote, filter: RunFilter) -> anyhow::Result<Vec<WorkflowRun>> {
+    let mut path = format!("repos/{}/actions/runs?per_page=50", remote.slug());
+    if let Some(status) = filter.status() {
+        path.push_str(&format!("&status={status}"));
+    }
+    Ok(parse_runs(&api(token, "GET", &path, None)?))
+}
+
+pub fn parse_runs(v: &Value) -> Vec<WorkflowRun> {
+    v["workflow_runs"].as_array().into_iter().flatten().map(parse_run).collect()
+}
+
+fn parse_run(v: &Value) -> WorkflowRun {
+    let text = |key: &str| v[key].as_str().unwrap_or("").to_string();
+    WorkflowRun {
+        id: v["id"].as_u64().unwrap_or(0),
+        number: v["run_number"].as_u64().unwrap_or(0),
+        attempt: v["run_attempt"].as_u64().unwrap_or(1),
+        workflow: text("name"),
+        title: text("display_title"),
+        event: text("event"),
+        branch: text("head_branch"),
+        sha: text("head_sha"),
+        actor: login(if v["triggering_actor"].is_object() { &v["triggering_actor"] } else { &v["actor"] }),
+        state: RunState::of(v["status"].as_str().unwrap_or(""), v["conclusion"].as_str().unwrap_or("")),
+        started_at: v["run_started_at"].as_str().or(v["created_at"].as_str()).unwrap_or("").to_string(),
+        updated_at: text("updated_at"),
+        url: text("html_url"),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Step {
+    pub name: String,
+    pub state: RunState,
+    pub started_at: String,
+    pub completed_at: String,
+}
+
+/// A job of a run, with its steps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Job {
+    pub id: u64,
+    pub name: String,
+    pub state: RunState,
+    pub started_at: String,
+    pub completed_at: String,
+    pub url: String,
+    pub steps: Vec<Step>,
+}
+
+/// The jobs of a run's latest attempt.
+pub fn run_jobs(token: &str, remote: &Remote, run: u64) -> anyhow::Result<Vec<Job>> {
+    let v = api(token, "GET", &format!("repos/{}/actions/runs/{run}/jobs?per_page=100", remote.slug()), None)?;
+    Ok(parse_jobs(&v))
+}
+
+pub fn parse_jobs(v: &Value) -> Vec<Job> {
+    let state = |v: &Value| RunState::of(v["status"].as_str().unwrap_or(""), v["conclusion"].as_str().unwrap_or(""));
+    let text = |v: &Value, key: &str| v[key].as_str().unwrap_or("").to_string();
+    v["jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|j| Job {
+            id: j["id"].as_u64().unwrap_or(0),
+            name: text(j, "name"),
+            state: state(j),
+            started_at: text(j, "started_at"),
+            completed_at: text(j, "completed_at"),
+            url: text(j, "html_url"),
+            steps: j["steps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|s| Step {
+                    name: text(s, "name"),
+                    state: state(s),
+                    started_at: text(s, "started_at"),
+                    completed_at: text(s, "completed_at"),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Run the whole workflow again, or (`failed_only`) just the jobs that failed.
+pub fn rerun(token: &str, remote: &Remote, run: u64, failed_only: bool) -> anyhow::Result<()> {
+    let what = if failed_only { "rerun-failed-jobs" } else { "rerun" };
+    api(token, "POST", &format!("repos/{}/actions/runs/{run}/{what}", remote.slug()), None)?;
+    Ok(())
+}
+
+pub fn cancel_run(token: &str, remote: &Remote, run: u64) -> anyhow::Result<()> {
+    api(token, "POST", &format!("repos/{}/actions/runs/{run}/cancel", remote.slug()), None)?;
+    Ok(())
+}
+
+/// The part of a finished job's log worth reading (see [`log_excerpt`]).
+pub fn job_log(token: &str, remote: &Remote, job: u64) -> anyhow::Result<Vec<String>> {
+    let path = format!("repos/{}/actions/jobs/{job}/logs", remote.slug());
+    // Logs are full of colour codes, which gh won't print without being told it may.
+    let raw = match run_gh(Some(token), &["api", "--allow-escape-sequences", &path], None) {
+        Err(err) if format!("{err}").contains("unknown flag") => run_gh(Some(token), &["api", &path], None)?,
+        other => other?,
+    };
+    Ok(log_excerpt(&raw))
+}
+
+/// The most lines of a log shown.
+const LOG_LINES: usize = 400;
+
+/// A job's log made readable: no timestamps or colour codes, the runner's markers turned into
+/// plain text. When something failed, it's the step that failed, up to its error; otherwise the
+/// end of the log.
+pub fn log_excerpt(raw: &str) -> Vec<String> {
+    let lines: Vec<String> = raw
+        .lines()
+        .map(|line| {
+            // Each line starts with an RFC 3339 time and a space (the first after a BOM).
+            let line = line.trim_start_matches('\u{feff}');
+            let line = match line.split_once(' ') {
+                Some((at, rest)) if at.len() >= 20 && at.ends_with('Z') && at.as_bytes()[4] == b'-' => rest,
+                _ => line,
+            };
+            strip_ansi(line)
+        })
+        .filter(|line| line != "##[endgroup]")
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("##[group]") {
+                format!("▸ {rest}")
+            } else if let Some(rest) = line.strip_prefix("##[error]") {
+                format!("Error: {rest}")
+            } else if let Some(rest) = line.strip_prefix("##[warning]") {
+                format!("Warning: {rest}")
+            } else if let Some(rest) = line.strip_prefix("##[command]") {
+                format!("$ {rest}")
+            } else {
+                line
+            }
+        })
+        .collect();
+    let (start, end) = match lines.iter().position(|l| l.starts_with("Error: ")) {
+        Some(error) => {
+            let step = lines[..error].iter().rposition(|l| l.starts_with("▸ Run ")).unwrap_or(0);
+            (step, error + 1)
+        }
+        None => (0, lines.len()),
+    };
+    let start = start.max(end.saturating_sub(LOG_LINES));
+    lines[start..end].to_vec()
+}
+
+/// Text without its terminal escape sequences.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters, then a final byte from @ to ~.
+            Some('[') => {
+                for ch in chars.by_ref() {
+                    if ('@'..='~').contains(&ch) {
+                        break;
+                    }
+                }
+            }
+            // OSC: up to BEL or ESC \.
+            Some(']') => {
+                while let Some(ch) = chars.next() {
+                    if ch == '\u{7}' || (ch == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// "45s", "1m 52s", "2h 3m": how long from `start` to `end` (or to `now` while it's going).
+pub fn duration(start: &str, end: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    let Ok(from) = chrono::DateTime::parse_from_rfc3339(start) else { return String::new() };
+    let to = chrono::DateTime::parse_from_rfc3339(end).map(|t| t.with_timezone(&chrono::Utc)).unwrap_or(now);
+    let secs = (to - from.with_timezone(&chrono::Utc)).num_seconds().max(0);
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3_600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3_600, secs % 3_600 / 60),
+    }
+}
+
 // ---------- small helpers for the view ----------
 
 /// "3m", "5h", "2d", "Nov 3": how long ago an ISO-8601 time was.
@@ -1192,6 +1485,101 @@ diff --git a/y.rs b/y.rs\n--- a/y.rs\n+++ b/y.rs\n@@ -10,3 +12,4 @@ fn f()\n ctx
         assert_eq!(ago("garbage", now), "");
     }
 
+    #[test]
+    fn workflow_runs_read_their_state_and_who_started_them() {
+        let v: Value = serde_json::from_str(
+            r#"{"total_count":2,"workflow_runs":[
+              {"id":46,"name":"CI","display_title":"Merge pull request #59","run_number":126,"run_attempt":2,
+               "event":"push","status":"completed","conclusion":"success","head_branch":"main","head_sha":"52a9ed0",
+               "created_at":"2026-11-27T16:20:00Z","run_started_at":"2026-11-27T16:26:21Z",
+               "updated_at":"2026-11-27T16:28:15Z","html_url":"u",
+               "actor":{"login":"bot"},"triggering_actor":{"login":"me"}},
+              {"id":47,"name":"CI","status":"queued","conclusion":null,"actor":{"login":"bot"},
+               "created_at":"2026-11-27T17:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let runs = parse_runs(&v);
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].number, runs[0].attempt, runs[0].state), (126, 2, RunState::Passed));
+        assert_eq!(runs[0].actor, "me", "who re-ran it, not who first pushed");
+        assert_eq!(runs[0].started_at, "2026-11-27T16:26:21Z");
+        assert_eq!((runs[1].state, runs[1].actor.as_str()), (RunState::Queued, "bot"));
+        assert_eq!(runs[1].started_at, "2026-11-27T17:00:00Z", "not started yet: when it was made");
+        assert!(runs[1].state.active() && !runs[0].state.active());
+    }
+
+    #[test]
+    fn run_states_follow_status_then_conclusion() {
+        assert_eq!(RunState::of("in_progress", ""), RunState::Running);
+        assert_eq!(RunState::of("waiting", ""), RunState::Queued);
+        assert_eq!(RunState::of("completed", "neutral"), RunState::Passed);
+        assert_eq!(RunState::of("completed", "cancelled"), RunState::Cancelled);
+        assert_eq!(RunState::of("completed", "skipped"), RunState::Skipped);
+        assert_eq!(RunState::of("completed", "timed_out"), RunState::Failed);
+        assert_eq!(RunState::of("completed", "startup_failure"), RunState::Failed);
+    }
+
+    #[test]
+    fn jobs_read_with_their_steps() {
+        let v: Value = serde_json::from_str(
+            r#"{"jobs":[{"id":9,"name":"build","status":"completed","conclusion":"failure",
+              "started_at":"2026-11-27T12:00:00Z","completed_at":"2026-11-27T12:01:52Z","html_url":"j",
+              "steps":[{"name":"Format","status":"completed","conclusion":"failure","number":6,
+                        "started_at":"2026-11-27T12:01:50Z","completed_at":"2026-11-27T12:01:51Z"},
+                       {"name":"Test","status":"completed","conclusion":"skipped","number":7}]}]}"#,
+        )
+        .unwrap();
+        let jobs = parse_jobs(&v);
+        assert_eq!((jobs[0].id, jobs[0].state), (9, RunState::Failed));
+        let steps: Vec<_> = jobs[0].steps.iter().map(|s| (s.name.as_str(), s.state)).collect();
+        assert_eq!(steps, vec![("Format", RunState::Failed), ("Test", RunState::Skipped)]);
+    }
+
+    #[test]
+    fn a_failed_log_shows_the_failing_step_up_to_its_error() {
+        let raw = "\u{feff}2026-11-27T12:00:49.2271745Z ##[group]Runner Image\n\
+2026-11-27T12:00:49.2271745Z image line\n\
+2026-11-27T12:00:49.2271745Z ##[endgroup]\n\
+2026-11-27T12:01:00.0000000Z ##[group]Run cargo build\n\
+2026-11-27T12:01:00.0000000Z built\n\
+2026-11-27T12:01:52.2890683Z ##[group]Run cargo fmt --check\n\
+2026-11-27T12:01:52.2890967Z \u{1b}[36;1mcargo fmt --check\u{1b}[0m\n\
+2026-11-27T12:01:52.2891801Z ##[endgroup]\n\
+2026-11-27T12:01:53.2272824Z Diff in src/x.rs:490:\n\
+2026-11-27T12:01:53.4057207Z ##[error]Process completed with exit code 1.\n\
+2026-11-27T12:01:53.4406862Z Post job cleanup.\n\
+2026-11-27T12:01:53.5000000Z ##[command]/usr/bin/git config --unset x\n";
+        assert_eq!(
+            log_excerpt(raw),
+            vec![
+                "▸ Run cargo fmt --check",
+                "cargo fmt --check",
+                "Diff in src/x.rs:490:",
+                "Error: Process completed with exit code 1.",
+            ]
+        );
+        let passed = "2026-11-27T12:00:00.0Z ##[group]Run x\n2026-11-27T12:00:01.0Z ##[command]x --go\n2026-11-27T12:00:02.0Z ok\n";
+        assert_eq!(log_excerpt(passed), vec!["▸ Run x", "$ x --go", "ok"], "nothing failed: the whole (short) log");
+        let long: String = (0..1000).map(|i| format!("2026-11-27T12:00:00.0Z line {i}\n")).collect();
+        let tail = log_excerpt(&long);
+        assert_eq!((tail.len(), tail[0].as_str()), (LOG_LINES, "line 600"), "a long log keeps its end");
+    }
+
+    #[test]
+    fn escape_sequences_are_stripped() {
+        assert_eq!(strip_ansi("\u{1b}[1m\u{1b}[31merror\u{1b}[0m: x"), "error: x");
+        assert_eq!(strip_ansi("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{1b}\\ done"), "link done");
+    }
+
+    #[test]
+    fn durations_read_short() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-25T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(duration("2026-11-25T11:59:15Z", "2026-11-25T11:59:59Z", now), "44s");
+        assert_eq!(duration("2026-11-25T11:58:00Z", "2026-11-25T11:59:52Z", now), "1m 52s");
+        assert_eq!(duration("2026-11-25T09:57:00Z", "", now), "2h 3m", "still going: up to now");
+        assert_eq!(duration("", "", now), "");
+    }
+
     /// Reads a real repository through gh: `TJ_LIVE_REPO=~/Projects/X cargo test -- --ignored live_github`
     #[test]
     #[ignore]
@@ -1209,6 +1597,15 @@ diff --git a/y.rs b/y.rs\n--- a/y.rs\n+++ b/y.rs\n@@ -10,3 +12,4 @@ fn f()\n ctx
         }
         let status = local_status(&root).unwrap();
         eprintln!("branch {:?}, ahead {}, behind {}", status.branch, status.ahead, status.behind);
+        let failed = workflow_runs(&token, &remote, RunFilter::Failed).unwrap();
+        eprintln!("{} failed runs", failed.len());
+        if let Some(run) = failed.first() {
+            let jobs = run_jobs(&token, &remote, run.id).unwrap();
+            let job = jobs.iter().find(|j| j.state == RunState::Failed).expect("a failed job");
+            let log = job_log(&token, &remote, job.id).unwrap();
+            eprintln!("run #{} job {}: {} log lines, ending {:?}", run.number, job.name, log.len(), log.last());
+            assert!(log.last().is_some_and(|l| l.starts_with("Error: ")));
+        }
     }
 
     /// Checking out and pulling against a real (local) remote.

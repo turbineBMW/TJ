@@ -6,6 +6,10 @@
 //! files with line comments that go out with a review (Comment, Approve, Request changes), and
 //! its commits. Check out puts its branch in the project folder.
 //!
+//! Beside Pull requests, the Actions page lists the repository's workflow runs (all, running or
+//! failed) and the one picked: its jobs and their steps, the failing part of a job's log, and
+//! Re-run or Cancel. Runs still going are read again while the page is open.
+//!
 //! All the work is `gh` and `git` in the background (see [`crate::github`]).
 
 use std::{
@@ -32,8 +36,8 @@ use gpui_kit::component::{
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::github::{
-    self, Branch, ChecksState, DraftComment, LineComment, LocalStatus, MergeMethod, PrDetail, PrFilter, PrState,
-    PullRequest, Remote, RepoInfo, ReviewEvent,
+    self, Branch, ChecksState, DraftComment, Job, LineComment, LocalStatus, MergeMethod, PrDetail, PrFilter, PrState,
+    PullRequest, Remote, RepoInfo, ReviewEvent, RunFilter, RunState, WorkflowRun,
 };
 
 pub const CONTEXT: &str = "GitHub";
@@ -111,6 +115,13 @@ enum Phase {
     Ready,
 }
 
+/// The tab's pages, like the repository's tabs on github.com.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    PullRequests,
+    Actions,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Section {
     Conversation,
@@ -147,6 +158,7 @@ pub struct GitHubView {
     account: Option<(String, String)>,
     remote: Option<Remote>,
     info: RepoInfo,
+    page: Page,
     filter: PrFilter,
     prs: Vec<PullRequest>,
     prs_loading: bool,
@@ -155,6 +167,18 @@ pub struct GitHubView {
     detail: Option<PrDetail>,
     detail_loading: bool,
     section: Section,
+    run_filter: RunFilter,
+    runs: Vec<WorkflowRun>,
+    runs_loading: bool,
+    runs_loaded_at: Option<Instant>,
+    run_selected: Option<u64>,
+    /// The picked run's jobs, with the run they're for.
+    jobs: Option<(u64, Vec<Job>)>,
+    jobs_loading: bool,
+    /// Job logs read so far (`None` while one is loading), and the jobs showing theirs.
+    logs: HashMap<u64, Option<Vec<String>>>,
+    logs_open: HashSet<u64>,
+    runs_scroll: ScrollHandle,
     diff: Entity<DiffState>,
     drafts: Vec<DraftComment>,
     compose: Option<Compose>,
@@ -231,6 +255,7 @@ impl GitHubView {
             account: None,
             remote: None,
             info: RepoInfo::default(),
+            page: Page::PullRequests,
             filter: PrFilter::Open,
             prs: Vec::new(),
             prs_loading: false,
@@ -239,6 +264,16 @@ impl GitHubView {
             detail: None,
             detail_loading: false,
             section: Section::Conversation,
+            run_filter: RunFilter::All,
+            runs: Vec::new(),
+            runs_loading: false,
+            runs_loaded_at: None,
+            run_selected: None,
+            jobs: None,
+            jobs_loading: false,
+            logs: HashMap::new(),
+            logs_open: HashSet::new(),
+            runs_scroll: ScrollHandle::new(),
             diff,
             drafts: Vec::new(),
             compose: None,
@@ -280,7 +315,8 @@ impl GitHubView {
     /// The tab came to the front: focus it and bring stale data up to date.
     pub fn shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
-        if self.phase == Phase::Ready && self.loaded_at.is_none_or(|at| at.elapsed() > STALE) {
+        let loaded_at = if self.page == Page::Actions { self.runs_loaded_at } else { self.loaded_at };
+        if self.phase == Phase::Ready && loaded_at.is_none_or(|at| at.elapsed() > STALE) {
             self.refresh(false, cx);
         }
     }
@@ -352,7 +388,11 @@ impl GitHubView {
         self._poll = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LOCAL_POLL).await;
-                if this.update(cx, |this: &mut Self, cx| this.load_local(cx)).is_err() {
+                let polled = this.update(cx, |this: &mut Self, cx| {
+                    this.load_local(cx);
+                    this.poll_runs(cx);
+                });
+                if polled.is_err() {
                     break;
                 }
             }
@@ -380,6 +420,9 @@ impl GitHubView {
         self.load_prs(cx);
         if let Some(number) = self.selected {
             self.load_detail(number, cx);
+        }
+        if self.page == Page::Actions {
+            self.load_runs(cx);
         }
     }
 
@@ -489,6 +532,116 @@ impl GitHubView {
         .detach();
     }
 
+    fn load_runs(&mut self, cx: &mut Context<Self>) {
+        let (Some(remote), Some(token)) = (self.remote.clone(), self.token()) else { return };
+        self.runs_loading = true;
+        let (filter, generation) = (self.run_filter, self.generation);
+        cx.spawn(async move |this, cx| {
+            let result =
+                cx.background_executor().spawn(async move { github::workflow_runs(&token, &remote, filter) }).await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                if this.generation != generation || this.run_filter != filter {
+                    return;
+                }
+                this.runs_loading = false;
+                this.runs_loaded_at = Some(Instant::now());
+                match result {
+                    Ok(runs) => {
+                        this.want_avatars(runs.iter().map(|r| r.actor.clone()), cx);
+                        this.runs = runs;
+                        // Open the first one, so the page is never empty when there's something.
+                        match this.run_selected.filter(|id| this.runs.iter().any(|r| r.id == *id)) {
+                            Some(id) => this.load_jobs(id, cx),
+                            None => {
+                                if let Some(first) = this.runs.first().map(|r| r.id) {
+                                    this.select_run(first, cx);
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => this.say(false, format!("Couldn't load workflow runs: {err:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn load_jobs(&mut self, run: u64, cx: &mut Context<Self>) {
+        let (Some(remote), Some(token)) = (self.remote.clone(), self.token()) else { return };
+        self.jobs_loading = true;
+        let generation = self.generation;
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { github::run_jobs(&token, &remote, run) }).await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                if this.generation != generation || this.run_selected != Some(run) {
+                    return;
+                }
+                this.jobs_loading = false;
+                match result {
+                    Ok(jobs) => {
+                        // A job that finished since its log was read (or failed to be) is read again.
+                        for job in &jobs {
+                            if job.state.active() {
+                                this.logs.remove(&job.id);
+                            }
+                        }
+                        this.jobs = Some((run, jobs));
+                    }
+                    Err(err) => this.say(false, format!("Couldn't load the run's jobs: {err:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Show or hide a job's log, reading it the first time.
+    fn toggle_log(&mut self, job: u64, cx: &mut Context<Self>) {
+        if !self.logs_open.insert(job) {
+            self.logs_open.remove(&job);
+            cx.notify();
+            return;
+        }
+        if self.logs.contains_key(&job) {
+            cx.notify();
+            return;
+        }
+        let (Some(remote), Some(token)) = (self.remote.clone(), self.token()) else { return };
+        self.logs.insert(job, None);
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { github::job_log(&token, &remote, job) }).await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                match result {
+                    Ok(lines) => {
+                        this.logs.insert(job, Some(lines));
+                    }
+                    Err(err) => {
+                        this.logs.remove(&job);
+                        this.logs_open.remove(&job);
+                        this.say(false, format!("Couldn't read the log: {err:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// While the Actions page is open and something on it is still going, read it again.
+    fn poll_runs(&mut self, cx: &mut Context<Self>) {
+        if self.page != Page::Actions || self.runs_loading {
+            return;
+        }
+        let jobs_going = self.jobs.as_ref().is_some_and(|(_, jobs)| jobs.iter().any(|j| j.state.active()));
+        if jobs_going || self.runs.iter().any(|r| r.state.active()) {
+            self.load_runs(cx);
+        }
+    }
+
     /// Fetch the avatars not asked for yet, from github.com (public pictures, by login).
     fn want_avatars(&mut self, logins: impl IntoIterator<Item = String>, cx: &mut Context<Self>) {
         let wanted: Vec<String> = logins
@@ -569,6 +722,61 @@ impl GitHubView {
         cx.notify();
     }
 
+    fn select_run(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.run_selected != Some(id) {
+            self.run_selected = Some(id);
+            self.jobs = None;
+            self.logs_open.clear();
+        }
+        self.load_jobs(id, cx);
+        if let Some(ix) = self.runs.iter().position(|r| r.id == id) {
+            self.runs_scroll.scroll_to_item(ix);
+        }
+        cx.notify();
+    }
+
+    fn set_run_filter(&mut self, filter: RunFilter, cx: &mut Context<Self>) {
+        if self.run_filter != filter {
+            self.run_filter = filter;
+            self.list_page = true;
+            self.runs.clear();
+            self.run_selected = None;
+            self.jobs = None;
+            self.load_runs(cx);
+        }
+    }
+
+    fn show_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        if self.page == page {
+            return;
+        }
+        self.page = page;
+        self.list_page = true;
+        let loaded_at = if page == Page::Actions { self.runs_loaded_at } else { self.loaded_at };
+        if loaded_at.is_none_or(|at| at.elapsed() > STALE) {
+            match page {
+                Page::Actions => self.load_runs(cx),
+                Page::PullRequests => self.load_prs(cx),
+            }
+        }
+        cx.notify();
+    }
+
+    /// A pull request's section; the keys for one bring the Pull requests page back.
+    fn show_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
+        self.show_page(Page::PullRequests, cx);
+        cx.notify();
+    }
+
+    /// The item picked on the page showing, if any.
+    fn has_selection(&self) -> bool {
+        match self.page {
+            Page::PullRequests => self.selected.is_some(),
+            Page::Actions => self.run_selected.is_some(),
+        }
+    }
+
     /// Whether the tab is too narrow for the list beside the pull request.
     fn narrow(&self) -> bool {
         self.width.is_some_and(|w| w < px(NARROW_WIDTH))
@@ -577,25 +785,23 @@ impl GitHubView {
     /// The button back to the list, when the pull request has the narrow tab to itself.
     fn back_to_list(&self, cx: &mut Context<Self>) -> Option<Button> {
         self.narrow().then(|| {
-            Button::new("github-back").small().ghost().icon(IconName::ArrowLeft).label("Pull requests").on_click(
-                cx.listener(|this, _, _, cx| {
+            let label = if self.page == Page::Actions { "Workflow runs" } else { "Pull requests" };
+            Button::new("github-back").small().ghost().icon(IconName::ArrowLeft).label(label).on_click(cx.listener(
+                |this, _, _, cx| {
                     this.list_page = true;
                     cx.notify();
-                }),
-            )
+                },
+            ))
         })
     }
 
     fn select_step(&mut self, step: isize, cx: &mut Context<Self>) {
-        if self.prs.is_empty() {
+        if self.page == Page::Actions {
+            let Some(next) = step_in(self.runs.iter().map(|r| r.id), self.run_selected, step) else { return };
+            self.select_run(next, cx);
             return;
         }
-        let at = self.selected.and_then(|n| self.prs.iter().position(|p| p.number == n));
-        let next = match at {
-            Some(at) => (at as isize + step).clamp(0, self.prs.len() as isize - 1) as usize,
-            None => 0,
-        };
-        let number = self.prs[next].number;
+        let Some(number) = step_in(self.prs.iter().map(|p| p.number), self.selected, step) else { return };
         self.select(number, cx);
     }
 
@@ -625,6 +831,11 @@ impl GitHubView {
         self.prs.clear();
         self.selected = None;
         self.detail = None;
+        self.runs.clear();
+        self.run_selected = None;
+        self.jobs = None;
+        self.logs.clear();
+        self.runs_loaded_at = None;
         self.account = None;
         self.load(cx);
     }
@@ -885,6 +1096,39 @@ impl GitHubView {
                 this.say(true, format!("#{number} is ready for review."));
                 this.load_detail(number, cx);
                 this.load_prs(cx);
+            },
+            cx,
+        );
+    }
+
+    /// Run the picked workflow run again: all of it, or (`failed_only`) the jobs that failed.
+    fn rerun(&mut self, failed_only: bool, cx: &mut Context<Self>) {
+        let (Some(remote), Some(token), Some(id)) = (self.remote.clone(), self.token(), self.run_selected) else {
+            return;
+        };
+        self.run(
+            if failed_only { "Re-running failed jobs…" } else { "Re-running…" },
+            move || github::rerun(&token, &remote, id, failed_only),
+            move |this, _, cx| {
+                this.say(true, if failed_only { "Re-running the failed jobs." } else { "Re-running all jobs." });
+                this.logs.clear();
+                this.logs_open.clear();
+                this.load_runs(cx);
+            },
+            cx,
+        );
+    }
+
+    fn cancel_run(&mut self, cx: &mut Context<Self>) {
+        let (Some(remote), Some(token), Some(id)) = (self.remote.clone(), self.token(), self.run_selected) else {
+            return;
+        };
+        self.run(
+            "Cancelling…",
+            move || github::cancel_run(&token, &remote, id),
+            |this, _, cx| {
+                this.say(true, "Cancel requested.");
+                this.load_runs(cx);
             },
             cx,
         );
@@ -1181,11 +1425,45 @@ impl GitHubView {
 
         let flash = self.flash.clone().filter(|f| !f.ok || f.at.elapsed() < Duration::from_secs(8));
 
+        let page = self.page;
+        let page_tab = |id: &'static str, p: Page, icon: IconName, label: &'static str, count: Option<usize>| {
+            let on = page == p;
+            h_flex()
+                .id(id)
+                .test_support()
+                .gap_1p5()
+                .px_3()
+                .py_2()
+                .text_sm()
+                .cursor_pointer()
+                .border_b_2()
+                .map(|el| {
+                    if on {
+                        el.border_color(c.accent).text_color(c.fg).font_weight(FontWeight::MEDIUM)
+                    } else {
+                        el.border_color(transparent_black()).text_color(c.muted).hover(|el| el.text_color(c.fg))
+                    }
+                })
+                .child(Icon::new(icon).small())
+                .child(label)
+                .when_some(count.filter(|n| *n > 0), |el, n| {
+                    el.child(div().px_1p5().rounded_full().bg(c.fg.opacity(0.08)).text_xs().child(n.to_string()))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.show_page(p, cx)))
+        };
+        let open_prs = (self.filter == PrFilter::Open).then_some(self.prs.len());
+        let running = self.runs.iter().filter(|r| r.state.active()).count();
+        let tabs = h_flex()
+            .gap_1()
+            // The picked tab's underline sits on the band's bottom border.
+            .mb(px(-1.))
+            .child(page_tab("github-page-prs", Page::PullRequests, IconName::GitPullRequest, "Pull requests", open_prs))
+            .child(page_tab("github-page-actions", Page::Actions, IconName::Workflow, "Actions", Some(running)));
+
         v_flex()
             .flex_none()
             .px_4()
             .pt_3()
-            .pb_2()
             .gap_2()
             .border_b_1()
             .border_color(c.border)
@@ -1305,6 +1583,7 @@ impl GitHubView {
                         ),
                 )
             })
+            .child(tabs)
     }
 
     fn render_list(&self, c: &Colors, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2659,6 +2938,453 @@ impl GitHubView {
     }
 }
 
+impl GitHubView {
+    /// The Actions page's list: workflow runs, newest first.
+    fn render_runs(&self, c: &Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = chrono::Utc::now();
+        let filter = self.run_filter;
+        let segments = RunFilter::ALL.map(|f| {
+            let on = f == filter;
+            div()
+                .id(SharedString::from(format!("github-run-filter-{}", f.label())))
+                .test_support()
+                .flex_1()
+                .py_1()
+                .rounded_md()
+                .text_center()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .map(|el| {
+                    if on {
+                        el.bg(c.bg).text_color(c.fg).shadow_sm()
+                    } else {
+                        el.text_color(c.muted).hover(|el| el.text_color(c.fg))
+                    }
+                })
+                .child(f.label())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_run_filter(f, cx)))
+        });
+        let rows = self.runs.iter().map(|run| {
+            let selected = self.run_selected == Some(run.id);
+            let id = run.id;
+            let end = if run.state.active() { "" } else { run.updated_at.as_str() };
+            div()
+                .id(SharedString::from(format!("github-run-{id}")))
+                .test_support()
+                .relative()
+                .mx_2()
+                .mb_1()
+                .px_3()
+                .py_2p5()
+                .rounded_lg()
+                .cursor_pointer()
+                .map(|el| if selected { el.bg(c.card) } else { el.hover(|el| el.bg(c.card.opacity(0.5))) })
+                .when(selected, |el| {
+                    el.child(
+                        div().absolute().left_0().top(px(10.)).bottom(px(10.)).w(px(3.)).rounded_full().bg(c.accent),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    window.focus(&this.focus, cx);
+                    this.list_page = false;
+                    this.select_run(id, cx)
+                }))
+                .child(
+                    h_flex().gap_2p5().items_start().child(div().pt_0p5().child(run_icon(run.state, false, c))).child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div().text_sm().font_weight(FontWeight::MEDIUM).line_clamp(2).child(run.title.clone()),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .text_xs()
+                                    .text_color(c.muted)
+                                    .child(
+                                        div()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .child(format!("{} #{}", run.workflow, run.number)),
+                                    )
+                                    .child("·")
+                                    .child(github::title_case(&run.event))
+                                    .child(div().flex_1())
+                                    .child(github::ago(&run.started_at, now)),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .text_xs()
+                                    .text_color(c.muted)
+                                    .when(!run.branch.is_empty(), |el| el.child(branch_chip(&run.branch, c)))
+                                    .child(div().flex_1())
+                                    .child(
+                                        h_flex()
+                                            .gap_0p5()
+                                            .child(Icon::new(IconName::Timer).xsmall())
+                                            .child(github::duration(&run.started_at, end, now)),
+                                    ),
+                            ),
+                    ),
+                )
+                .into_any_element()
+        });
+        let empty = self.runs.is_empty();
+        v_flex()
+            .map(|el| if self.narrow() { el.flex_1().min_w_0() } else { el.w(px(LIST_WIDTH)).flex_none().border_r_1() })
+            .h_full()
+            .border_color(c.border)
+            .child(h_flex().m_2().p_0p5().gap_0p5().rounded_lg().bg(c.card).children(segments))
+            .child(
+                div()
+                    .id("github-run-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.runs_scroll)
+                    .pb_2()
+                    .map(|el| {
+                        if !empty {
+                            return el.children(rows);
+                        }
+                        el.child(
+                            v_flex()
+                                .items_center()
+                                .gap_2()
+                                .pt_10()
+                                .text_sm()
+                                .text_color(c.muted)
+                                .child(if self.runs_loading {
+                                    Spinner::new().small().color(c.accent).into_any_element()
+                                } else {
+                                    Icon::new(IconName::Workflow)
+                                        .large()
+                                        .text_color(c.muted.opacity(0.5))
+                                        .into_any_element()
+                                })
+                                .child(match (self.runs_loading, filter) {
+                                    (true, _) => "Loading workflow runs…",
+                                    (false, RunFilter::All) => "No workflow runs yet",
+                                    (false, RunFilter::Running) => "Nothing running",
+                                    (false, RunFilter::Failed) => "No failed runs",
+                                }),
+                        )
+                    }),
+            )
+    }
+
+    /// The picked workflow run: what started it, its jobs and their steps, and logs.
+    fn render_run(&self, c: &Colors, cx: &mut Context<Self>) -> AnyElement {
+        let back = self.back_to_list(cx);
+        let Some(run) = self.run_selected.and_then(|id| self.runs.iter().find(|r| r.id == id)) else {
+            return v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .when_some(back, |el, back| el.child(h_flex().px_3().pt_3().child(back)))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(c.muted)
+                        .child(Icon::new(IconName::Workflow).large().text_color(c.muted.opacity(0.5)))
+                        .when(!self.runs_loading, |el| el.child("Pick a workflow run")),
+                )
+                .into_any_element();
+        };
+        let now = chrono::Utc::now();
+        let (tone, _) = run_look(run.state, c);
+        let busy = self.busy.is_some();
+        let can_push = self.info.can_push;
+        let no_push = "This account can't run workflows on this repository";
+        let url = run.url.clone();
+        let end = if run.state.active() { "" } else { run.updated_at.as_str() };
+        let action = |id: &'static str, icon: IconName, label: &'static str| {
+            Button::new(id)
+                .small()
+                .outline()
+                .icon(icon)
+                .label(label)
+                .disabled(busy || !can_push)
+                .when(!can_push, |b| b.tooltip(no_push))
+        };
+        let header = v_flex()
+            .px_5()
+            .pt_4()
+            .pb_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(c.border)
+            .when_some(back, |el, back| el.child(h_flex().ml(px(-10.)).child(back)))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(run.title.clone())
+                            .child(
+                                div()
+                                    .text_color(c.muted)
+                                    .font_weight(FontWeight::NORMAL)
+                                    .child(format!(" {} #{}", run.workflow, run.number)),
+                            ),
+                    )
+                    .when(run.state.active(), |el| {
+                        el.child(
+                            action("github-run-cancel", IconName::CircleStop, "Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_run(cx))),
+                        )
+                    })
+                    .when(matches!(run.state, RunState::Failed | RunState::Cancelled), |el| {
+                        el.child(
+                            action("github-run-rerun-failed", IconName::RotateCcw, "Re-run failed jobs")
+                                .on_click(cx.listener(|this, _, _, cx| this.rerun(true, cx))),
+                        )
+                    })
+                    .when(!run.state.active(), |el| {
+                        el.child(
+                            action("github-run-rerun", IconName::RefreshCw, "Re-run all jobs")
+                                .on_click(cx.listener(|this, _, _, cx| this.rerun(false, cx))),
+                        )
+                    })
+                    .child(
+                        Button::new("github-run-web")
+                            .small()
+                            .ghost()
+                            .icon(IconName::ExternalLink)
+                            .tooltip("Open on GitHub")
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .text_sm()
+                    .text_color(c.muted)
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .px_2p5()
+                            .py_1()
+                            .rounded_full()
+                            .bg(tone)
+                            .text_color(c.bg)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(run_look(run.state, c).1.small())
+                            .child(run.state.label()),
+                    )
+                    .child(github::title_case(&run.event))
+                    .when(!run.branch.is_empty(), |el| el.child("on").child(branch_chip(&run.branch, c)))
+                    .child("by")
+                    .child(self.avatar(&run.actor, 18., c))
+                    .child(div().text_color(c.fg).font_weight(FontWeight::MEDIUM).child(run.actor.clone()))
+                    .child(
+                        div()
+                            .px_1p5()
+                            .rounded_md()
+                            .bg(c.card)
+                            .text_xs()
+                            .font_family(c.mono.clone())
+                            .child(run.sha.chars().take(7).collect::<String>()),
+                    )
+                    .child(format!("· started {}", github::ago(&run.started_at, now)))
+                    .child(format!(
+                        "· {} {}",
+                        if run.state.active() { "running for" } else { "took" },
+                        github::duration(&run.started_at, end, now)
+                    ))
+                    .when(run.attempt > 1, |el| el.child(pill(&format!("Attempt {}", run.attempt), c.muted))),
+            );
+
+        let jobs = self.jobs.as_ref().filter(|(id, _)| *id == run.id).map(|(_, jobs)| jobs);
+        let body = match jobs {
+            None => v_flex().pt_10().items_center().child(Spinner::new().color(c.accent)).into_any_element(),
+            Some(jobs) if jobs.is_empty() => {
+                div().p_5().text_sm().text_color(c.muted).child("This run has no jobs yet.").into_any_element()
+            }
+            Some(jobs) => v_flex()
+                .max_w(px(920.))
+                .px_5()
+                .py_4()
+                .gap_3()
+                .children(jobs.iter().map(|job| self.render_job(job, now, c, cx)))
+                .into_any_element(),
+        };
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(header)
+            .child(div().id("github-run-jobs").flex_1().min_h_0().overflow_y_scroll().child(body))
+            .into_any_element()
+    }
+
+    fn render_job(
+        &self,
+        job: &Job,
+        now: chrono::DateTime<chrono::Utc>,
+        c: &Colors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = job.id;
+        let open = self.logs_open.contains(&id);
+        let log = self.logs.get(&id);
+        let url = job.url.clone();
+        let (tone, _) = run_look(job.state, c);
+        let steps = job.steps.iter().enumerate().map(|(ix, step)| {
+            let skipped = step.state == RunState::Skipped;
+            h_flex()
+                .gap_2()
+                .px_4()
+                .py_1p5()
+                .text_sm()
+                .border_t_1()
+                .border_color(c.border)
+                .when(skipped, |el| el.text_color(c.muted))
+                .child(run_icon(step.state, true, c))
+                .child(div().w(px(22.)).text_xs().text_color(c.muted).child((ix + 1).to_string()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(step.name.clone()),
+                )
+                .when(!skipped && !step.started_at.is_empty(), |el| {
+                    el.child(div().text_xs().text_color(c.muted).child(github::duration(
+                        &step.started_at,
+                        &step.completed_at,
+                        now,
+                    )))
+                })
+        });
+        let log_view = open.then(|| {
+            let lines = log.cloned().flatten();
+            v_flex().border_t_1().border_color(c.border).bg(c.bg).map(|el| match lines {
+                None => el.p_3().items_center().child(Spinner::new().small().color(c.accent)),
+                Some(lines) => {
+                    let text = lines.join("\n");
+                    el.child(
+                        h_flex()
+                            .px_4()
+                            .py_1()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(c.muted)
+                            .child(div().flex_1().child(if lines.iter().any(|l| l.starts_with("Error: ")) {
+                                "The step that failed, up to its error"
+                            } else {
+                                "The end of the log"
+                            }))
+                            .child(
+                                Button::new(SharedString::from(format!("github-log-copy-{id}")))
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(IconName::Copy)
+                                    .label("Copy")
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("github-log-{id}")))
+                            .max_h(px(420.))
+                            .overflow_y_scroll()
+                            .px_4()
+                            .pb_3()
+                            .font_family(c.mono.clone())
+                            .text_xs()
+                            .children(lines.into_iter().map(|line| {
+                                let color = if line.starts_with("Error: ") {
+                                    c.red
+                                } else if line.starts_with("Warning: ") {
+                                    c.yellow
+                                } else if line.starts_with("▸ ") {
+                                    c.accent
+                                } else if line.starts_with("$ ") {
+                                    c.muted
+                                } else {
+                                    c.fg
+                                };
+                                div().text_color(color).child(if line.is_empty() { " ".to_string() } else { line })
+                            })),
+                    )
+                }
+            })
+        });
+        v_flex()
+            .rounded_lg()
+            .border_1()
+            .border_color(if job.state == RunState::Failed { tone.opacity(0.55) } else { c.border })
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .px_4()
+                    .py_2()
+                    .bg(c.card)
+                    .child(run_icon(job.state, false, c))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(job.name.clone()),
+                    )
+                    .when(!job.started_at.is_empty(), |el| {
+                        el.child(div().text_xs().text_color(c.muted).child(github::duration(
+                            &job.started_at,
+                            &job.completed_at,
+                            now,
+                        )))
+                    })
+                    .child(
+                        Button::new(SharedString::from(format!("github-job-log-{id}")))
+                            .xsmall()
+                            .map(|b| if open { b.ghost() } else { b.outline() })
+                            .icon(IconName::SquareTerminal)
+                            .label(if open { "Hide log" } else { "Log" })
+                            .disabled(job.state.active() || job.state == RunState::Skipped)
+                            .when(job.state.active(), |b| b.tooltip("The log is ready when the job finishes"))
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_log(id, cx))),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("github-job-web-{id}")))
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::ExternalLink)
+                            .tooltip("Open on GitHub")
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    ),
+            )
+            .children(steps)
+            .children(log_view)
+            .into_any_element()
+    }
+}
+
 impl Focusable for GitHubView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -2707,19 +3433,31 @@ impl Render for GitHubView {
                 cx,
             ),
             Phase::Failed(err) => self.render_message(IconName::CircleAlert, "Couldn't reach GitHub", &err, &c, cx),
-            Phase::Ready => v_flex()
-                .size_full()
-                .child(self.render_header(&c, cx))
-                .child(h_flex().flex_1().min_h_0().items_start().map(|el| {
-                    if !self.narrow() {
-                        el.child(self.render_list(&c, cx)).child(self.render_detail(window, &c, cx))
-                    } else if self.list_page || self.selected.is_none() {
-                        el.child(self.render_list(&c, cx))
-                    } else {
-                        el.child(self.render_detail(window, &c, cx))
-                    }
-                }))
-                .into_any_element(),
+            Phase::Ready => {
+                let (list, detail) = match self.page {
+                    Page::PullRequests => (
+                        self.render_list(&c, cx).into_any_element(),
+                        (!self.narrow() || !self.list_page).then(|| self.render_detail(window, &c, cx)),
+                    ),
+                    Page::Actions => (
+                        self.render_runs(&c, cx).into_any_element(),
+                        (!self.narrow() || !self.list_page).then(|| self.render_run(&c, cx)),
+                    ),
+                };
+                v_flex()
+                    .size_full()
+                    .child(self.render_header(&c, cx))
+                    .child(h_flex().flex_1().min_h_0().items_start().map(|el| {
+                        if !self.narrow() {
+                            el.child(list).children(detail)
+                        } else if self.list_page || !self.has_selection() {
+                            el.child(list)
+                        } else {
+                            el.children(detail)
+                        }
+                    }))
+                    .into_any_element()
+            }
         };
         let this = cx.entity();
         let width = self.width;
@@ -2751,7 +3489,7 @@ impl Render for GitHubView {
             .on_action(cx.listener(|this, _: &NextPullRequest, _, cx| this.select_step(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousPullRequest, _, cx| this.select_step(-1, cx)))
             .on_action(cx.listener(|this, _: &OpenPullRequest, _, cx| {
-                if this.selected.is_some() {
+                if this.has_selection() {
                     this.list_page = false;
                     cx.notify();
                 }
@@ -2764,18 +3502,9 @@ impl Render for GitHubView {
                     cx.propagate();
                 }
             }))
-            .on_action(cx.listener(|this, _: &ShowConversation, _, cx| {
-                this.section = Section::Conversation;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &ShowFiles, _, cx| {
-                this.section = Section::Files;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &ShowCommits, _, cx| {
-                this.section = Section::Commits;
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &ShowConversation, _, cx| this.show_section(Section::Conversation, cx)))
+            .on_action(cx.listener(|this, _: &ShowFiles, _, cx| this.show_section(Section::Files, cx)))
+            .on_action(cx.listener(|this, _: &ShowCommits, _, cx| this.show_section(Section::Commits, cx)))
             .on_action(cx.listener(
                 |this, _: &Refresh, _, cx| {
                     if this.phase == Phase::Ready { this.refresh(true, cx) } else { this.load(cx) }
@@ -2869,6 +3598,41 @@ fn checks_icon(state: ChecksState, c: &Colors) -> Option<AnyElement> {
         ChecksState::Failing => Icon::new(IconName::CircleX).xsmall().text_color(c.red).into_any_element(),
         ChecksState::Pending => Icon::new(IconName::CircleDot).xsmall().text_color(c.yellow).into_any_element(),
     })
+}
+
+/// A run's, job's or step's colour and icon.
+fn run_look(state: RunState, c: &Colors) -> (Hsla, Icon) {
+    let (color, icon) = match state {
+        RunState::Queued => (c.yellow, IconName::CircleDashed),
+        RunState::Running => (c.yellow, IconName::LoaderCircle),
+        RunState::Passed => (c.green, IconName::CircleCheck),
+        RunState::Failed => (c.red, IconName::CircleX),
+        RunState::Cancelled => (c.muted, IconName::CircleStop),
+        RunState::Skipped => (c.muted, IconName::CircleMinus),
+    };
+    (color, Icon::new(icon))
+}
+
+/// The icon for where a run, job or step stands; a spinner while it runs.
+fn run_icon(state: RunState, xsmall: bool, c: &Colors) -> AnyElement {
+    let (color, icon) = run_look(state, c);
+    if state == RunState::Running {
+        let spinner = Spinner::new().color(color);
+        return if xsmall { spinner.xsmall() } else { spinner.small() }.into_any_element();
+    }
+    let icon = icon.text_color(color);
+    if xsmall { icon.xsmall() } else { icon.small() }.into_any_element()
+}
+
+/// The id `step` places from `at` among `ids` (the first when nothing is picked), held at the ends.
+fn step_in(ids: impl Iterator<Item = u64>, at: Option<u64>, step: isize) -> Option<u64> {
+    let ids: Vec<u64> = ids.collect();
+    let last = ids.len().checked_sub(1)?;
+    let next = match at.and_then(|at| ids.iter().position(|id| *id == at)) {
+        Some(ix) => (ix as isize + step).clamp(0, last as isize) as usize,
+        None => 0,
+    };
+    Some(ids[next])
 }
 
 /// How far the branch is from its upstream: `↓ 3  ↑ 1`, or a check when level.
