@@ -41,6 +41,82 @@ impl Render for NoDragImage {
     }
 }
 const RESIZE_STEP: f32 = 0.05;
+/// How tall the bar over each pane of a split tab is: the grip to drag the pane by.
+const GRIP_BAR: f32 = 8.0;
+/// How far in from a pane's left and right sides a dragged pane lands on that side; between
+/// them, it lands above or below.
+const SIDE_ZONE: f32 = 0.3;
+
+/// A pane being dragged by its grip, to another pane's edge.
+#[derive(Clone, Debug)]
+struct PaneDrag {
+    pane: usize,
+    title: SharedString,
+}
+
+/// What follows the pointer while a pane is dragged: its title.
+struct PaneDragImage {
+    title: SharedString,
+}
+
+impl Render for PaneDragImage {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.primary)
+            .bg(theme.popover)
+            .text_xs()
+            .text_color(theme.popover_foreground)
+            .shadow_md()
+            .child(self.title.clone())
+    }
+}
+
+/// The side of a pane another pane is dropped on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Edge {
+    fn direction(self) -> SplitDirection {
+        match self {
+            Edge::Left | Edge::Right => SplitDirection::Right,
+            Edge::Top | Edge::Bottom => SplitDirection::Down,
+        }
+    }
+
+    /// Whether the dropped pane goes first: left of, or above, the one it's dropped on.
+    fn before(self) -> bool {
+        matches!(self, Edge::Left | Edge::Top)
+    }
+
+    /// The side of `bounds` a pane let go at `at` lands on, if `at` is within them: the left
+    /// and right sides take it beside, the middle above or below.
+    fn at(bounds: Bounds<Pixels>, at: Point<Pixels>) -> Option<Edge> {
+        if !bounds.contains(&at) {
+            return None;
+        }
+        let x = (at.x - bounds.left()) / bounds.size.width;
+        let y = (at.y - bounds.top()) / bounds.size.height;
+        Some(if x < SIDE_ZONE {
+            Edge::Left
+        } else if x > 1.0 - SIDE_ZONE {
+            Edge::Right
+        } else if y < 0.5 {
+            Edge::Top
+        } else {
+            Edge::Bottom
+        })
+    }
+}
 
 gpui_kit::actions!(
     panes,
@@ -182,23 +258,20 @@ impl Node {
         }
     }
 
-    /// Replace pane `id` with a split of it and `new`.
-    fn split(self, id: usize, direction: SplitDirection, new: Pane) -> (Node, Option<Pane>) {
+    /// Replace pane `id` with a split of it and `new`, with `new` first (left or above) when
+    /// `before`. `new` comes back if there's no pane `id`.
+    fn split(self, id: usize, direction: SplitDirection, new: Pane, before: bool) -> (Node, Option<Pane>) {
         match self {
-            Node::Pane(pane) if pane.id == id => (
-                Node::Split {
-                    direction,
-                    ratio: 0.5,
-                    first: Box::new(Node::Pane(pane)),
-                    second: Box::new(Node::Pane(new)),
-                },
-                None,
-            ),
+            Node::Pane(pane) if pane.id == id => {
+                let (pane, new) = (Box::new(Node::Pane(pane)), Box::new(Node::Pane(new)));
+                let (first, second) = if before { (new, pane) } else { (pane, new) };
+                (Node::Split { direction, ratio: 0.5, first, second }, None)
+            }
             Node::Pane(pane) => (Node::Pane(pane), Some(new)),
             Node::Split { direction: d, ratio, first, second } => {
-                let (first, rest) = first.split(id, direction, new);
+                let (first, rest) = first.split(id, direction, new, before);
                 let (second, rest) = match rest {
-                    Some(new) => second.split(id, direction, new),
+                    Some(new) => second.split(id, direction, new, before),
                     None => (*second, None),
                 };
                 (Node::Split { direction: d, ratio, first: Box::new(first), second: Box::new(second) }, rest)
@@ -218,6 +291,38 @@ impl Node {
                 (None, None) => None,
             },
         }
+    }
+
+    /// Take pane `id` out, as `remove` does, and hand it back.
+    fn take(self, id: usize) -> (Option<Node>, Option<Pane>) {
+        match self {
+            Node::Pane(pane) if pane.id == id => (None, Some(pane)),
+            Node::Pane(pane) => (Some(Node::Pane(pane)), None),
+            Node::Split { direction, ratio, first, second } => {
+                let ((first, a), (second, b)) = (first.take(id), second.take(id));
+                let node = match (first, second) {
+                    (Some(first), Some(second)) => {
+                        Some(Node::Split { direction, ratio, first: Box::new(first), second: Box::new(second) })
+                    }
+                    (Some(only), None) | (None, Some(only)) => Some(only),
+                    (None, None) => None,
+                };
+                (node, a.or(b))
+            }
+        }
+    }
+
+    /// Move pane `id` to `edge` of pane `target`, where it takes half of `target`'s place.
+    /// Unchanged (and false) if either is missing or they're the same pane.
+    fn move_pane(self, id: usize, target: usize, edge: Edge) -> (Node, bool) {
+        if id == target || !self.contains(id) || !self.contains(target) {
+            return (self, false);
+        }
+        // `target` is still there once `id` is out, so there's a root left to put it back in.
+        let (Some(root), Some(pane)) = self.take(id) else { unreachable!("both panes were found") };
+        let (root, rest) = root.split(target, edge.direction(), pane, edge.before());
+        debug_assert!(rest.is_none());
+        (root, true)
     }
 
     /// Set the ratio of the split at `path`, kept within the limits. False if there's none.
@@ -341,6 +446,10 @@ pub struct Panes {
     shell: Option<Shell>,
     /// The conversation last reported as focused.
     reported_thread: Option<String>,
+    /// The pane being dragged by its grip, while the drag lasts.
+    dragging: Option<PaneDrag>,
+    /// Where the dragged pane would land if let go now: a pane, and the side of it.
+    drop_target: Option<(usize, Edge)>,
     focus: FocusHandle,
     pub error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -373,6 +482,8 @@ impl Panes {
             github: github.clone(),
             shell,
             reported_thread: None,
+            dragging: None,
+            drop_target: None,
             focus: cx.focus_handle(),
             error: None,
             _subscriptions: Vec::new(),
@@ -774,7 +885,7 @@ impl Panes {
         let id = self.next_id();
         let ix = self.active;
         let Tab { id: tab_id, root, focused } = self.tabs.remove(ix);
-        let (root, _) = root.split(focused, direction, Pane { id, view: View::Terminal(term) });
+        let (root, _) = root.split(focused, direction, Pane { id, view: View::Terminal(term) }, false);
         self.tabs.insert(ix, Tab { id: tab_id, root, focused: id });
         self.changed(window, cx);
     }
@@ -936,6 +1047,23 @@ impl Panes {
         }
     }
 
+    /// Move pane `id` of the tab on show to `edge` of pane `target`, and focus it there.
+    fn move_pane(&mut self, id: usize, target: usize, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
+        (self.dragging, self.drop_target) = (None, None);
+        let ix = self.active;
+        if ix >= self.tabs.len() {
+            return;
+        }
+        let Tab { id: tab_id, root, focused } = self.tabs.remove(ix);
+        let (root, moved) = root.move_pane(id, target, edge);
+        self.tabs.insert(ix, Tab { id: tab_id, root, focused: if moved { id } else { focused } });
+        if moved {
+            self.changed(window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
     // ---------- rendering ----------
 
     /// Drag a divider: the split takes the pointer's position within it as its ratio.
@@ -946,11 +1074,17 @@ impl Panes {
     }
 
     fn render_node(&self, node: &Node, path: Vec<bool>, cx: &mut Context<Self>) -> AnyElement {
+        let child_path = |second: bool| path.iter().copied().chain([second]).collect::<Vec<_>>();
+        // A pane being dragged is out of the layout until it's let go, as if already taken out:
+        // its sibling has its place, and the shadow shows exactly where it will land.
+        let dragged = self.dragging.as_ref().filter(|_| cx.has_active_drag()).map(|d| d.pane);
+        let is_dragged = |node: &Node| matches!(node, Node::Pane(pane) if Some(pane.id) == dragged);
         match node {
             Node::Pane(pane) => self.render_pane(pane, cx),
+            Node::Split { first, second, .. } if is_dragged(first) => self.render_node(second, child_path(true), cx),
+            Node::Split { first, second, .. } if is_dragged(second) => self.render_node(first, child_path(false), cx),
             Node::Split { direction, ratio, first, second } => {
                 let (border, accent) = (cx.theme().border, cx.theme().primary);
-                let child_path = |second: bool| path.iter().copied().chain([second]).collect::<Vec<_>>();
                 let (a, b) =
                     (self.render_node(first, child_path(false), cx), self.render_node(second, child_path(true), cx));
                 let across = *direction == SplitDirection::Right;
@@ -1025,11 +1159,28 @@ impl Panes {
         }
     }
 
+    /// The pointer moved over pane `over` (to `edge` of it, or off it) while pane `from` is
+    /// dragged: the shadow follows.
+    fn drag_over(&mut self, from: usize, over: usize, edge: Option<Edge>, cx: &mut Context<Self>) {
+        let target = match edge {
+            Some(edge) => (from != over).then_some((over, edge)),
+            // Off this pane: only its own shadow goes; another pane may have taken over.
+            None if self.drop_target.is_some_and(|(pane, _)| pane == over) => None,
+            None => return,
+        };
+        if self.drop_target != target {
+            self.drop_target = target;
+            cx.notify();
+        }
+    }
+
     fn render_pane(&self, pane: &Pane, cx: &mut Context<Self>) -> AnyElement {
-        let accent = cx.theme().primary;
+        let (accent, border) = (cx.theme().primary, cx.theme().border);
         let tab = self.tabs.get(self.active);
         let split = tab.is_some_and(|t| matches!(t.root, Node::Split { .. }));
         let focused = tab.is_some_and(|t| t.focused == pane.id);
+        // A drag that ended outside the panes leaves `dragging` behind; it's over all the same.
+        let dragging = self.dragging.as_ref().filter(|_| cx.has_active_drag());
         let pane_id = pane.id;
         let content = match &pane.view {
             View::Agent(agent) => agent.clone().into_any_element(),
@@ -1037,8 +1188,46 @@ impl Panes {
             View::Review(review) => review.clone().into_any_element(),
             View::GitHub(github) => github.clone().into_any_element(),
         };
+        let title: SharedString = view_label(&pane.view, cx).0.into();
+        let this = cx.entity().downgrade();
+        // The tab is titled after its focused pane; when split, a bar over each pane says which
+        // one that is, and is the grip to drag the pane to another pane's side.
+        let grip = div()
+            .id(SharedString::from(format!("pane-grip-{pane_id}")))
+            .debug_selector(|| format!("pane-grip-{pane_id}"))
+            .group("pane-grip")
+            .h(px(GRIP_BAR))
+            .flex_none()
+            .relative()
+            .flex()
+            .justify_center()
+            .items_center()
+            .cursor_grab()
+            .child(div().absolute().top_0().left_0().right_0().h(px(2.)).when(focused, |el| el.bg(accent)))
+            .child(
+                div()
+                    .w(px(32.))
+                    .h(px(3.))
+                    .mt(px(1.))
+                    .rounded_full()
+                    .bg(border)
+                    .group_hover("pane-grip", |el| el.bg(accent)),
+            )
+            .on_drag(PaneDrag { pane: pane_id, title }, move |drag, _, _, cx| {
+                this.update(cx, |this, cx| {
+                    (this.dragging, this.drop_target) = (Some(drag.clone()), None);
+                    cx.notify();
+                })
+                .ok();
+                cx.new(|_| PaneDragImage { title: drag.title.clone() })
+            });
+        let shadow = match (dragging, self.drop_target) {
+            (Some(drag), Some((target, edge))) if target == pane_id => Some(drop_shadow(&drag.title, edge, cx)),
+            _ => None,
+        };
         v_flex()
             .size_full()
+            .relative()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -1051,12 +1240,61 @@ impl Panes {
                     }
                 }),
             )
-            // The tab is titled after its focused pane; when split, a line over that pane says
-            // which one it is.
-            .when(split, |el| el.child(div().h(px(2.)).flex_none().when(focused, |el| el.bg(accent))))
+            .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<PaneDrag>, _, cx| {
+                let edge = Edge::at(event.bounds, event.event.position);
+                this.drag_over(event.drag(cx).pane, pane_id, edge, cx);
+            }))
+            // It lands where its shadow shows, which is where the pointer last moved to.
+            .on_drop(cx.listener(move |this, drag: &PaneDrag, window, cx| match this.drop_target {
+                Some((target, edge)) if target == pane_id => this.move_pane(drag.pane, target, edge, window, cx),
+                _ => {
+                    (this.dragging, this.drop_target) = (None, None);
+                    cx.notify();
+                }
+            }))
+            .when(split, |el| el.child(grip))
             .child(div().flex_1().min_h_0().child(content))
+            .children(shadow)
             .into_any_element()
     }
+}
+
+/// Where a dragged pane would land on the pane under it: a shadow of the pane, titled, over the
+/// half of that pane it would take.
+fn drop_shadow(title: &SharedString, edge: Edge, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let place = div().absolute().p(px(6.));
+    let place = match edge {
+        Edge::Left => place.top_0().bottom_0().left_0().w(relative(0.5)),
+        Edge::Right => place.top_0().bottom_0().right_0().w(relative(0.5)),
+        Edge::Top => place.left_0().right_0().top_0().h(relative(0.5)),
+        Edge::Bottom => place.left_0().right_0().bottom_0().h(relative(0.5)),
+    };
+    place
+        .debug_selector(|| "drop-shadow".into())
+        .child(
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .border_2()
+                .border_color(theme.primary)
+                .bg(theme.primary.opacity(0.18))
+                .shadow_lg()
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.popover)
+                        .text_sm()
+                        .text_color(theme.popover_foreground)
+                        .child(title.clone()),
+                ),
+        )
+        .into_any_element()
 }
 
 /// A view's title, and the colour of its dot when its thread is working or waiting.
@@ -1334,6 +1572,128 @@ mod tests {
     }
 
     use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+
+    /// The panes of the tab on show, in order (left to right, top to bottom), and its root split.
+    fn order(panes: &Entity<Panes>, cx: &mut VisualTestContext) -> (Vec<usize>, Option<SplitDirection>) {
+        panes.read_with(cx, |p, _| {
+            let tab = &p.tabs[p.active];
+            let direction = match &tab.root {
+                super::Node::Split { direction, .. } => Some(*direction),
+                super::Node::Pane(_) => None,
+            };
+            (tab.pane_ids(), direction)
+        })
+    }
+
+    /// Drag pane `id` by its grip to `to`, still holding it.
+    fn drag_pane_to(id: usize, to: gpui_kit::Point<gpui_kit::Pixels>, cx: &mut VisualTestContext) {
+        let selector: &'static str = Box::leak(format!("pane-grip-{id}").into_boxed_str());
+        let grip = cx.debug_bounds(selector).expect("a split pane has a grip").center();
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(grip, MouseButton::Left, none);
+        cx.simulate_mouse_move(point(grip.x - px(20.), grip.y + px(20.)), MouseButton::Left, none);
+        cx.simulate_mouse_move(to, MouseButton::Left, none);
+        cx.run_until_parked();
+    }
+
+    /// Drag pane `id` by its grip and let go at `to`.
+    fn drag_pane(id: usize, to: gpui_kit::Point<gpui_kit::Pixels>, cx: &mut VisualTestContext) {
+        drag_pane_to(id, to, cx);
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+    }
+
+    #[test]
+    fn where_a_pane_lands_depends_on_where_in_the_other_pane_it_is_let_go() {
+        use super::Edge;
+        let pane = bounds(point(px(100.), px(100.)), size(px(1000.), px(400.)));
+        let at = |x: f32, y: f32| Edge::at(pane, point(px(x), px(y)));
+        assert_eq!(at(150., 450.), Some(Edge::Left), "the left side, even low down");
+        assert_eq!(at(1050., 150.), Some(Edge::Right), "the right side, even high up");
+        assert_eq!(at(600., 150.), Some(Edge::Top));
+        assert_eq!(at(600., 450.), Some(Edge::Bottom));
+        assert_eq!(at(50., 300.), None, "outside the pane");
+    }
+
+    #[gpui_kit::test]
+    fn a_shadow_shows_where_a_dragged_pane_will_land(cx: &mut TestAppContext) {
+        let s = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(s.window, cx);
+        s.panes.update_in(cx, |p, window, cx| p.split(SplitDirection::Right, window, cx));
+        cx.run_until_parked();
+        let (ids, _) = order(&s.panes, cx);
+        let [left, right] = ids[..] else { panic!("two panes: {ids:?}") };
+        assert!(cx.debug_bounds("drop-shadow").is_none(), "no shadow before a drag");
+
+        // Over the left side of the other pane (the whole tab, while this one's out of it): the
+        // shadow covers its left half.
+        drag_pane_to(right, point(px(40.), px(400.)), cx);
+        assert_eq!(s.panes.read_with(cx, |p, _| p.drop_target), Some((left, super::Edge::Left)));
+        let shadow = cx.debug_bounds("drop-shadow").expect("a shadow while over another pane");
+        assert!(shadow.left() < px(1.) && (shadow.right() - px(600.)).abs() < px(4.), "left half: {shadow:?}");
+
+        // It follows the pointer: over the top middle, the top half.
+        let none = Modifiers::none();
+        cx.simulate_mouse_move(point(px(600.), px(100.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert_eq!(s.panes.read_with(cx, |p, _| p.drop_target), Some((left, super::Edge::Top)));
+        let shadow = cx.debug_bounds("drop-shadow").expect("a shadow");
+        assert!(shadow.top() < px(1.) && (shadow.bottom() - px(400.)).abs() < px(4.), "top half: {shadow:?}");
+        cx.simulate_mouse_up(point(px(600.), px(100.)), MouseButton::Left, none);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("drop-shadow").is_none(), "the shadow goes when the drag ends");
+    }
+
+    #[gpui_kit::test]
+    fn dragging_a_pane_by_its_grip_moves_it_to_another_panes_side(cx: &mut TestAppContext) {
+        let s = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(s.window, cx);
+        s.panes.update_in(cx, |p, window, cx| p.split(SplitDirection::Right, window, cx));
+        cx.run_until_parked();
+        let (before, _) = order(&s.panes, cx);
+        let [left, right] = before[..] else { panic!("two panes: {before:?}") };
+
+        // Onto the left side of the left pane: the two swap places.
+        s.events.borrow_mut().clear();
+        drag_pane(right, point(px(40.), px(400.)), cx);
+        assert_eq!(order(&s.panes, cx), (vec![right, left], Some(SplitDirection::Right)));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.focused_pane()), right, "the moved pane has focus");
+        assert!(s.events.borrow().iter().any(|e| e == "layout"), "the new layout is saved");
+        assert!(s.panes.read_with(cx, |p, _| p.dragging.is_none()));
+
+        // Onto the bottom of the other pane, which has the whole tab while this one's dragged:
+        // one above the other.
+        cx.run_until_parked();
+        drag_pane(right, point(px(600.), px(700.)), cx);
+        assert_eq!(order(&s.panes, cx), (vec![left, right], Some(SplitDirection::Down)));
+    }
+
+    #[gpui_kit::test]
+    fn a_dragged_pane_leaves_the_layout_until_it_is_let_go(cx: &mut TestAppContext) {
+        let s = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(s.window, cx);
+        s.panes.update_in(cx, |p, window, cx| p.split(SplitDirection::Right, window, cx));
+        cx.run_until_parked();
+        let before = order(&s.panes, cx);
+        let [left, right] = before.0[..] else { panic!("two panes: {before:?}") };
+        let selector = |id: usize| -> &'static str { Box::leak(format!("pane-grip-{id}").into_boxed_str()) };
+
+        // Picked up: the other pane takes the whole tab, so the shadow over where the dragged
+        // one was is the right half of the tab.
+        drag_pane_to(right, point(px(1150.), px(400.)), cx);
+        assert!(cx.debug_bounds(selector(right)).is_none(), "the dragged pane isn't drawn");
+        let grip = cx.debug_bounds(selector(left)).expect("the other pane is");
+        assert!(grip.size.width > px(1190.), "and fills the tab: {grip:?}");
+        assert!(cx.debug_bounds("divider-").is_none(), "with no divider");
+        let shadow = cx.debug_bounds("drop-shadow").expect("a shadow");
+        assert!((shadow.left() - px(600.)).abs() < px(4.) && shadow.right() > px(1195.), "right half: {shadow:?}");
+
+        // Let go there: back where it was, drawn again.
+        cx.simulate_mouse_up(point(px(1150.), px(400.)), MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(order(&s.panes, cx), before);
+        assert!(cx.debug_bounds(selector(right)).is_some());
+        assert!(cx.debug_bounds("divider-").is_some());
+    }
 
     fn root_ratio(panes: &Entity<Panes>, cx: &mut VisualTestContext) -> f32 {
         match panes.read_with(cx, |p, cx| p.snapshot(cx)) {
