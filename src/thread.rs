@@ -797,6 +797,24 @@ impl ThreadView {
         self.prompt.focus_handle(cx)
     }
 
+    /// Put `text` in the prompt box, ready to edit and send.
+    pub fn set_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt.update(cx, |p, cx| p.set_value(text, window, cx));
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn prompt_text(&self, cx: &App) -> String {
+        self.prompt.read(cx).value().to_string()
+    }
+
+    /// Scroll to the user's `n`th message (1 is the first). False if there isn't one.
+    pub fn reveal_prompt(&mut self, n: usize, cx: &mut Context<Self>) -> bool {
+        let at = self.rows.iter().enumerate().filter(|(_, r)| matches!(r, Row::User(..))).nth(n.saturating_sub(1));
+        let Some((ix, _)) = at else { return false };
+        self.scroller.update(cx, |s, cx| s.scroll_to_item(ix, cx))
+    }
+
     // ---------- commands ----------
 
     /// Send what's in the prompt box, after any tool calls it asks about and with any

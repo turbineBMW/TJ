@@ -17,6 +17,7 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use crate::agent_slot::AgentSlot;
 use crate::changes::ReviewView;
 use crate::github_view::GitHubView;
+use crate::notes_view::NotesView;
 use crate::store::{AreaLayout, SplitDirection, SplitLayout, TabState};
 use crate::terminal::{TerminalExited, TerminalView};
 use crate::thread::{Status, ThreadView};
@@ -147,6 +148,7 @@ pub enum View {
     Terminal(Entity<TerminalView>),
     Review(Entity<ReviewView>),
     GitHub(Entity<GitHubView>),
+    Notes(Entity<NotesView>),
 }
 
 impl View {
@@ -156,6 +158,7 @@ impl View {
             View::Terminal(term) => term.entity_id(),
             View::Review(review) => review.entity_id(),
             View::GitHub(github) => github.entity_id(),
+            View::Notes(notes) => notes.entity_id(),
         }
     }
 
@@ -167,6 +170,7 @@ impl View {
             }
             View::Review(_) => TabState::Review,
             View::GitHub(_) => TabState::GitHub,
+            View::Notes(_) => TabState::Notes,
         }
     }
 
@@ -405,6 +409,7 @@ struct Placed {
     agent: bool,
     review: bool,
     github: bool,
+    notes: bool,
 }
 
 /// Something the workspace acts on.
@@ -442,6 +447,8 @@ pub struct Panes {
     review: Entity<ReviewView>,
     /// The project's GitHub page, shown in at most one pane.
     github: Entity<GitHubView>,
+    /// The project's notes, shown in at most one pane.
+    notes: Entity<NotesView>,
     /// The shell to run; the user's login shell when `None` (tests use `/bin/sh`).
     shell: Option<Shell>,
     /// The conversation last reported as focused.
@@ -466,6 +473,7 @@ impl Panes {
         agent: Entity<AgentSlot>,
         review: Entity<ReviewView>,
         github: Entity<GitHubView>,
+        notes: Entity<NotesView>,
         start: Start,
         shell: Option<Shell>,
         window: &mut Window,
@@ -480,6 +488,7 @@ impl Panes {
             agent: agent.clone(),
             review,
             github: github.clone(),
+            notes: notes.clone(),
             shell,
             reported_thread: None,
             dragging: None,
@@ -490,6 +499,7 @@ impl Panes {
         };
         this._subscriptions.push(cx.observe(&agent, |_, _, cx| cx.notify()));
         this._subscriptions.push(cx.observe(&github, |_, _, cx| cx.notify()));
+        this._subscriptions.push(cx.observe(&notes, |_, _, cx| cx.notify()));
         let has_thread = start.thread.is_some();
         if let Some((id, view)) = start.thread {
             agent.update(cx, |a, cx| a.set_thread(&id, view, cx));
@@ -540,6 +550,7 @@ impl Panes {
                     }
                     TabState::Review => once(&mut placed.review).then(|| View::Review(self.review.clone())),
                     TabState::GitHub => once(&mut placed.github).then(|| View::GitHub(self.github.clone())),
+                    TabState::Notes => once(&mut placed.notes).then(|| View::Notes(self.notes.clone())),
                 }?;
                 Some(self.leaf(view))
             }
@@ -663,6 +674,9 @@ impl Panes {
                     Some(Icon::new(IconName::FileDiff).small().text_color(muted).into_any_element())
                 }
                 Some(View::GitHub(_)) => Some(Icon::new(IconName::Github).small().text_color(muted).into_any_element()),
+                Some(View::Notes(_)) => {
+                    Some(Icon::new(IconName::StickyNote).small().text_color(muted).into_any_element())
+                }
                 None => None,
             };
             let (activate, close) = (this.clone(), this.clone());
@@ -787,6 +801,7 @@ impl Panes {
                 window.focus(&focus, cx);
             }
             Some(View::GitHub(github)) => github.update(cx, |g, cx| g.shown(window, cx)),
+            Some(View::Notes(notes)) => notes.update(cx, |n, cx| n.shown(window, cx)),
             Some(View::Review(_)) | None => self.focus.focus(window, cx),
         }
     }
@@ -848,6 +863,19 @@ impl Panes {
             Some(at) => self.activate_at(at, window, cx),
             None => self.push_tab(View::GitHub(self.github.clone()), window, cx),
         }
+    }
+
+    /// Show the notes, opening them in a new tab if needed.
+    pub fn show_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.find(|v| matches!(v, View::Notes(_))) {
+            Some(at) => self.activate_at(at, window, cx),
+            None => self.push_tab(View::Notes(self.notes.clone()), window, cx),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn notes_are_showing(&self) -> bool {
+        matches!(self.active_view(), Some(View::Notes(_)))
     }
 
     #[cfg(test)]
@@ -1199,6 +1227,7 @@ impl Panes {
             View::Terminal(term) => term.clone().into_any_element(),
             View::Review(review) => review.clone().into_any_element(),
             View::GitHub(github) => github.clone().into_any_element(),
+            View::Notes(notes) => notes.clone().into_any_element(),
         };
         // A terminal's own background fills its whole pane, grip bar and all, so no strip of
         // the content's background shows round it. Other views paint the content's background.
@@ -1337,6 +1366,7 @@ fn view_label(view: &View, cx: &App) -> (String, Option<Hsla>) {
         }
         View::Review(review) => (review.read(cx).title(cx), None),
         View::GitHub(github) => (github.read(cx).title(), None),
+        View::Notes(notes) => (notes.read(cx).title(cx), None),
     }
 }
 
@@ -1496,10 +1526,32 @@ mod tests {
                 let changes = cx.new(|cx| ProjectChanges::new(project.clone(), cx));
                 let review = cx.new(|cx| ReviewView::new(changes.clone(), true, cx));
                 let github = cx.new(|cx| crate::github_view::GitHubView::new(project.clone(), None, None, window, cx));
+                let store = cx.new(|cx| crate::notes::NotesStore::new(&project.join(".notes-test"), cx));
+                let notes = cx.new(|cx| {
+                    crate::notes_view::NotesView::new(
+                        store,
+                        gpui_kit::WeakEntity::new_invalid(),
+                        "p1".into(),
+                        "proj".into(),
+                        project.clone(),
+                        cx,
+                    )
+                });
                 let agent = cx.new(|cx| crate::agent_slot::AgentSlot::new(project.clone(), changes, cx));
                 let start = Start { thread: start_thread.then(|| ("t1".to_string(), thread.clone())), terminal: true };
                 let panes = cx.new(|cx| {
-                    Panes::new(project, layout.as_ref(), agent, review, github, start, Some(shell.clone()), window, cx)
+                    Panes::new(
+                        project,
+                        layout.as_ref(),
+                        agent,
+                        review,
+                        github,
+                        notes,
+                        start,
+                        Some(shell.clone()),
+                        window,
+                        cx,
+                    )
                 });
                 cx.subscribe(&panes, move |_, event: &PaneEvent, _| {
                     log.borrow_mut().push(match event {

@@ -69,6 +69,7 @@ pub static COMMANDS: &[Command] = &[
     command!("focus_agent", "Focus the agent's prompt box", Projects, WS, ["ctrl-shift-l"], workspace::FocusAgent),
     command!("find", "Find a project or thread", Projects, WS, ["ctrl-space"], workspace::OpenSwitcher),
     command!("open_github", "Open the project's GitHub tab", Projects, WS, ["ctrl-shift-g"], workspace::OpenGitHub),
+    command!("open_notes", "Open the project's notes", Projects, WS, ["ctrl-shift-n"], workspace::OpenNotes),
     command!("settings", "Open settings", Window, WS, ["ctrl-,"], workspace::OpenSettings),
     command!("toggle_sidebar", "Show or hide the sidebar", Window, WS, ["ctrl-shift-s"], workspace::ToggleSidebar),
     // Ctrl+T and Ctrl+W, like a browser. A terminal keeps them for its shell (transpose, delete a

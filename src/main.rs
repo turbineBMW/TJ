@@ -19,6 +19,9 @@ mod history;
 mod images;
 mod keybindings;
 mod keymap;
+mod notes;
+mod notes_mcp;
+mod notes_view;
 mod omarchy;
 mod overview;
 mod panes;
@@ -61,6 +64,8 @@ struct Args {
     review: bool,
     /// Open the project's GitHub tab.
     github: bool,
+    /// Open the project's notes.
+    notes: bool,
 }
 
 impl Args {
@@ -76,6 +81,7 @@ impl Args {
             project: value("--project").map(PathBuf::from),
             review: args.iter().any(|a| a == "--review"),
             github: args.iter().any(|a| a == "--github"),
+            notes: args.iter().any(|a| a == "--notes"),
         }
     }
 
@@ -101,11 +107,22 @@ impl Args {
             no_summaries: false,
             review: self.review,
             github: self.github,
+            notes: self.notes,
         }
     }
 }
 
 fn main() {
+    // `tj notes-mcp …`: the notes server TJ gives each Claude session, not the app.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("notes-mcp") {
+        let result = notes_mcp::Context::from_args(&raw).and_then(|context| notes_mcp::run(&context));
+        if let Err(err) = result {
+            eprintln!("tj notes-mcp: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let args = Args::parse();
     // The icon SVGs (the full Lucide set) must be registered, or icons render blank.
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
