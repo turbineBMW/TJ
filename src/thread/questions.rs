@@ -490,19 +490,15 @@ impl ThreadView {
             v_flex()
                 .gap_1()
                 .child(
-                    h_flex()
-                        .items_start()
-                        .gap_2()
-                        .when(!q.header.is_empty(), |el| el.child(chip(&q.header)))
-                        .child(
-                            div()
-                                .debug_selector(|| "modal-question".into())
-                                .flex_1()
-                                .min_w_0()
-                                .text_sm()
-                                .text_color(fg)
-                                .child(q.question.clone()),
-                        ),
+                    h_flex().items_start().gap_2().when(!q.header.is_empty(), |el| el.child(chip(&q.header))).child(
+                        div()
+                            .debug_selector(|| "modal-question".into())
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(fg)
+                            .child(q.question.clone()),
+                    ),
                 )
                 .child(
                     v_flex()
