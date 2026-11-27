@@ -477,6 +477,8 @@ impl ThreadView {
                     .child(div().flex_none().text_color(if picked { accent } else { muted }).child(mark))
                     .child(
                         v_flex()
+                            .debug_selector(move || format!("modal-option-{oi}"))
+                            .flex_1()
                             .min_w_0()
                             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(label.clone()))
                             .when(!description.is_empty(), |el| {
@@ -489,9 +491,18 @@ impl ThreadView {
                 .gap_1()
                 .child(
                     h_flex()
+                        .items_start()
                         .gap_2()
                         .when(!q.header.is_empty(), |el| el.child(chip(&q.header)))
-                        .child(div().text_sm().text_color(fg).child(q.question.clone())),
+                        .child(
+                            div()
+                                .debug_selector(|| "modal-question".into())
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .text_color(fg)
+                                .child(q.question.clone()),
+                        ),
                 )
                 .child(
                     v_flex()
@@ -540,6 +551,7 @@ impl ThreadView {
         };
 
         let panel = v_flex()
+            .debug_selector(|| "question-modal".into())
             .id("question-modal")
             .test_support()
             .key_context(MODAL_CONTEXT)

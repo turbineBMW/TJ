@@ -2298,7 +2298,9 @@ impl ThreadView {
                 let pending = outcome.is_none();
                 let fg = theme.foreground;
                 let questions = card.questions.iter().map(|q| {
+                    // The question wraps beside its header chip rather than running off the card.
                     h_flex()
+                        .items_start()
                         .gap_2()
                         .when(!q.header.is_empty(), |el| {
                             el.child(
@@ -2312,11 +2314,20 @@ impl ThreadView {
                                     .child(q.header.clone()),
                             )
                         })
-                        .child(div().text_sm().text_color(fg).child(q.question.clone()))
+                        .child(
+                            div()
+                                .debug_selector(|| "asked-question".into())
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .text_color(fg)
+                                .child(q.question.clone()),
+                        )
                 });
                 pad(div())
                     .child(
                         v_flex()
+                            .debug_selector(|| "asked-card".into())
                             .gap_2()
                             .p_3()
                             .rounded_md()
@@ -3658,6 +3669,42 @@ mod tests {
             ("Which branch?".to_string(), "release 2.0".to_string()),
         ]);
         assert_eq!(responses(&thread, cx), vec![Decision::Answer { answers: expected }]);
+    }
+
+    #[gpui_kit::test]
+    fn a_long_question_wraps_inside_the_modal_and_its_card(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let long = "In a shell, Ctrl+W deletes the previous word and Ctrl+T swaps two characters. ".repeat(4);
+        let event = AgentEvent::PermissionRequested(crate::agent::PermissionRequest {
+            id: "q1".into(),
+            tool_name: "AskUserQuestion".into(),
+            tool_use_id: None,
+            description: None,
+            input: serde_json::json!({ "questions": [
+                { "question": long, "header": "Ctrl+T/W", "multiSelect": false,
+                  "options": [{ "label": "Shell keeps them", "description": long },
+                              { "label": "Tabs take them", "description": "" }] }
+            ]}),
+            suggestions: Vec::new(),
+            reason: None,
+            no_standing_grant: false,
+        });
+        first_card(&thread, vec![event], cx);
+        frame(cx);
+        let inside = |outer: gpui_kit::Bounds<gpui_kit::Pixels>, inner: gpui_kit::Bounds<gpui_kit::Pixels>| {
+            inner.origin.x >= outer.origin.x && inner.right() <= outer.right()
+        };
+        let modal = cx.debug_bounds("question-modal").expect("the modal is open");
+        let text = cx.debug_bounds("modal-question").expect("the open question's text");
+        assert!(inside(modal, text), "the question wraps inside the modal: {text:?} in {modal:?}");
+        assert!(text.size.height > px(30.), "on more than one line: {text:?}");
+        let option = cx.debug_bounds("modal-option-0").expect("the first option");
+        assert!(inside(modal, option), "the option's description wraps too: {option:?} in {modal:?}");
+
+        let card = cx.debug_bounds("asked-card").expect("the card in the conversation");
+        let text = cx.debug_bounds("asked-question").expect("the card's question");
+        assert!(inside(card, text), "the question wraps inside its card: {text:?} in {card:?}");
     }
 
     #[gpui_kit::test]
