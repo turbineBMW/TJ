@@ -81,6 +81,8 @@ pub fn bindings() -> Vec<KeyBinding> {
 pub enum GitHubEvent {
     /// The account picked for this project (`None`: TJ picks).
     AccountChosen(Option<String>),
+    /// The merge method picked from the merge button's menu.
+    MergeMethodChosen(MergeMethod),
     /// Open a file of a pull request in the review modal, with its summary.
     ExpandFile(ExpandFile),
 }
@@ -159,6 +161,8 @@ pub struct GitHubView {
     comment_box: Entity<TextareaState>,
     review_box: Entity<TextareaState>,
     merge_method: MergeMethod,
+    /// The merge method last picked for the project, which the merge button starts on.
+    last_merge_method: Option<MergeMethod>,
     delete_branch: bool,
     local: Option<LocalStatus>,
     branches: Vec<Branch>,
@@ -194,7 +198,13 @@ pub struct GitHubView {
 }
 
 impl GitHubView {
-    pub fn new(root: PathBuf, chosen: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        chosen: Option<String>,
+        last_merge_method: Option<MergeMethod>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let textarea = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 12).placeholder(placeholder))
         };
@@ -235,6 +245,7 @@ impl GitHubView {
             comment_box,
             review_box,
             merge_method: MergeMethod::Squash,
+            last_merge_method,
             delete_branch: true,
             local: None,
             branches: Vec::new(),
@@ -318,8 +329,7 @@ impl GitHubView {
                         this.remote = remote;
                         this.account = account;
                         this.delete_branch = true;
-                        this.merge_method =
-                            MergeMethod::ALL.into_iter().find(|m| m.allowed(&info)).unwrap_or(MergeMethod::Squash);
+                        this.merge_method = MergeMethod::initial(this.last_merge_method, &info);
                         this.info = info;
                         if let Some((login, _)) = this.account.clone() {
                             this.want_avatars([login], cx);
@@ -598,6 +608,15 @@ impl GitHubView {
             self.detail = None;
             self.load_prs(cx);
         }
+    }
+
+    fn choose_merge_method(&mut self, method: MergeMethod, cx: &mut Context<Self>) {
+        self.merge_method = method;
+        if self.last_merge_method != Some(method) {
+            self.last_merge_method = Some(method);
+            cx.emit(GitHubEvent::MergeMethodChosen(method));
+        }
+        cx.notify();
     }
 
     fn choose_account(&mut self, login: Option<String>, cx: &mut Context<Self>) {
@@ -1902,12 +1921,7 @@ impl GitHubView {
                                 for m in &methods {
                                     let (this, m) = (this.clone(), *m);
                                     menu = menu.item(PopupMenuItem::new(m.label()).checked(m == method).on_click(
-                                        move |_, _, cx| {
-                                            this.update(cx, |v, cx| {
-                                                v.merge_method = m;
-                                                cx.notify();
-                                            })
-                                        },
+                                        move |_, _, cx| this.update(cx, |v, cx| v.choose_merge_method(m, cx)),
                                     ));
                                 }
                                 menu

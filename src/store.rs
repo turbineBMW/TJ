@@ -314,6 +314,9 @@ pub struct Project {
     /// The GitHub account (a `gh` login) for the GitHub tab; picked from the remote when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_account: Option<String>,
+    /// The merge method last picked in the GitHub tab, which its merge button starts on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_merge_method: Option<crate::github::MergeMethod>,
 }
 
 /// The picture chosen for a project.
@@ -486,6 +489,7 @@ impl State {
             layout: None,
             image: None,
             github_account: None,
+            github_merge_method: None,
         });
         self.projects.last_mut().unwrap()
     }

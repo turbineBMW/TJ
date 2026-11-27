@@ -20,6 +20,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const HOST: &str = "github.com";
@@ -733,7 +734,8 @@ pub fn reply(token: &str, remote: &Remote, number: u64, to: u64, body: &str) -> 
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MergeMethod {
     Squash,
     Merge,
@@ -742,6 +744,14 @@ pub enum MergeMethod {
 
 impl MergeMethod {
     pub const ALL: [MergeMethod; 3] = [MergeMethod::Squash, MergeMethod::Merge, MergeMethod::Rebase];
+
+    /// The method the merge button starts on: the one last picked for the project if the
+    /// repository still allows it, else the first it allows.
+    pub fn initial(last: Option<MergeMethod>, info: &RepoInfo) -> MergeMethod {
+        last.filter(|m| m.allowed(info))
+            .or_else(|| MergeMethod::ALL.into_iter().find(|m| m.allowed(info)))
+            .unwrap_or(MergeMethod::Squash)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -1019,6 +1029,19 @@ pub fn ago(iso: &str, now: chrono::DateTime<chrono::Utc>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_merge_button_starts_on_the_last_method_the_repository_still_allows() {
+        use super::{MergeMethod, RepoInfo};
+        let all = RepoInfo { allow_squash: true, allow_merge: true, allow_rebase: true, ..Default::default() };
+        assert_eq!(MergeMethod::initial(None, &all), MergeMethod::Squash, "nothing picked yet: the first allowed");
+        assert_eq!(MergeMethod::initial(Some(MergeMethod::Merge), &all), MergeMethod::Merge);
+        let no_merge = RepoInfo { allow_merge: false, ..all.clone() };
+        assert_eq!(MergeMethod::initial(Some(MergeMethod::Merge), &no_merge), MergeMethod::Squash);
+        let rebase_only = RepoInfo { allow_rebase: true, ..Default::default() };
+        assert_eq!(MergeMethod::initial(Some(MergeMethod::Merge), &rebase_only), MergeMethod::Rebase);
+        assert_eq!(serde_json::to_string(&MergeMethod::Merge).unwrap(), "\"merge\"");
+    }
+
     #[test]
     fn last_patch_line_is_the_end_of_the_last_file() {
         let patch = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n\

@@ -1391,7 +1391,15 @@ impl Workspace {
             .entry(project.id.clone())
             .or_insert_with(|| cx.new(|cx| ReviewView::new(changes.clone(), no_summaries, cx)))
             .clone();
-        let github = cx.new(|cx| GitHubView::new(project.path.clone(), project.github_account.clone(), window, cx));
+        let github = cx.new(|cx| {
+            GitHubView::new(
+                project.path.clone(),
+                project.github_account.clone(),
+                project.github_merge_method,
+                window,
+                cx,
+            )
+        });
         let github_project = project.id.clone();
         let github_root = project.path.clone();
         self._subscriptions.push(cx.subscribe_in(&github, window, move |this, _, event: &GitHubEvent, window, cx| {
@@ -1399,6 +1407,12 @@ impl Workspace {
                 GitHubEvent::AccountChosen(login) => {
                     if let Some(project) = this.state.project_mut(&github_project) {
                         project.github_account = login.clone();
+                    }
+                    this.save();
+                }
+                GitHubEvent::MergeMethodChosen(method) => {
+                    if let Some(project) = this.state.project_mut(&github_project) {
+                        project.github_merge_method = Some(*method);
                     }
                     this.save();
                 }
@@ -2639,6 +2653,11 @@ mod tests {
         assert_eq!(State::load(&paths).unwrap().projects[0].github_account.as_deref(), Some("work-login"));
         github.update(cx, |_, cx| cx.emit(crate::github_view::GitHubEvent::AccountChosen(None)));
         assert_eq!(State::load(&paths).unwrap().projects[0].github_account, None);
+
+        // So is the merge method picked last.
+        use crate::github::MergeMethod;
+        github.update(cx, |_, cx| cx.emit(crate::github_view::GitHubEvent::MergeMethodChosen(MergeMethod::Merge)));
+        assert_eq!(State::load(&paths).unwrap().projects[0].github_merge_method, Some(MergeMethod::Merge));
     }
 
     #[gpui_kit::test]
