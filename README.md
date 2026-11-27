@@ -33,6 +33,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
   |---|---|
   | `Ctrl+Alt+N` / `Ctrl+Alt+P` | Next / previous project (down / up the sidebar, wrapping round). A project comes back as you left it: the same thread, panes and tabs. |
   | `Ctrl+Shift+O` | A new thread in the project on show (its start screen) |
+  | `Ctrl+Shift+L` | Back to the project's agent, with the caret in its prompt box, from any tab or split (a terminal, the GitHub tab, the review). A closed agent opens again in its own tab |
   | `Ctrl+Shift+G` | The project's GitHub tab: pull requests, reviews, merging, branches, pull and push, on the project's own account |
   | `Ctrl+Space` | Find a project or thread: a filtered list of every project with its threads under it. **↑/↓** move, **Enter** opens; a project opens a new thread's start screen in it, a thread opens that thread. A thread matches on its title or its project's name. |
   | `Ctrl+,` | Settings |

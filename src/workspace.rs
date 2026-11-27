@@ -44,7 +44,7 @@ pub const CONTEXT: &str = "Workspace";
 // Window-wide commands. Their keys are in `keybindings::COMMANDS`, and settings can change them.
 gpui_kit::actions!(
     workspace,
-    [ToggleSidebar, NextProject, PreviousProject, NewThread, OpenSwitcher, OpenSettings, OpenGitHub]
+    [ToggleSidebar, NextProject, PreviousProject, NewThread, OpenSwitcher, OpenSettings, OpenGitHub, FocusAgent]
 );
 /// The agent mark at the end of a thread's row in the sidebar.
 const MARK_SIZE: f32 = 14.0;
@@ -1360,6 +1360,23 @@ impl Workspace {
         view.update(cx, |v, cx| v.focus(window, cx));
     }
 
+    /// Bring the project's agent to the front from wherever focus is (a terminal, the GitHub
+    /// tab, another split) and put the caret in its prompt box. A closed agent opens again in
+    /// a tab of its own; a project with no thread to show starts one.
+    fn focus_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self.active_project_id() else { return };
+        let shown = self
+            .agents
+            .get(&project_id)
+            .and_then(|a| a.read(cx).thread_id().map(str::to_string))
+            .or_else(|| self.active.clone())
+            .filter(|id| self.state.thread(id).is_some());
+        match shown {
+            Some(thread_id) => self.open_thread(&thread_id, window, cx),
+            None => self.new_thread(&project_id, window, cx),
+        }
+    }
+
     /// Show the project's GitHub tab.
     fn open_github(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project_id) = self.active_project().map(|p| p.id.clone()) else { return };
@@ -2109,6 +2126,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread_here(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSwitcher, window, cx| this.open_switcher(window, cx)))
             .on_action(cx.listener(|this, _: &OpenGitHub, window, cx| this.open_github(window, cx)))
+            .on_action(cx.listener(|this, _: &FocusAgent, window, cx| this.focus_agent(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .size_full()
             .text_color(fg)
@@ -2167,7 +2185,20 @@ mod tests {
         point, px, size,
     };
 
-    fn open(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<Workspace>, Paths, std::path::PathBuf) {
+    type Opened = (gpui_kit::AnyWindowHandle, Entity<Workspace>, Paths, std::path::PathBuf);
+
+    fn open(cx: &mut TestAppContext) -> Opened {
+        open_with_shell(cx, alacritty_terminal::tty::Shell::new("/bin/sh".into(), vec![]))
+    }
+
+    /// Terminals that print nothing (`sleep`), for tests that open one and let the scheduler
+    /// run: a shell's prompt would wake the view from the PTY's thread, which the test
+    /// scheduler rejects.
+    fn open_quiet(cx: &mut TestAppContext) -> Opened {
+        open_with_shell(cx, alacritty_terminal::tty::Shell::new("sleep".into(), vec!["60".into()]))
+    }
+
+    fn open_with_shell(cx: &mut TestAppContext, shell: alacritty_terminal::tty::Shell) -> Opened {
         let root = std::env::temp_dir().join(format!("tj-ws-{}", new_id()));
         let project = root.join("demo-project");
         std::fs::create_dir_all(&project).unwrap();
@@ -2179,7 +2210,7 @@ mod tests {
         let launch = Launch {
             project: Some(project.clone()),
             paths: Some(paths.clone()),
-            shell: Some(alacritty_terminal::tty::Shell::new("/bin/sh".into(), vec![])),
+            shell: Some(shell),
             no_summaries: true,
             ..Default::default()
         };
@@ -2998,6 +3029,37 @@ mod tests {
             .read_with(cx, |w, _| (w.active.clone().unwrap(), w.state.project(&second).unwrap().threads.len()));
         assert_ne!(active, second_thread, "a new thread is shown");
         assert_eq!(threads, 2, "in the project on show");
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_shift_l_brings_back_the_agent_and_its_prompt_box_from_any_pane(cx: &mut TestAppContext) {
+        let (window, workspace, _, _) = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        let on_prompt = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| thread.read(cx).prompt_focus(cx).is_focused(window))
+                && panes.read_with(cx, |p, cx| p.active_thread_id(cx).is_some())
+        };
+
+        // From another tab.
+        cx.simulate_keystrokes("ctrl-shift-g");
+        assert!(panes.read_with(cx, |p, _| p.github_is_showing()));
+        cx.simulate_keystrokes("ctrl-shift-l");
+        assert!(on_prompt(cx), "the agent's tab is on show, its prompt box focused");
+
+        // From a terminal split beside it.
+        panes.update_in(cx, |p, window, cx| p.split(crate::store::SplitDirection::Right, window, cx));
+        assert!(panes.read_with(cx, |p, _| p.active_terminal().is_some()));
+        cx.simulate_keystrokes("ctrl-shift-l");
+        assert!(on_prompt(cx), "focus leaves the terminal for the prompt box");
+
+        // A closed agent opens again.
+        panes.update_in(cx, |p, window, cx| p.close_tab(window, cx));
+        assert!(!panes.read_with(cx, |p, _| p.agent_on_show()));
+        cx.simulate_keystrokes("ctrl-shift-l");
+        assert!(on_prompt(cx), "the agent comes back in a tab of its own");
     }
 
     #[gpui_kit::test]
