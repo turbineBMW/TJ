@@ -3,6 +3,7 @@
 mod agent;
 mod agent_icon;
 mod agent_slot;
+mod attention;
 mod box_drawing;
 mod caret;
 mod changes;
@@ -108,6 +109,8 @@ fn main() {
     // The icon SVGs (the full Lucide set) must be registered, or icons render blank.
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
+        // Notifications go out as TJ, which also finds TJ's launcher entry and its icon.
+        cx.set_app_identity("dev.turbinebmw.TJ", "TJ");
         caret::init(cx);
         // gpui keeps running after its last window closes; TJ has only one, so quit with it.
         // Dropping the workspace also stops its claude processes.

@@ -16,6 +16,7 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::agent::{AgentEvent, claude::SessionOptions};
 use crate::agent_slot::{AgentSlot, AgentSlotEvent};
+use crate::attention::{self, Attention, AttentionKind, Reminder};
 use crate::changes::{ProjectChanges, ReviewView, Summarizer};
 use crate::github_view::{GitHubEvent, GitHubView};
 use crate::panes::{FLOAT_HEIGHT, FLOAT_INSET, PaneEvent, Panes, Start};
@@ -23,7 +24,8 @@ use crate::settings::Settings;
 use crate::store::SplitDirection;
 use crate::store::{self, Accounts, Paths, State};
 use crate::thread::{
-    self, Backend, MenuContext, Status, ThreadAction, ThreadChanged, ThreadSent, ThreadSetup, ThreadView,
+    self, Backend, MenuContext, Status, ThreadAction, ThreadChanged, ThreadNeedsYou, ThreadSent, ThreadSetup,
+    ThreadView,
 };
 use gpui_kit::assets::IconName;
 
@@ -51,6 +53,8 @@ const MARK_SIZE: f32 = 14.0;
 const IDLE_STOP: Duration = Duration::from_secs(10 * 60);
 /// At most this many idle Claude processes are kept, the most recently used.
 const IDLE_KEEP: usize = 3;
+/// How often reminders picked on a notification are checked for being due.
+const REMINDER_CHECK: Duration = Duration::from_secs(15);
 
 /// How the workspace starts.
 #[derive(Default)]
@@ -120,9 +124,13 @@ pub struct Workspace {
     found_icons: HashMap<String, Option<PathBuf>>,
     /// The settings modal, while it's open.
     settings_view: Option<WeakEntity<crate::settings_view::SettingsView>>,
+    /// The window has the keyboard, so a thread on screen is being looked at.
+    window_active: bool,
     _subscriptions: Vec<Subscription>,
     /// Checks every minute for Claude processes idle long enough to stop.
     _idle_check: Option<Task<()>>,
+    /// Shows reminders picked on notifications when they're due.
+    _reminder_check: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -169,8 +177,10 @@ impl Workspace {
             found_icons: HashMap::new(),
             no_summaries: launch.no_summaries,
             settings_view: None,
+            window_active: window.is_window_active(),
             _subscriptions: Vec::new(),
             _idle_check: None,
+            _reminder_check: None,
         };
         this._idle_check = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -212,6 +222,7 @@ impl Workspace {
             this.open_github(window, cx);
         }
         this.find_icons(cx);
+        this.watch_attention(window, cx);
         // Save each terminal's current directory when the window closes.
         let workspace = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
@@ -312,6 +323,9 @@ impl Workspace {
                 }
                 cx.notify();
             }));
+            let id = thread_id.to_string();
+            self._subscriptions
+                .push(cx.subscribe(&thread, move |this, _, event: &ThreadNeedsYou, cx| this.needs_you(&id, event, cx)));
             let id = thread_id.to_string();
             self._subscriptions.push(cx.subscribe(&thread, move |this, _, _: &ThreadSent, cx| {
                 this.state.touch_thread(&id);
@@ -458,6 +472,7 @@ impl Workspace {
         let Some(project_id) = self.state.thread(thread_id).map(|(p, _)| p.id.clone()) else { return };
         self.active = Some(thread_id.to_string());
         self.state.selected_thread = self.active.clone();
+        self.mark_seen(thread_id);
         let start = Some((thread_id.to_string(), view.clone()));
         if let Some(panes) = self.project_panes(&project_id, start, window, cx) {
             let id = thread_id.to_string();
@@ -492,6 +507,133 @@ impl Workspace {
             meta.updated_at = store::now();
         }
         self.save();
+    }
+
+    // ---------- notifications ----------
+
+    /// Follow the window's focus, answer clicks on notifications, and show reminders when due.
+    fn watch_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            this.window_active = window.is_window_active();
+            this.mark_shown_seen(cx);
+        }));
+        let (workspace, handle) = (cx.entity().downgrade(), window.window_handle());
+        cx.on_system_notification_response(move |response, cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                workspace.update(cx, |w, cx| w.notification_response(response, window, cx))
+            });
+        });
+        self._reminder_check = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REMINDER_CHECK).await;
+                if this.update(cx, |w: &mut Workspace, cx| w.show_due_reminders(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Whether the user is looking at the thread: the window has the keyboard and the thread
+    /// is in its project's agent, in the tab on show.
+    fn on_screen(&self, thread_id: &str, cx: &App) -> bool {
+        self.window_active
+            && self.active.as_deref() == Some(thread_id)
+            && self.active_project().and_then(|p| self.panes.get(&p.id)).is_some_and(|p| p.read(cx).agent_on_show())
+    }
+
+    /// A thread asked something or finished. Unless the user is looking at it, mark it in the
+    /// sidebar and say so in a notification.
+    fn needs_you(&mut self, thread_id: &str, event: &ThreadNeedsYou, cx: &mut Context<Self>) {
+        if self.on_screen(thread_id, cx) {
+            return;
+        }
+        let Some(meta) = self.state.thread_mut(thread_id) else { return };
+        // Approvals often come several at once, and a failed turn is often followed by its
+        // process exiting: one notification until the thread is seen.
+        let again = meta.unseen.as_ref().is_some_and(|a| {
+            a.kind == event.kind && a.kind != AttentionKind::Finished || a.kind.is_waiting() && event.kind.is_waiting()
+        });
+        meta.unseen = Some(Attention { kind: event.kind, detail: event.detail.clone(), at: store::now() });
+        if !again {
+            // A reminder about what it wanted before is out of date now.
+            self.state.reminders.retain(|r| r.thread_id != thread_id);
+            self.show_notification(thread_id, cx);
+        }
+        self.save();
+        cx.notify();
+    }
+
+    /// The notification for what the thread wants, if it still hasn't been seen.
+    fn show_notification(&self, thread_id: &str, cx: &App) {
+        let Some((project, meta)) = self.state.thread(thread_id) else { return };
+        let Some(attention) = &meta.unseen else { return };
+        let title = meta.title.as_deref().unwrap_or("New thread");
+        cx.show_system_notification(attention::notification(
+            thread_id,
+            meta.agent.label(),
+            &project.name,
+            title,
+            attention,
+        ));
+    }
+
+    /// A click on a notification opens its thread; a button brings the notification back later.
+    fn notification_response(
+        &mut self,
+        response: SystemNotificationResponse,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_id = response.tag.to_string();
+        if self.state.thread(&thread_id).is_none() {
+            return;
+        }
+        match response.action_id {
+            None => {
+                self.open_thread(&thread_id, window, cx);
+                window.activate_window();
+                attention::focus_on_hyprland();
+            }
+            Some(action) => {
+                let Some(due) = attention::remind_at(&action, store::now()) else { return };
+                self.state.reminders.retain(|r| r.thread_id != thread_id);
+                self.state.reminders.push(Reminder { thread_id, due });
+                self.save();
+            }
+        }
+    }
+
+    /// Show the notifications whose reminders are due, for threads still not looked at.
+    /// Reminders due while TJ was closed show once it's open again.
+    fn show_due_reminders(&mut self, cx: &mut Context<Self>) {
+        let now = store::now();
+        if !self.state.reminders.iter().any(|r| r.due <= now) {
+            return;
+        }
+        let (due, later) = std::mem::take(&mut self.state.reminders).into_iter().partition(|r| r.due <= now);
+        self.state.reminders = later;
+        for reminder in due {
+            self.show_notification(&reminder.thread_id, cx);
+        }
+        self.save();
+    }
+
+    /// The thread has been looked at: take its mark off, and drop its reminders.
+    fn mark_seen(&mut self, thread_id: &str) {
+        let reminders = self.state.reminders.len();
+        self.state.reminders.retain(|r| r.thread_id != thread_id);
+        let marked = self.state.thread_mut(thread_id).and_then(|meta| meta.unseen.take()).is_some();
+        if marked || reminders != self.state.reminders.len() {
+            self.save();
+        }
+    }
+
+    /// Mark the thread on screen seen, if the user is looking at it.
+    fn mark_shown_seen(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.active.clone().filter(|id| self.on_screen(id, cx)) {
+            self.mark_seen(&id);
+            cx.notify();
+        }
     }
 
     // ---------- renaming, archiving, deleting ----------
@@ -683,11 +825,13 @@ impl Workspace {
     // ---------- history ----------
 
     /// A thread the sidebar lists even past its first few: the open one, one being renamed,
-    /// and one working or waiting for the user, so none of those is lost in the history.
+    /// one working or waiting for the user, and one not looked at since it asked something or
+    /// finished, so none of those is lost in the history.
     fn pinned(&self, meta: &store::ThreadMeta, cx: &App) -> bool {
         self.active.as_deref() == Some(meta.id.as_str())
             || self.renaming.as_ref().is_some_and(|(id, _)| *id == meta.id)
             || self.threads.get(&meta.id).is_some_and(|t| t.read(cx).status != Status::Idle)
+            || meta.unseen.is_some()
     }
 
     /// The project's threads the sidebar doesn't list, last touched first. Only their saved
@@ -1297,11 +1441,14 @@ impl Workspace {
                     project.area = layout;
                     project.layout = None;
                 }
+                // The agent's tab may have come on show.
+                this.mark_shown_seen(cx);
                 this.save();
             }
             PaneEvent::ThreadFocused(thread) => {
                 this.active = Some(thread.clone());
                 this.state.selected_thread = this.active.clone();
+                this.mark_shown_seen(cx);
                 this.save();
                 cx.notify();
             }
@@ -1347,7 +1494,7 @@ impl Workspace {
         let theme = cx.theme();
         let (muted, accent_bg, fg) =
             (theme.sidebar_foreground.opacity(0.6), theme.sidebar_accent, theme.sidebar_foreground);
-        let waiting = theme.primary;
+        let (waiting, done, stopped) = (theme.primary, theme.success, theme.danger);
         let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
         let sidebar_bg = theme.sidebar.opacity(alpha);
         // The selected thread is a card like the status column's sections, see-through with the
@@ -1361,7 +1508,16 @@ impl Workspace {
         let thread_row = |meta: &store::ThreadMeta, cx: &mut Context<Self>| {
             let id = meta.id.clone();
             let status = self.threads.get(&meta.id).map(|t| t.read(cx).status).unwrap_or(Status::Idle);
-            let dot = (status == Status::AwaitingApproval).then_some(waiting);
+            // Not looked at since it asked something (?), finished (✓) or stopped on a problem
+            // (!): the row is tinted and its title bold, with the mark where the waiting dot
+            // would be.
+            let unseen = meta.unseen.as_ref().map(|a| a.kind);
+            let unseen_mark = unseen.map(|kind| match kind {
+                AttentionKind::Finished => (IconName::CircleCheck, done, "Finished, not looked at yet"),
+                AttentionKind::Stopped => (IconName::CircleAlert, stopped, "Stopped on a problem, not looked at yet"),
+                _ => (IconName::CircleQuestionMark, waiting, "Waiting for you, not looked at yet"),
+            });
+            let dot = (status == Status::AwaitingApproval && unseen.is_none()).then_some(waiting);
             let mark = MARK_SIZE * if status == Status::Running { breath } else { 1.0 };
             let selected = active.as_deref() == Some(meta.id.as_str());
             let editing = renaming.as_ref().filter(|(r, _)| *r == meta.id).map(|(_, input)| input.clone());
@@ -1373,6 +1529,7 @@ impl Workspace {
                 .text_ellipsis()
                 .text_sm()
                 .text_color(if meta.archived { muted } else { fg })
+                .when(unseen.is_some(), |el| el.font_weight(FontWeight::SEMIBOLD))
                 .child(meta.title.clone().unwrap_or_else(|| "New thread".into()));
             let menu =
                 {
@@ -1402,7 +1559,11 @@ impl Workspace {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .map(|el| if selected { el.bg(selected_bg) } else { el.hover(|el| el.bg(hover_bg)) })
+                .map(|el| match (selected, unseen_mark) {
+                    (true, _) => el.bg(selected_bg),
+                    (false, Some((_, color, _))) => el.bg(color.opacity(0.14)).hover(|el| el.bg(color.opacity(0.22))),
+                    (false, None) => el.hover(|el| el.bg(hover_bg)),
+                })
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     // A double click renames, as in a file manager.
                     if event.click_count() >= 2 {
@@ -1426,6 +1587,21 @@ impl Workspace {
                     None => el.child(label),
                 })
                 .when_some(dot, |el, color| el.child(div().size_2().rounded_full().bg(color)))
+                .when_some(unseen_mark, |el, (icon, color, tip)| {
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("thread-unseen-{}", meta.id)))
+                            .debug_selector({
+                                let id = meta.id.clone();
+                                move || format!("thread-unseen-{id}")
+                            })
+                            .flex_none()
+                            .child(Icon::new(icon).small().text_color(color))
+                            .tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx)
+                            }),
+                    )
+                })
                 .child(
                     div()
                         .id(SharedString::from(format!("thread-agent-{}", meta.id)))
@@ -2037,6 +2213,78 @@ mod tests {
         workspace.update_in(cx, |w, window, cx| w.new_thread(&project_id, window, cx));
         let second = workspace.read_with(cx, |w, _| w.active.clone().unwrap());
         (project_id, first, second)
+    }
+
+    #[gpui_kit::test]
+    fn a_thread_that_asks_or_finishes_unseen_is_marked_until_looked_at_and_can_remind(cx: &mut TestAppContext) {
+        use crate::attention::{AttentionKind, REMIND_10_MINUTES, REMIND_TOMORROW};
+        use crate::thread::ThreadNeedsYou;
+        let (window, workspace, paths, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (_, first, second) = two_threads(&workspace, cx);
+        let ask = |thread: &str, kind: AttentionKind, cx: &mut VisualTestContext| {
+            let view = workspace.read_with(cx, |w, _| w.threads[thread].clone());
+            view.update(cx, |_, cx| cx.emit(ThreadNeedsYou { kind, detail: "Which colour?".into() }));
+        };
+        let unseen = |thread: &str, _: &mut VisualTestContext| {
+            let saved = State::load(&paths).unwrap();
+            saved.projects[0].threads.iter().find(|t| t.id == thread).unwrap().unseen.as_ref().map(|a| a.kind)
+        };
+
+        // The thread on screen, with the window focused, is being looked at: nothing to mark.
+        workspace.update(cx, |w, _| w.window_active = true);
+        ask(&second, AttentionKind::Finished, cx);
+        assert_eq!(unseen(&second, cx), None);
+
+        // One that isn't on screen is marked, and the mark is drawn in its row.
+        ask(&first, AttentionKind::Question, cx);
+        assert_eq!(unseen(&first, cx), Some(AttentionKind::Question));
+        cx.update(|window, cx| window.render_frame(cx));
+        // Selectors are 'static.
+        let mark = |thread: &str| -> &'static str { format!("thread-unseen-{thread}").leak() };
+        assert!(cx.debug_bounds(mark(&first)).is_some());
+        assert!(cx.debug_bounds(mark(&second)).is_none());
+
+        // With the window in the background, the thread on screen is marked too, until the
+        // window is focused again.
+        workspace.update(cx, |w, _| w.window_active = false);
+        ask(&second, AttentionKind::Finished, cx);
+        assert_eq!(unseen(&second, cx), Some(AttentionKind::Finished));
+        workspace.update(cx, |w, cx| {
+            w.window_active = true;
+            w.mark_shown_seen(cx);
+        });
+        assert_eq!(unseen(&second, cx), None);
+
+        // A button on the notification brings it back later; a reminder past due shows and goes.
+        let respond = |action: Option<&str>, cx: &mut VisualTestContext| {
+            let response = gpui_kit::SystemNotificationResponse {
+                tag: first.clone().into(),
+                action_id: action.map(|a| SharedString::from(a.to_string())),
+            };
+            workspace.update_in(cx, |w, window, cx| w.notification_response(response, window, cx));
+        };
+        let now = crate::store::now();
+        respond(Some(REMIND_10_MINUTES), cx);
+        let reminders = State::load(&paths).unwrap().reminders;
+        assert_eq!(reminders.len(), 1);
+        assert!(reminders[0].thread_id == first && (now + 600..=now + 602).contains(&reminders[0].due));
+        respond(Some(REMIND_TOMORROW), cx);
+        let reminders = State::load(&paths).unwrap().reminders;
+        assert!(reminders.len() == 1 && reminders[0].due > now + 600, "the later one replaces it");
+        workspace.update(cx, |w, cx| {
+            w.state.reminders[0].due = now - 1;
+            w.show_due_reminders(cx);
+        });
+        assert!(State::load(&paths).unwrap().reminders.is_empty());
+        assert_eq!(unseen(&first, cx), Some(AttentionKind::Question), "still not looked at");
+
+        // Clicking the notification opens the thread, which takes its mark and reminders off.
+        respond(Some(REMIND_10_MINUTES), cx);
+        respond(None, cx);
+        assert_eq!(workspace.read_with(cx, |w, _| w.active.clone()), Some(first.clone()));
+        assert_eq!(unseen(&first, cx), None);
+        assert!(State::load(&paths).unwrap().reminders.is_empty());
     }
 
     #[gpui_kit::test]

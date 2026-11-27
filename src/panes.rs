@@ -633,6 +633,13 @@ impl Panes {
         matches!(self.active_view(), Some(View::Review(_)))
     }
 
+    /// Whether the agent is on screen: in the tab on show, focused or not.
+    pub fn agent_on_show(&self) -> bool {
+        self.tabs.get(self.active).is_some_and(|tab| {
+            tab.pane_ids().into_iter().any(|id| matches!(tab.root.pane(id).map(|p| &p.view), Some(View::Agent(_))))
+        })
+    }
+
     /// The thread showing in the focused pane, if it shows the agent.
     pub fn active_thread_id(&self, cx: &App) -> Option<String> {
         self.active_view().and_then(|v| v.thread_id(cx))
