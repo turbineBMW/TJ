@@ -3,9 +3,10 @@
 //! follow the Omarchy theme. The header shows the tool, a one-line summary, a button that adds
 //! the call to the prompt, and a spinner, check or cross; the body is shaped for the tool (a
 //! little terminal for Bash, a diff for Edit) and scrolls once it reaches half the window. A
-//! Bash card shows its first lines and how long the command took; the rest opens in a dialog.
+//! Bash card is cut off at a fixed height and shows how long the command took; the rest opens
+//! in a dialog.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{cell::Cell, path::Path, rc::Rc, sync::Arc, time::Duration};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
@@ -179,18 +180,28 @@ pub struct Card<'a> {
     pub scroll: &'a ScrollHandle,
 }
 
-/// The most lines of command and output a Bash card shows; the rest opens in a dialog.
+/// The tallest a Bash card's command and output are drawn; the rest opens in a dialog. The
+/// height is what counts, since one long line can wrap many times.
+const SHELL_MAX_HEIGHT: Pixels = px(300.);
+/// The most lines of command and output a Bash card lays out. More than `SHELL_MAX_HEIGHT`
+/// holds; it only spares laying out text that's cut off anyway.
 pub const SHELL_LINES: usize = 30;
 /// Lines kept for the output when the command alone would fill the card.
 const SHELL_OUTPUT_LINES: usize = 10;
+/// The most characters of the command, and of the output, a Bash card lays out, for the same
+/// reason: a line of thousands of characters wraps far past `SHELL_MAX_HEIGHT`.
+const SHELL_CHARS: usize = 4_000;
 
 /// A Bash call's command and what it printed, coloured once and kept with the row.
 #[derive(Clone)]
 pub struct ShellText {
     command: Highlighted,
     output: Option<Highlighted>,
-    /// What the card shows when the whole text is longer than `SHELL_LINES`.
+    /// What the card lays out when the whole text is longer than `SHELL_LINES` or `SHELL_CHARS`.
     short: Option<Short>,
+    /// Whether the text, as last drawn, was taller than `SHELL_MAX_HEIGHT`. Shared with the
+    /// card's drawing, which measures it.
+    overflows: Rc<Cell<bool>>,
     failed: bool,
 }
 
@@ -200,14 +211,17 @@ struct Short {
     command: Highlighted,
     command_cut: bool,
     output: Option<Highlighted>,
-    /// Lines left out.
-    hidden: usize,
 }
 
 impl ShellText {
     pub fn new(command: &str) -> Self {
-        let mut shell =
-            ShellText { command: Highlighted::command(clean(command)), output: None, short: None, failed: false };
+        let mut shell = ShellText {
+            command: Highlighted::command(clean(command)),
+            output: None,
+            short: None,
+            overflows: Rc::default(),
+            failed: false,
+        };
         shell.shorten();
         shell
     }
@@ -219,24 +233,26 @@ impl ShellText {
         self.shorten();
     }
 
-    /// Lines the card leaves out; they're shown in the dialog.
-    pub fn hidden_lines(&self) -> usize {
-        self.short.as_ref().map_or(0, |short| short.hidden)
+    /// Whether the card leaves some of the text out, so it opens in the dialog.
+    pub fn is_cut(&self) -> bool {
+        self.short.is_some() || self.overflows.get()
     }
 
     fn shorten(&mut self) {
         let command = self.command.text.as_ref();
         let output = self.output.as_ref().map(|o| o.text.as_ref()).unwrap_or_default();
         let (c, o) = (command.lines().count(), output.lines().count());
-        let short = (c + o > SHELL_LINES).then(|| {
+        let too_long = c + o > SHELL_LINES || command.len() > SHELL_CHARS || output.len() > SHELL_CHARS;
+        let short = too_long.then(|| {
             // A long script leaves room for the start of what it printed.
             let keep_c = c.min(SHELL_LINES - o.min(SHELL_OUTPUT_LINES));
             let keep_o = o.min(SHELL_LINES - keep_c);
+            let kept_command = first_chars(first_lines(command, keep_c), SHELL_CHARS);
             Short {
-                command: Highlighted::command(first_lines(command, keep_c)),
-                command_cut: keep_c < c,
-                output: (keep_o > 0).then(|| Highlighted::output(first_lines(output, keep_o))),
-                hidden: c + o - keep_c - keep_o,
+                command_cut: kept_command.len() < command.trim_end().len(),
+                command: Highlighted::command(kept_command),
+                output: (keep_o > 0)
+                    .then(|| Highlighted::output(first_chars(first_lines(output, keep_o), SHELL_CHARS))),
             }
         });
         self.short = short;
@@ -245,6 +261,14 @@ impl ShellText {
 
 fn first_lines(text: &str, count: usize) -> String {
     text.lines().take(count).collect::<Vec<_>>().join("\n")
+}
+
+/// At most `max` bytes of `text`, cut at a character boundary.
+fn first_chars(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        text.truncate(text.floor_char_boundary(max));
+    }
+    text
 }
 
 /// "Took 40ms", "Took 2.4s", "Took 1m 12s", "Took 1h 3m".
@@ -396,7 +420,7 @@ const INNER_RADIUS: Pixels = px(5.);
 pub struct Actions<T, E, Q> {
     /// The header of any card but a Bash one: open or fold the card.
     pub toggle: T,
-    /// "Click to expand" under a long Bash card: open all of it in a dialog.
+    /// "Click to expand" over the bottom of a cut-off Bash card: open all of it in a dialog.
     pub expand: E,
     /// The header's button: add the call to the prompt, to ask about it.
     pub quote: Q,
@@ -510,8 +534,8 @@ where
                     .border_color(look.border)
                     .rounded_b(INNER_RADIUS)
                     .when_some(look.body_bg, |el, bg| el.bg(bg))
-                    // A Bash card is already cut to its first lines; scrolling would hide the
-                    // line that opens the rest.
+                    // A Bash card is already cut off at its own height, and opens the rest in a
+                    // dialog.
                     .when(card.shell.is_none(), |el| {
                         el.max_h(window.viewport_size().height * 0.5).overflow_y_scroll().track_scroll(card.scroll)
                     })
@@ -525,8 +549,9 @@ where
         .into_any_element()
 }
 
-/// A Bash card's body: the first lines of the command and its output, a line that opens the
-/// rest, any pictures, and how long the command took.
+/// A Bash card's body: the command and its output cut off at `SHELL_MAX_HEIGHT`, with a
+/// "Click to expand" over the bottom when there's more, then any pictures, and how long the
+/// command took.
 fn shell_card_body(
     card: &Card,
     shell: &ShellText,
@@ -537,23 +562,45 @@ fn shell_card_body(
         Some(short) => shell_body(&short.command, short.command_cut, short.output.as_ref(), shell.failed, look),
         None => shell_body(&shell.command, false, shell.output.as_ref(), shell.failed, look),
     };
-    let hidden = shell.hidden_lines();
+    // Whether the text is taller than the card is only known once it's laid out, so the
+    // drawing measures it and, when that changes, draws the window again. The "Click to
+    // expand" lies over the text, so the card's height doesn't change with it.
+    let overflows = shell.overflows.clone();
+    let measure = move |children: Vec<Bounds<Pixels>>, window: &mut Window, cx: &mut App| {
+        let height = children.iter().map(|b| b.size.height).fold(px(0.), |a, b| a.max(b));
+        let over = height > SHELL_MAX_HEIGHT + px(0.5);
+        if overflows.replace(over) != over {
+            window.defer(cx, |window, _| window.refresh());
+        }
+    };
+    let bg = look.body_bg.unwrap_or(look.header_bg);
     let hover = look.text;
-    v_flex()
-        .gap_2()
-        .child(text)
-        .when(hidden > 0, |el| {
-            el.child(
-                div()
-                    .id(SharedString::from(format!("tool-expand-{}", card.ix)))
-                    .test_support()
-                    .cursor_pointer()
+    let clipped = div()
+        .id(SharedString::from(format!("tool-expand-{}", card.ix)))
+        .test_support()
+        .relative()
+        .max_h(SHELL_MAX_HEIGHT)
+        .overflow_hidden()
+        .child(div().on_children_prepainted(measure).child(text))
+        .when(shell.is_cut(), |el| {
+            el.cursor_pointer().on_click(on_expand).child(
+                h_flex()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h_10()
+                    .items_end()
+                    .justify_center()
+                    .bg(linear_gradient(180., linear_color_stop(bg.opacity(0.), 0.), linear_color_stop(bg, 0.7)))
                     .text_color(look.dim)
                     .hover(move |el| el.text_color(hover))
-                    .on_click(on_expand)
-                    .child(format!("… {hidden} more line{} · Click to expand", if hidden == 1 { "" } else { "s" })),
+                    .child("Click to expand"),
             )
-        })
+        });
+    v_flex()
+        .gap_2()
+        .child(clipped)
         .children(card.pictures.iter().map(|p| picture_block(p, look)))
         .when_some(card.took, |el, took| el.child(div().text_color(look.dim.opacity(0.8)).child(took_label(took))))
         .into_any_element()
@@ -889,8 +936,8 @@ fn first_line(text: &str) -> String {
 mod tests {
     // Named imports: `super::*` would bring in gpui's `test` attribute in place of the standard one.
     use super::{
-        Diff, Duration, Family, Path, SHELL_LINES, ShellText, clean, header_summary, kind, line_diff, opens_by_default,
-        quote, title, took_label,
+        Diff, Duration, Family, Path, SHELL_CHARS, SHELL_LINES, ShellText, clean, header_summary, kind, line_diff,
+        opens_by_default, quote, title, took_label,
     };
     use serde_json::json;
 
@@ -940,27 +987,34 @@ mod tests {
     }
 
     #[test]
-    fn a_bash_card_shows_thirty_lines_and_counts_the_rest() {
+    fn a_bash_card_lays_out_at_most_thirty_lines_and_a_few_thousand_characters() {
         let lines = |n: usize| (1..=n).map(|i| format!("line {i}\n")).collect::<String>();
         let shown = |shell: &ShellText| {
             let short = shell.short.as_ref().expect("cut short");
             short.command.text.lines().count() + short.output.as_ref().map_or(0, |o| o.text.lines().count())
         };
-        // Short text is shown whole.
+        // Short text is laid out whole.
         let mut shell = ShellText::new("echo hi");
         shell.finish(&lines(SHELL_LINES - 1), false);
-        assert_eq!(shell.hidden_lines(), 0);
+        assert!(shell.short.is_none());
         // Long output is cut after the command.
         shell.finish(&lines(300), false);
-        assert_eq!((shown(&shell), shell.hidden_lines()), (SHELL_LINES, 271));
+        assert_eq!(shown(&shell), SHELL_LINES);
+        assert!(shell.is_cut());
         // A long script is cut too, and leaves room for the start of its output.
         let mut shell = ShellText::new(&lines(100));
-        assert_eq!((shown(&shell), shell.hidden_lines()), (SHELL_LINES, 70));
+        assert_eq!(shown(&shell), SHELL_LINES);
         shell.finish(&lines(50), false);
         let short = shell.short.as_ref().unwrap();
         assert!(short.command_cut);
         assert_eq!(short.output.as_ref().unwrap().text.lines().count(), 10);
-        assert_eq!((shown(&shell), shell.hidden_lines()), (SHELL_LINES, 120));
+        assert_eq!(shown(&shell), SHELL_LINES);
+        // One very long line is cut by its length, at a character boundary.
+        let mut shell = ShellText::new("cat one-line.json");
+        shell.finish(&"é".repeat(SHELL_CHARS), false);
+        let output = &shell.short.as_ref().expect("cut short").output.as_ref().unwrap().text;
+        assert_eq!(output.len(), SHELL_CHARS);
+        assert!(!shell.short.as_ref().unwrap().command_cut);
     }
 
     #[test]
