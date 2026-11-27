@@ -23,9 +23,10 @@ const KEY_CONTEXT: &str = "Terminal";
 /// Keys the terminal must receive even though an outer view binds them.
 ///
 /// gpui runs key bindings before key-down listeners, and gpui-kit's root view binds
-/// Tab/Shift-Tab to focus traversal and Ctrl-C to Copy. Unbinding them in the
-/// terminal's key context lets them fall through to [`TerminalView::on_key`].
-const PASSTHROUGH_KEYS: [&str; 3] = ["tab", "shift-tab", "ctrl-c"];
+/// Tab/Shift-Tab to focus traversal and Ctrl-C to Copy, and TJ binds Ctrl-T/Ctrl-W to open
+/// and close tabs. Unbinding them in the terminal's key context lets them fall through to
+/// [`TerminalView::on_key`], so the shell gets ^T (transpose) and ^W (delete a word).
+pub(crate) const PASSTHROUGH_KEYS: [&str; 5] = ["tab", "shift-tab", "ctrl-c", "ctrl-t", "ctrl-w"];
 
 /// Register the terminal's key bindings. Call once after `gpui_kit::init`.
 pub fn init(cx: &mut App) {
@@ -1321,8 +1322,8 @@ mod tests {
 
     #[gpui_kit::test]
     fn tab_and_ctrl_c_reach_the_shell(cx: &mut TestAppContext) {
-        let (sent, focused) = press_in_terminal(cx, true, &["tab", "shift-tab", "ctrl-c"]);
-        assert_eq!(sent, b"\t\x1b[Z\x03");
+        let (sent, focused) = press_in_terminal(cx, true, &["tab", "shift-tab", "ctrl-c", "ctrl-t", "ctrl-w"]);
+        assert_eq!(sent, b"\t\x1b[Z\x03\x14\x17");
         assert!(focused, "Tab must not move focus out of the terminal");
     }
 
