@@ -1669,10 +1669,15 @@ impl Workspace {
         let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
         let sidebar_bg = theme.sidebar.opacity(alpha);
         // The selected thread is a card like the status column's sections, but nearly solid so it
-        // stands out from the rows that want attention; a hovered row is a fainter one.
+        // stands out from the rows that want attention; a hovered row is a fainter one. On a light
+        // theme a near-solid card reads lighter than a see-through frame, so the row is shaded
+        // with the ink instead: darker than whatever is behind it, solid or not.
         let card_alpha = cx.try_global::<Settings>().map(Settings::card_alpha).unwrap_or(0.5);
-        let (selected_bg, hover_bg) =
-            (accent_bg.opacity((card_alpha + 0.4).min(1.0)), accent_bg.opacity(card_alpha * 0.6));
+        let (selected_bg, hover_bg) = if theme.is_dark() {
+            (accent_bg.opacity((card_alpha + 0.4).min(1.0)), accent_bg.opacity(card_alpha * 0.6))
+        } else {
+            (fg.opacity(0.12), fg.opacity(0.06))
+        };
         let active = self.active.clone();
 
         let workspace = cx.entity();
