@@ -517,6 +517,11 @@ fn key_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
 
 // ---------- colours ----------
 
+/// The terminal's default background, for whatever sits round a terminal to match it.
+pub fn background(cx: &App) -> Hsla {
+    terminal_colors(cx).2
+}
+
 /// Tokyo Night-ish defaults for the 16 ANSI colours, used when no Omarchy theme is followed.
 const ANSI: [u32; 16] = [
     0x15161e, 0xf7768e, 0x9ece6a, 0xe0af68, 0x7aa2f7, 0xbb9af7, 0x7dcfff, 0xa9b1d6, //
