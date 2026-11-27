@@ -1217,6 +1217,8 @@ impl Workspace {
             self.state.selected_thread = self.active.clone();
             self.save();
             panes.update(cx, |p, cx| p.focus_active(window, cx));
+            // Coming back to it by keyboard is looking at it, as a click on its row is.
+            self.mark_shown_seen(cx);
             cx.notify();
             return;
         }
@@ -1511,10 +1513,11 @@ impl Workspace {
         let (waiting, done, stopped) = (theme.primary, theme.success, theme.danger);
         let alpha = cx.try_global::<Settings>().map(Settings::sidebar_alpha).unwrap_or(1.0);
         let sidebar_bg = theme.sidebar.opacity(alpha);
-        // The selected thread is a card like the status column's sections, see-through with the
-        // sidebar; a hovered row is a fainter one.
+        // The selected thread is a card like the status column's sections, but nearly solid so it
+        // stands out from the rows that want attention; a hovered row is a fainter one.
         let card_alpha = cx.try_global::<Settings>().map(Settings::card_alpha).unwrap_or(0.5);
-        let (selected_bg, hover_bg) = (accent_bg.opacity(card_alpha), accent_bg.opacity(card_alpha * 0.6));
+        let (selected_bg, hover_bg) =
+            (accent_bg.opacity((card_alpha + 0.4).min(1.0)), accent_bg.opacity(card_alpha * 0.6));
         let active = self.active.clone();
 
         let workspace = cx.entity();
@@ -1523,8 +1526,8 @@ impl Workspace {
             let id = meta.id.clone();
             let status = self.threads.get(&meta.id).map(|t| t.read(cx).status).unwrap_or(Status::Idle);
             // Not looked at since it asked something (?), finished (✓) or stopped on a problem
-            // (!): the row is tinted and its title bold, with the mark where the waiting dot
-            // would be.
+            // (!): the row is outlined in the mark's colour and its title bold, with the mark
+            // where the waiting dot would be.
             let unseen = meta.unseen.as_ref().map(|a| a.kind);
             let unseen_mark = unseen.map(|kind| match kind {
                 AttentionKind::Finished => (IconName::CircleCheck, done, "Finished, not looked at yet"),
@@ -1573,11 +1576,10 @@ impl Workspace {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .map(|el| match (selected, unseen_mark) {
-                    (true, _) => el.bg(selected_bg),
-                    (false, Some((_, color, _))) => el.bg(color.opacity(0.14)).hover(|el| el.bg(color.opacity(0.22))),
-                    (false, None) => el.hover(|el| el.bg(hover_bg)),
-                })
+                // Every row has the border, so outlining one doesn't shift its text.
+                .border_1()
+                .border_color(unseen_mark.map_or(transparent_black(), |(_, color, _)| color.opacity(0.8)))
+                .map(|el| if selected { el.bg(selected_bg) } else { el.hover(|el| el.bg(hover_bg)) })
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     // A double click renames, as in a file manager.
                     if event.click_count() >= 2 {
@@ -2996,6 +2998,32 @@ mod tests {
             .read_with(cx, |w, _| (w.active.clone().unwrap(), w.state.project(&second).unwrap().threads.len()));
         assert_ne!(active, second_thread, "a new thread is shown");
         assert_eq!(threads, 2, "in the project on show");
+    }
+
+    #[gpui_kit::test]
+    fn moving_to_a_project_by_keyboard_takes_its_threads_mark_off(cx: &mut TestAppContext) {
+        use crate::attention::AttentionKind;
+        use crate::thread::ThreadNeedsYou;
+        let (window, workspace, _, _) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let (_, second) = two_projects(&workspace, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        workspace.update(cx, |w, _| w.window_active = true);
+        // Open the second project once, so coming back to it shows the thread it was left on.
+        cx.simulate_keystrokes("ctrl-alt-n");
+        let thread = workspace.read_with(cx, |w, _| w.active.clone().unwrap());
+        cx.simulate_keystrokes("ctrl-alt-p");
+
+        let view = workspace.read_with(cx, |w, _| w.threads[&thread].clone());
+        view.update(cx, |_, cx| cx.emit(ThreadNeedsYou { kind: AttentionKind::Question, detail: String::new() }));
+        let unseen = |cx: &mut VisualTestContext| {
+            workspace.read_with(cx, |w, _| w.state.thread(&thread).unwrap().1.unseen.as_ref().map(|a| a.kind))
+        };
+        assert_eq!(unseen(cx), Some(AttentionKind::Question), "marked while another project is on show");
+
+        cx.simulate_keystrokes("ctrl-alt-n");
+        assert_eq!(shown_project(&workspace, cx).as_ref(), Some(&second));
+        assert_eq!(unseen(cx), None, "looked at once its project is shown again");
     }
 
     #[gpui_kit::test]
