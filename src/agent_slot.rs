@@ -185,7 +185,8 @@ impl AgentSlot {
         // Before the first turn, the room the model had last time.
         let window =
             t.context_window.or_else(|| t.model_name().and_then(|m| crate::usage::Usage::context_window(cx, &m)));
-        let (account_name, cost, context) = (t.account_name.clone(), t.cost_usd, (t.context_tokens, window));
+        let (account_name, cost, context) = (t.account_name.clone(), t.cost(), (t.context_tokens, window));
+        let estimating = t.cost_estimate > 0.0;
         let theme = cx.theme();
         let (muted, fg) = (theme.muted_foreground, theme.foreground);
         let (warning, danger, primary) = (theme.warning, theme.danger, theme.primary);
@@ -293,8 +294,9 @@ impl AgentSlot {
                 .into_any_element(),
         );
         if cost > 0.0 {
-            // On a subscription this is Claude's estimate, not a charge.
-            let approx = if account.is_subscription() { "≈" } else { "" };
+            // On a subscription this is Claude's estimate, not a charge; mid-turn it's priced
+            // from the tokens until Claude Code says what the turn cost.
+            let approx = if account.is_subscription() || estimating { "≈" } else { "" };
             let amount = if cost < 1.0 { format!("{approx}${cost:.3}") } else { format!("{approx}${cost:.2}") };
             let note = account.is_subscription().then(|| "estimate".to_string());
             rows.push(meter("💵", "This thread".into(), amount, note, None, fg).into_any_element());

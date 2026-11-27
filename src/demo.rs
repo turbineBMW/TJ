@@ -23,7 +23,13 @@ pub fn sample_stream(fast: bool) -> Vec<(Duration, AgentEvent)> {
     events.extend(chunk_words(sample::REPLY, words).into_iter().map(|chunk| (every, AgentEvent::TextDelta(chunk))));
     events.push((
         Duration::ZERO,
-        AgentEvent::TurnFinished { cost_usd: Some(0.0412), duration_ms: Some(9_200), is_error: false, error: None },
+        AgentEvent::TurnFinished {
+            cost_usd: Some(0.0412),
+            process_total_usd: None,
+            duration_ms: Some(9_200),
+            is_error: false,
+            error: None,
+        },
     ));
     events
 }
@@ -59,7 +65,7 @@ fn sample_usage() -> Vec<UsageWindow> {
 /// A recorded session from `tests/fixtures/claude/`, played back through the real parser.
 pub fn replay(path: &Path) -> anyhow::Result<Vec<(Duration, AgentEvent)>> {
     let file = std::fs::File::open(path)?;
-    let mut parser = Parser;
+    let mut parser = Parser::default();
     Ok(read_fixture(file)
         .iter()
         .flat_map(|message| parser.parse(message))

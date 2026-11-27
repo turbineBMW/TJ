@@ -363,7 +363,14 @@ pub struct ThreadView {
     pub mode: PermissionMode,
     pub session_id: Option<String>,
     pub model: Option<String>,
+    /// What the finished turns cost.
     pub cost_usd: f64,
+    /// What the turn under way has cost so far, priced from its tokens; its own cost replaces
+    /// this when it finishes.
+    pub cost_estimate: f64,
+    /// While replaying an old transcript: Claude Code's running total at the last turn, to work
+    /// each turn's cost out from.
+    legacy_total: f64,
     /// What a scripted agent was asked to do; tests read it.
     pub scripted_log: Option<Arc<Mutex<Vec<ScriptedCall>>>>,
 }
@@ -454,6 +461,8 @@ impl ThreadView {
             session_id: None,
             model: None,
             cost_usd: 0.0,
+            cost_estimate: 0.0,
+            legacy_total: 0.0,
             scripted_log: None,
         };
         this.replay(records, cx);
@@ -508,7 +517,14 @@ impl ThreadView {
         self.current_text = None;
         self.plain_current = None;
         self.status = Status::Idle;
+        // A turn that never finished was still spent.
+        self.cost_usd += std::mem::take(&mut self.cost_estimate);
         self.replaying = false;
+    }
+
+    /// What the thread has cost, the turn under way included.
+    pub fn cost(&self) -> f64 {
+        self.cost_usd + self.cost_estimate
     }
 
     fn write(&mut self, record: Record) {
@@ -2053,7 +2069,16 @@ impl ThreadView {
             }
             AgentEvent::Usage(windows) => crate::usage::Usage::update(cx, &self.account_id, |u| u.merge(windows)),
             AgentEvent::Plan(plan) => crate::usage::Usage::update(cx, &self.account_id, |u| u.plan = Some(plan)),
-            AgentEvent::TurnFinished { cost_usd, duration_ms, is_error, error } => {
+            AgentEvent::CostEstimate(dollars) => self.cost_estimate += dollars,
+            AgentEvent::TurnFinished { cost_usd, process_total_usd, duration_ms, is_error, error } => {
+                // Older transcripts kept the process's running total; a smaller one is a new
+                // process, counting from zero again.
+                let cost_usd = cost_usd.or_else(|| {
+                    let total = process_total_usd?;
+                    let turn = if total >= self.legacy_total { total - self.legacy_total } else { total };
+                    self.legacy_total = total;
+                    Some(turn)
+                });
                 self.current_text = None;
                 self.status = Status::Idle;
                 self.update_overview(cx);
@@ -2061,8 +2086,11 @@ impl ThreadView {
                 if let (false, Some(agent)) = (self.replaying, &self.agent) {
                     let _ = agent.request_usage();
                 }
+                // Claude Code's figure replaces the running estimate. A turn without one (a slash
+                // command) leaves it waiting: a background subagent may still be running up cost.
                 if let Some(cost) = cost_usd {
                     self.cost_usd += cost;
+                    self.cost_estimate = 0.0;
                 }
                 if is_error {
                     self.notice(NoticeKind::Error, error.unwrap_or_else(|| "The turn failed.".into()), cx);
@@ -2087,6 +2115,8 @@ impl ThreadView {
                 self.agent = None;
                 self._pump = None;
                 self.current_text = None;
+                // The turn it was on won't report its cost now; keep what it was estimated at.
+                self.cost_usd += std::mem::take(&mut self.cost_estimate);
                 if self.status != Status::Idle || code.is_some_and(|c| c != 0) {
                     let detail = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
                     let code = code.map_or("a signal".to_string(), |c| format!("code {c}"));
@@ -2918,7 +2948,7 @@ mod tests {
 
     fn fixture(name: &str) -> Vec<AgentEvent> {
         let path = format!("{}/tests/fixtures/claude/{name}", env!("CARGO_MANIFEST_DIR"));
-        let mut parser = claude::Parser;
+        let mut parser = claude::Parser::default();
         claude::read_fixture(std::fs::File::open(path).unwrap()).iter().flat_map(|m| parser.parse(m)).collect()
     }
 
@@ -3044,7 +3074,16 @@ mod tests {
             t.handle(AgentEvent::SessionInfo { session_id: "s1".into(), model: None }, cx);
             t.handle(AgentEvent::TextStarted, cx);
             t.handle(AgentEvent::TextDelta("It opens the window.".into()), cx);
-            t.handle(AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, error: None }, cx);
+            t.handle(
+                AgentEvent::TurnFinished {
+                    cost_usd: None,
+                    process_total_usd: None,
+                    duration_ms: None,
+                    is_error: false,
+                    error: None,
+                },
+                cx,
+            );
             t.set_account("work", "Work", None, cx);
         });
         assert_eq!(thread.read_with(cx, |t, _| t.session_id.clone()), None);
@@ -3067,10 +3106,62 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_cost_climbs_during_a_turn_and_settles_on_what_it_cost(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let finished = |cost: Option<f64>| AgentEvent::TurnFinished {
+            cost_usd: cost,
+            process_total_usd: None,
+            duration_ms: None,
+            is_error: false,
+            error: None,
+        };
+        thread.update(cx, |t, cx| {
+            t.send("Look around", cx);
+            t.handle(AgentEvent::CostEstimate(0.25), cx);
+            t.handle(AgentEvent::CostEstimate(0.5), cx);
+            assert_eq!(t.cost(), 0.75, "shown while the agent works");
+            t.handle(finished(Some(0.8)), cx);
+            assert_eq!((t.cost(), t.cost_estimate), (0.8, 0.0), "Claude Code's figure replaces the estimate");
+
+            t.send("And again", cx);
+            t.handle(AgentEvent::CostEstimate(0.25), cx);
+            t.handle(finished(None), cx);
+            assert_eq!(t.cost(), 1.05, "with no figure, the estimate stands");
+            assert_eq!(t.cost_estimate, 0.25, "until a figure comes or the process ends");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn old_transcripts_count_each_turn_once(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        // Saved before the turn's own cost was kept: Claude Code's running total per process,
+        // which starts again from zero in a new process.
+        let old = |total: f64| super::Record::Event {
+            event: serde_json::from_value(serde_json::json!({
+                "TurnFinished": { "cost_usd": total, "duration_ms": 1000, "is_error": false, "error": null }
+            }))
+            .unwrap(),
+        };
+        thread.update(cx, |t, cx| {
+            t.replay(vec![old(1.0), old(1.5), old(2.25), old(0.5), old(0.75)], cx);
+            // 1.0 + 0.5 + 0.75, then 0.5 + 0.25 in the next process.
+            assert!((t.cost() - 3.0).abs() < 1e-9, "{}", t.cost());
+        });
+    }
+
+    #[gpui_kit::test]
     fn an_idle_process_is_stopped_only_when_nothing_runs_in_it(cx: &mut TestAppContext) {
         let (window, thread) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
-        let finished = || AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, error: None };
+        let finished = || AgentEvent::TurnFinished {
+            cost_usd: None,
+            process_total_usd: None,
+            duration_ms: None,
+            is_error: false,
+            error: None,
+        };
         thread.update(cx, |t, cx| {
             // Only a Claude process is stopped; the scripted agent stands in for its session.
             t.backend = Some(Backend::Claude(Default::default()));
@@ -3103,7 +3194,16 @@ mod tests {
             t.send("What does main.rs do?", cx);
             t.handle(AgentEvent::TextStarted, cx);
             t.handle(AgentEvent::TextDelta("It opens the window.".into()), cx);
-            t.handle(AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, error: None }, cx);
+            t.handle(
+                AgentEvent::TurnFinished {
+                    cost_usd: None,
+                    process_total_usd: None,
+                    duration_ms: None,
+                    is_error: false,
+                    error: None,
+                },
+                cx,
+            );
             t.set_account("work", "Work", None, cx);
             t.handoff = None;
             t.summarizing = Some(("Personal".into(), "Work".into()));
@@ -3968,7 +4068,7 @@ mod tests {
                 AgentEvent::CommandOutput { command: "effort".into(), text: "Set effort level to high".into() },
                 cx,
             );
-            t.handle(AgentEvent::TurnFinished { cost_usd: None, duration_ms: None, is_error: false, error: None }, cx);
+            t.handle(AgentEvent::TurnFinished { cost_usd: None, process_total_usd: None, duration_ms: None, is_error: false, error: None }, cx);
             assert_eq!(t.rows.len(), before + 1, "one row, and no footer");
             assert!(matches!(t.rows.last(), Some(Row::Assistant(_))));
             t.handle(AgentEvent::ConversationReset, cx);

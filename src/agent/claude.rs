@@ -7,7 +7,7 @@
 //! `tests/fixtures/` pin the shapes this code was written against.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
@@ -135,7 +135,7 @@ impl ClaudeSession {
         {
             let child = session.child.clone();
             std::thread::spawn(move || {
-                let mut parser = Parser;
+                let mut parser = Parser::default();
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     for event in parser.parse_line(&line) {
                         if tx.send_blocking(event).is_err() {
@@ -409,9 +409,17 @@ fn session_rules(request: &PermissionRequest) -> Vec<Value> {
     }
 }
 
-/// Turns protocol lines into [`AgentEvent`]s.
+/// Turns protocol lines into [`AgentEvent`]s. One parser reads one process.
 #[derive(Default)]
-pub struct Parser;
+pub struct Parser {
+    /// The main agent's response being streamed: its model, its usage when it began, and what
+    /// it has been priced at so far.
+    response: Option<(String, Value, f64)>,
+    /// Subagent responses already priced: each content block repeats the same usage.
+    priced: HashSet<String>,
+    /// Claude Code's running cost for this process at its last result.
+    process_total: f64,
+}
 
 impl Parser {
     pub fn parse_line(&mut self, line: &str) -> Vec<AgentEvent> {
@@ -425,6 +433,17 @@ impl Parser {
         }
     }
 
+    /// A subagent's response, priced the first time it's seen. Subagents aren't streamed, so its
+    /// output is counted as it stood when the response began.
+    fn price_subagent_response(&mut self, message: &Value) -> Option<AgentEvent> {
+        let id = message.get("id").and_then(Value::as_str)?;
+        if !self.priced.insert(id.to_string()) {
+            return None;
+        }
+        let cost = super::pricing::cost(message.get("model").and_then(Value::as_str)?, &message["usage"])?;
+        (cost > 0.0).then_some(AgentEvent::CostEstimate(cost))
+    }
+
     pub fn parse(&mut self, m: &Value) -> Vec<AgentEvent> {
         let str_at = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
         // Messages from subagents carry their parent's tool id; only the main thread is shown.
@@ -434,18 +453,22 @@ impl Parser {
         if from_subagent {
             let parent = str_at(m, "parent_tool_use_id").unwrap_or_default();
             return match m.get("type").and_then(Value::as_str) {
-                Some("assistant") => blocks(m)
-                    .filter_map(|b| match b["type"].as_str() {
-                        Some("tool_use") => Some(AgentEvent::SubagentTool {
-                            tool_use_id: parent.clone(),
-                            name: str_at(b, "name")?,
-                            input: b.get("input").cloned().unwrap_or(Value::Null),
-                        }),
-                        Some("text") => str_at(b, "text")
-                            .filter(|t| !t.trim().is_empty())
-                            .map(|text| AgentEvent::SubagentText { tool_use_id: parent.clone(), text }),
-                        _ => None,
-                    })
+                Some("assistant") => self
+                    .price_subagent_response(&m["message"])
+                    .into_iter()
+                    .chain(blocks(m).filter_map(|b| {
+                        match b["type"].as_str() {
+                            Some("tool_use") => Some(AgentEvent::SubagentTool {
+                                tool_use_id: parent.clone(),
+                                name: str_at(b, "name")?,
+                                input: b.get("input").cloned().unwrap_or(Value::Null),
+                            }),
+                            Some("text") => str_at(b, "text")
+                                .filter(|t| !t.trim().is_empty())
+                                .map(|text| AgentEvent::SubagentText { tool_use_id: parent.clone(), text }),
+                            _ => None,
+                        }
+                    }))
                     .collect(),
                 _ => Vec::new(),
             };
@@ -500,6 +523,27 @@ impl Parser {
             Some("stream_event") if !from_subagent => {
                 let event = &m["event"];
                 match event.get("type").and_then(Value::as_str) {
+                    Some("message_start") => {
+                        let message = &event["message"];
+                        let model = str_at(message, "model").unwrap_or_default();
+                        let usage = message["usage"].clone();
+                        let cost = super::pricing::cost(&model, &usage).unwrap_or(0.0);
+                        self.response = Some((model, usage, cost));
+                        estimate(cost)
+                    }
+                    // The response's final counts; what it added since it began is the difference.
+                    Some("message_delta") => match (self.response.as_mut(), event["usage"].as_object()) {
+                        (Some((model, usage, priced)), Some(delta)) => {
+                            for (key, value) in delta.iter().filter(|(_, v)| v.is_number()) {
+                                usage[key] = value.clone();
+                            }
+                            let cost = super::pricing::cost(model, usage).unwrap_or(0.0);
+                            let added = cost - *priced;
+                            *priced = cost;
+                            estimate(added)
+                        }
+                        _ => Vec::new(),
+                    },
                     Some("content_block_start") if event["content_block"]["type"] == "text" => {
                         vec![AgentEvent::TextStarted]
                     }
@@ -582,8 +626,19 @@ impl Parser {
                 }
                 // A slash command Claude Code ran itself never reached a model: nothing to report.
                 let local = m.get("local_command").is_some_and(|c| !c.is_null()) && !is_error;
+                self.response = None;
+                // `total_cost_usd` is what the whole process has cost so far, not this turn.
+                let total = m.get("total_cost_usd").and_then(Value::as_f64);
+                let since_last = m["model_usage_since_last_result"]
+                    .as_object()
+                    .map(|models| models.values().filter_map(|u| u.get("costUSD")?.as_f64()).sum::<f64>());
+                let turn = since_last.or_else(|| total.map(|t| (t - self.process_total).max(0.0)));
+                if let Some(total) = total {
+                    self.process_total = total;
+                }
                 events.push(AgentEvent::TurnFinished {
-                    cost_usd: m.get("total_cost_usd").and_then(Value::as_f64).filter(|_| !local),
+                    cost_usd: turn.filter(|_| !local),
+                    process_total_usd: None,
                     duration_ms: m.get("duration_ms").and_then(Value::as_u64).filter(|_| !local),
                     is_error,
                     error: is_error.then(|| str_at(m, "result").unwrap_or_else(|| "The turn failed.".into())),
@@ -728,6 +783,11 @@ fn unix_seconds(iso: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(iso).ok().map(|t| t.timestamp())
 }
 
+/// A running cost estimate, when there is anything to add.
+fn estimate(dollars: f64) -> Vec<AgentEvent> {
+    if dollars > 0.0 { vec![AgentEvent::CostEstimate(dollars)] } else { Vec::new() }
+}
+
 fn blocks(message: &Value) -> impl Iterator<Item = &Value> {
     message["message"]["content"].as_array().into_iter().flatten()
 }
@@ -848,7 +908,7 @@ mod tests {
     fn replay(name: &str) -> Vec<AgentEvent> {
         let path = format!("{}/tests/fixtures/claude/{name}", env!("CARGO_MANIFEST_DIR"));
         let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        let mut parser = Parser;
+        let mut parser = Parser::default();
         read_fixture(file).iter().flat_map(|m| parser.parse(m)).collect()
     }
 
@@ -899,11 +959,60 @@ mod tests {
 
     #[test]
     fn compacting_is_reported() {
-        let events = Parser.parse(&json!({
+        let events = Parser::default().parse(&json!({
             "type": "system", "subtype": "compact_boundary", "session_id": "s",
             "compact_metadata": { "trigger": "manual", "pre_tokens": 48213 },
         }));
         assert_eq!(events, vec![AgentEvent::Compacted { pre_tokens: Some(48213), manual: true }]);
+    }
+
+    /// What each turn cost, and what was estimated for it while it ran.
+    fn turn_costs(events: &[AgentEvent]) -> Vec<(f64, Option<f64>)> {
+        let mut turns = Vec::new();
+        let mut estimate = 0.0;
+        for event in events {
+            match event {
+                AgentEvent::CostEstimate(dollars) => estimate += dollars,
+                AgentEvent::TurnFinished { cost_usd, .. } => turns.push((std::mem::take(&mut estimate), *cost_usd)),
+                _ => {}
+            }
+        }
+        turns
+    }
+
+    #[test]
+    fn cost_climbs_with_each_response_and_comes_to_what_claude_code_charged() {
+        let events = replay("2.1.331-plan.jsonl");
+        let estimates = events.iter().filter(|e| matches!(e, AgentEvent::CostEstimate(_))).count();
+        assert!(estimates >= 4, "every response adds to the estimate as it streams: {estimates}");
+        let turns = turn_costs(&events);
+        assert_eq!(turns.len(), 1);
+        let (estimated, charged) = turns[0];
+        assert!((estimated - charged.unwrap()).abs() < 1e-9, "estimated {estimated}, charged {charged:?}");
+    }
+
+    #[test]
+    fn each_turn_reports_its_own_cost_not_the_process_total() {
+        let turns = turn_costs(&replay("2.1.331-subagent.jsonl"));
+        let charged: Vec<f64> = turns.iter().map(|(_, c)| c.unwrap()).collect();
+        // Claude Code says 0.0097 and then 0.0113, its total so far; the second turn cost 0.0016.
+        assert!((charged[0] - 0.009692325).abs() < 1e-9, "{charged:?}");
+        assert!((charged[1] - 0.00157015).abs() < 1e-9, "{charged:?}");
+        // The subagent's responses aren't streamed, so its output is only counted as it began.
+        assert!(turns[0].0 > 0.0 && turns[0].0 <= charged[0], "{turns:?}");
+
+        // Without the per-result figure, the turn's cost is the growth in the running total.
+        let mut parser = Parser::default();
+        let result = |total: f64| json!({"type": "result", "is_error": false, "total_cost_usd": total});
+        let costs: Vec<_> = [result(0.5), result(0.75)]
+            .iter()
+            .flat_map(|m| parser.parse(m))
+            .filter_map(|e| match e {
+                AgentEvent::TurnFinished { cost_usd, .. } => cost_usd,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(costs, vec![0.5, 0.25]);
     }
 
     #[test]
@@ -1052,7 +1161,7 @@ mod tests {
             "type": "tool_result", "tool_use_id": "toolu_1",
             "content": [{ "type": "image", "source": { "type": "base64", "data": "iVBORw0K", "media_type": "image/png" } }]
         }]}});
-        let events = Parser.parse(&message);
+        let events = Parser::default().parse(&message);
         let [AgentEvent::ToolFinished { id, output, images, .. }] = events.as_slice() else { panic!("{events:?}") };
         assert_eq!(id, "toolu_1");
         assert!(output.is_empty());
@@ -1252,7 +1361,7 @@ mod tests {
 
     #[test]
     fn unknown_messages_are_skipped() {
-        let mut parser = Parser;
+        let mut parser = Parser::default();
         assert!(parser.parse_line(r#"{"type":"something_new","x":1}"#).is_empty());
         assert!(parser.parse_line("not json").is_empty());
     }
