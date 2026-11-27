@@ -25,6 +25,7 @@ use crate::agent::{
 use crate::attention::{AttentionKind, one_line};
 use crate::overview::{self, Overview};
 use crate::store::{Record, TranscriptWriter};
+use crate::summary::{self, SummaryCard};
 use crate::tool_card::{self, ToolStatus};
 
 mod elicitation;
@@ -262,11 +263,48 @@ enum ApprovalKind {
 enum Row {
     /// What the user sent, and the images that went with it.
     User(Entity<TextViewState>, Vec<Arc<gpui_kit::Image>>),
-    Assistant(Entity<TextViewState>),
+    Assistant(AssistantRow),
     Tool(ToolRow),
     Approval(ApprovalRow),
     Notice(NoticeKind, SharedString),
     Footer(SharedString),
+}
+
+/// A block of Claude's text. An 80/20 summary at its end is drawn as a card, not as text.
+struct AssistantRow {
+    /// The text above the summary (all of it when there is none).
+    body: Entity<TextViewState>,
+    /// Everything that arrived, summary included.
+    raw: String,
+    /// Where the summary starts in `raw`, and its card.
+    summary: Option<(usize, SummaryCard)>,
+}
+
+impl AssistantRow {
+    fn new(text: &str, cx: &mut App) -> Self {
+        let body = cx.new(|cx| TextViewState::markdown("", cx).selectable(true));
+        let mut row = Self { body, raw: String::new(), summary: None };
+        row.push_str(text, cx);
+        row
+    }
+
+    fn push_str(&mut self, text: &str, cx: &mut App) {
+        self.raw.push_str(text);
+        let Some(at) = summary::split(&self.raw) else {
+            if self.summary.take().is_some() {
+                self.body.update(cx, |b, cx| b.set_text(&self.raw, cx));
+            } else {
+                self.body.update(cx, |b, cx| b.push_str(text, cx));
+            }
+            return;
+        };
+        if self.summary.as_ref().is_none_or(|(was, _)| *was != at) {
+            self.body.update(cx, |b, cx| b.set_text(self.raw[..at].trim_end(), cx));
+        }
+        let (was, card) = self.summary.get_or_insert_with(|| (at, SummaryCard::new()));
+        *was = at;
+        card.sync(summary::parse(&self.raw[at..]), cx);
+    }
 }
 
 /// An image waiting in the prompt box for the next message.
@@ -1969,8 +2007,8 @@ impl ThreadView {
                         ix
                     }
                 };
-                if let Some(Row::Assistant(body)) = self.rows.get(ix) {
-                    body.update(cx, |state, cx| state.push_str(&text, cx));
+                if let Some(Row::Assistant(row)) = self.rows.get_mut(ix) {
+                    row.push_str(&text, cx);
                 }
                 let plain = match self.plain_current {
                     Some(plain) => plain,
@@ -2252,8 +2290,12 @@ impl ThreadView {
     }
 
     fn push_text_row(&mut self, user: bool, text: &str, cx: &mut Context<Self>) -> usize {
-        let body = cx.new(|cx| TextViewState::markdown(text, cx).selectable(true));
-        self.push_row(if user { Row::User(body, Vec::new()) } else { Row::Assistant(body) }, cx)
+        let row = if user {
+            Row::User(cx.new(|cx| TextViewState::markdown(text, cx).selectable(true)), Vec::new())
+        } else {
+            Row::Assistant(AssistantRow::new(text, cx))
+        };
+        self.push_row(row, cx)
     }
 
     fn notice(&mut self, kind: NoticeKind, text: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -2334,16 +2376,22 @@ impl ThreadView {
                         .child(TextView::new(body).selectable(true)),
                 )
                 .into_any_element(),
-            Row::Assistant(body) => {
+            Row::Assistant(row) => {
                 let thread = cx.entity().downgrade();
-                pad(div())
+                // A reply that is only a summary has no text above its card.
+                let text = row.summary.as_ref().is_none_or(|(at, _)| !row.raw[..*at].trim().is_empty());
+                pad(v_flex())
                     .py_2()
-                    .child(
-                        TextView::new(body)
-                            .selectable(true)
-                            .stream_fade(true)
-                            .code_block_actions(move |block, _, _| code_block_buttons(block, thread.clone())),
-                    )
+                    .gap_2()
+                    .when(text, |el| {
+                        el.child(
+                            TextView::new(&row.body)
+                                .selectable(true)
+                                .stream_fade(true)
+                                .code_block_actions(move |block, _, _| code_block_buttons(block, thread.clone())),
+                        )
+                    })
+                    .when_some(row.summary.as_ref(), |el, (_, card)| el.child(card.render(cx)))
                     .into_any_element()
             }
             Row::Tool(tool) => {
@@ -4386,6 +4434,25 @@ mod tests {
                 cx,
             );
             assert_eq!(t.commands().len(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn an_80_20_summary_streams_into_a_card(cx: &mut TestAppContext) {
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, cx| {
+            t.handle(AgentEvent::TextStarted, cx);
+            let reply = "Fixed the bug.\n\n---\n\n## 80/20\n✅ Result: **Fixed**\n👉 Next:\n1. **Restart TJ**\n";
+            // Small pieces, so the heading arrives split across deltas.
+            let chars: Vec<char> = reply.chars().collect();
+            for piece in chars.chunks(5) {
+                t.handle(AgentEvent::TextDelta(piece.iter().collect()), cx);
+            }
+            let Some(Row::Assistant(row)) = t.rows.last() else { panic!("an assistant row") };
+            assert_eq!(row.raw, reply, "the row keeps everything that arrived");
+            let (at, _) = row.summary.as_ref().expect("a card");
+            assert_eq!(&row.raw[..*at], "Fixed the bug.\n\n");
         });
     }
 

@@ -107,5 +107,12 @@ All four pass. I didn't touch the existing `spawn_*` tests; they still pass unch
 
 > **Note:** the hand-off summary costs one cheap-model call per switch, about a cent on an API account. Subscription accounts don't see a charge, but it does count toward the usage window.
 
-Want me to wire the **Make default for project** button next, or the sidebar marker first?
+---
+
+## 80/20
+
+✅ Result: **Per-thread account switching works**; four new tests pass.
+❓ Decide: **Wire Make default for project next, or the sidebar marker first?**
+⚠️ Watch out: each switch makes **one cheap-model call** for the hand-off summary.
+🔀 Git: changes are on **account-switching**, not committed.
 "#;

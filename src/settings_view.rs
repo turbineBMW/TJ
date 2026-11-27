@@ -86,7 +86,7 @@ impl SettingsTab {
     /// The tab's rows, top to bottom.
     fn rows(self) -> Vec<RowKind> {
         match self {
-            SettingsTab::General => vec![RowKind::DefaultAccount],
+            SettingsTab::General => vec![RowKind::DefaultAccount, RowKind::EightyTwenty],
             SettingsTab::Appearance => {
                 vec![
                     RowKind::FollowTheme,
@@ -111,6 +111,7 @@ impl SettingsTab {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowKind {
     DefaultAccount,
+    EightyTwenty,
     FollowTheme,
     UiFont,
     MonoFont,
@@ -366,6 +367,7 @@ impl SettingsView {
     fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.current() {
             Some(RowKind::DefaultAccount) => self.step_account(1, cx),
+            Some(RowKind::EightyTwenty) => self.change(cx, |s| s.eighty_twenty = !s.eighty_twenty),
             Some(RowKind::FollowTheme) => self.change(cx, |s| s.follow_omarchy_theme = !s.follow_omarchy_theme),
             Some(RowKind::TransparentSidebar) => self.change(cx, |s| s.transparent_sidebar = !s.transparent_sidebar),
             Some(RowKind::UiFont) => self.open_fonts(FontKind::Ui, window, cx),
@@ -381,6 +383,7 @@ impl SettingsView {
         let on = step > 0.;
         match self.current() {
             Some(RowKind::DefaultAccount) => self.step_account(step as isize, cx),
+            Some(RowKind::EightyTwenty) => self.change(cx, |s| s.eighty_twenty = on),
             Some(RowKind::FollowTheme) => self.change(cx, |s| s.follow_omarchy_theme = on),
             Some(RowKind::TransparentSidebar) => self.change(cx, |s| s.transparent_sidebar = on),
             Some(RowKind::UiFont) => self.step_font(FontKind::Ui, step as isize, cx),
@@ -677,6 +680,14 @@ impl SettingsView {
                     let _ = this.workspace.update(cx, |w, cx| w.set_default_account(&id, cx));
                 }))
         }));
+        let eighty_twenty = Switch::new("eighty-twenty")
+            .checked(cx.try_global::<Settings>().is_none_or(|s| s.eighty_twenty))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                let checked = *checked;
+                this.pick(RowKind::EightyTwenty, cx);
+                this.change(cx, |s| s.eighty_twenty = checked);
+            }))
+            .into_any_element();
         vec![
             self.row(
                 RowKind::DefaultAccount,
@@ -693,6 +704,14 @@ impl SettingsView {
                 .text_color(cx.theme().foreground.opacity(0.6))
                 .child("A project or thread can switch account from the menus under the prompt box. Accounts are listed in accounts.toml (see About).")
                 .into_any_element(),
+            self.row(
+                RowKind::EightyTwenty,
+                picked,
+                "80/20 summaries",
+                Some("Claude ends finished work with its result, your next steps and any decision, shown as a card. New threads pick up a change.".into()),
+                eighty_twenty,
+                cx,
+            ),
         ]
     }
 
