@@ -464,21 +464,159 @@ impl ProjectChanges {
     }
 }
 
+/// The text of lines `start..=end` on one side of `patch` (one file's part of a diff): the old
+/// side's (context and removed lines) or the new side's (context and added lines). Lines the
+/// patch doesn't carry are left out.
+pub fn patch_lines(patch: &str, old: bool, start: u64, end: u64) -> String {
+    let (mut old_no, mut new_no) = (0u64, 0u64);
+    let mut in_hunk = false;
+    let mut out: Vec<&str> = Vec::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("@@ ") {
+            // `@@ -12,3 +12,4 @@`: where each side's lines start.
+            let mut parts = rest.split_whitespace();
+            let first = |part: Option<&str>, sign: char| {
+                part.and_then(|p| p.strip_prefix(sign)).and_then(|p| p.split(',').next()?.parse().ok()).unwrap_or(1)
+            };
+            old_no = first(parts.next(), '-');
+            new_no = first(parts.next(), '+');
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        let tag = line.chars().next();
+        let text = tag.map_or("", |c| &line[c.len_utf8()..]);
+        let mut take = |no: u64| {
+            if (start..=end).contains(&no) {
+                out.push(text);
+            }
+        };
+        match tag {
+            Some(' ') | None => {
+                take(if old { old_no } else { new_no });
+                old_no += 1;
+                new_no += 1;
+            }
+            Some('-') => {
+                if old {
+                    take(old_no);
+                }
+                old_no += 1;
+            }
+            Some('+') => {
+                if !old {
+                    take(new_no);
+                }
+                new_no += 1;
+            }
+            // "\ No newline at end of file".
+            _ => {}
+        }
+    }
+    out.join("\n")
+}
+
+/// A comment on lines of the review's diff, for the agent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineNote {
+    pub path: String,
+    /// On lines the change removed (numbered as before it), rather than the file as it is.
+    pub old: bool,
+    pub start: u64,
+    pub line: u64,
+    /// The lines it's on.
+    pub quoted: String,
+    pub body: String,
+}
+
+/// What the agent is sent for `notes`: each one's place (`path:line`), the lines it's on and
+/// the comment.
+pub fn notes_prompt(notes: &[LineNote]) -> String {
+    let mut out = String::from("Review comments on the uncommitted changes. Please address each one:\n");
+    for note in notes {
+        let at = if note.start < note.line {
+            format!("{}:{}-{}", note.path, note.start, note.line)
+        } else {
+            format!("{}:{}", note.path, note.line)
+        };
+        out.push_str(&format!(
+            "\n{at}{}\n",
+            if note.old { " (removed lines, numbered as before the change)" } else { "" }
+        ));
+        if !note.quoted.trim().is_empty() {
+            // A fence longer than any run of backticks in the code, so the code can't end it.
+            let longest = note.quoted.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+            let fence = "`".repeat(longest.max(2) + 1);
+            out.push_str(&format!("{fence}\n{}\n{fence}\n", note.quoted.trim_end_matches('\n')));
+        }
+        out.push_str(note.body.trim());
+        out.push('\n');
+    }
+    out
+}
+
+pub const REVIEW_CONTEXT: &str = "Review";
+
+gpui_kit::actions!(review, [CommentOnLines, RemoveComment, SendComments, CancelComment]);
+
+/// The review's own keys, while its diff (or a comment box in it) has focus. Shift+↑/↓ in the
+/// diff select lines (gpui-kit's), and these act on them.
+pub fn bindings() -> Vec<KeyBinding> {
+    let cx = Some(REVIEW_CONTEXT);
+    vec![
+        KeyBinding::new("enter", CommentOnLines, cx),
+        KeyBinding::new("delete", RemoveComment, cx),
+        KeyBinding::new("ctrl-enter", SendComments, cx),
+        KeyBinding::new("escape", CancelComment, cx),
+    ]
+}
+
+/// What the review asks of the workspace.
+pub enum ReviewEvent {
+    /// Put these comments in the project agent's prompt box, as a chip.
+    SendToThread { label: String, text: String },
+}
+
+/// A comment being written on the diff.
+struct Compose {
+    note: LineNote,
+    input: Entity<gpui_kit::component::input::TextareaState>,
+}
+
 /// The review of a project's changes, shown in a tab: every file's diff stacked, unified or
-/// side by side, with each file's summary under its header.
+/// side by side, with each file's summary under its header. Lines can be commented on (hover
+/// and +, or select and Enter), and the comments sent to the agent's prompt box.
 pub struct ReviewView {
     pub changes: Entity<ProjectChanges>,
     no_summaries: bool,
-    /// In a modal over a pull request: one file at a time, with Previous and Next file.
+    /// In a modal over a pull request: one file at a time, with Previous and Next file, and no
+    /// comments (the GitHub tab takes those).
     navigator: bool,
+    /// Comments waiting to go to the agent.
+    pub notes: Vec<LineNote>,
+    compose: Option<Compose>,
     focus: FocusHandle,
     _observe: Subscription,
+    _compose_events: Option<Subscription>,
 }
+
+impl EventEmitter<ReviewEvent> for ReviewView {}
 
 impl ReviewView {
     pub fn new(changes: Entity<ProjectChanges>, no_summaries: bool, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&changes, |_, _, cx| cx.notify());
-        Self { changes, no_summaries, navigator: false, focus: cx.focus_handle(), _observe: observe }
+        Self {
+            changes,
+            no_summaries,
+            navigator: false,
+            notes: Vec::new(),
+            compose: None,
+            focus: cx.focus_handle(),
+            _observe: observe,
+            _compose_events: None,
+        }
     }
 
     /// The review in a modal, a file at a time, with Previous and Next file (also ← and →).
@@ -486,8 +624,18 @@ impl ReviewView {
         Self { navigator: true, ..Self::new(changes, no_summaries, cx) }
     }
 
+    /// Put the keyboard in the review: in its diff, where the arrows scroll and Shift+↑/↓
+    /// select lines (in the modal, on the review itself, where ← and → change file).
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
-        window.focus(&self.focus, cx);
+        if self.navigator {
+            window.focus(&self.focus, cx);
+        } else if let Some(compose) = &self.compose {
+            let handle = compose.input.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        } else {
+            let handle = self.changes.read(cx).diff.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
     }
 
     /// The tab's title: the file shown, or how many.
@@ -498,6 +646,100 @@ impl ReviewView {
             None => format!("Review · {}", model.changes.files.len()),
         }
     }
+
+    /// Start a comment on `range` (lines picked in the diff).
+    pub fn start_comment(
+        &mut self,
+        range: &gpui_kit::component::diff::DiffLineRange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_kit::component::diff::DiffSide;
+        use gpui_kit::component::input::{InputEvent, TextareaState};
+        if self.navigator {
+            return;
+        }
+        // A range from a removed line to an added one (unified view) is taken on its end's side.
+        let side = range.end_side();
+        let (start, line) = if range.side() == side {
+            (range.start().min(range.end()) as u64, range.start().max(range.end()) as u64)
+        } else {
+            (range.end() as u64, range.end() as u64)
+        };
+        let old = side == DiffSide::Original;
+        let path = range.path().to_string();
+        let quoted = self
+            .changes
+            .read(cx)
+            .changes
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| patch_lines(&f.patch, old, start, line))
+            .unwrap_or_default();
+        let placeholder = "Comment for the agent";
+        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 10).placeholder(placeholder));
+        self._compose_events = Some(cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { secondary: true, .. } = event {
+                this.finish_comment(window, cx);
+            }
+        }));
+        window.focus(&input.read(cx).focus_handle(cx), cx);
+        self.compose = Some(Compose { note: LineNote { path, old, start, line, quoted, body: String::new() }, input });
+        cx.notify();
+    }
+
+    /// Keep the comment being written (if it says anything), and go back to the diff.
+    pub fn finish_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Compose { mut note, input }) = self.compose.take() else { return };
+        note.body = input.read(cx).value().trim().to_string();
+        if !note.body.is_empty() {
+            self.notes.push(note);
+        }
+        self._compose_events = None;
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.compose = None;
+        self._compose_events = None;
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn remove_note(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.notes.len() {
+            self.notes.remove(ix);
+            cx.notify();
+        }
+    }
+
+    /// Remove the comments on the lines selected in the diff. False if there were none.
+    fn remove_selected(&mut self, cx: &mut Context<Self>) -> bool {
+        use gpui_kit::component::diff::DiffSide;
+        let Some(range) = self.changes.read(cx).diff.read(cx).selected_lines() else { return false };
+        let old = range.end_side() == DiffSide::Original;
+        let (from, to) = (range.start().min(range.end()) as u64, range.start().max(range.end()) as u64);
+        let before = self.notes.len();
+        self.notes.retain(|n| !(n.path == range.path().as_ref() && n.old == old && n.start <= to && n.line >= from));
+        cx.notify();
+        self.notes.len() < before
+    }
+
+    /// Hand the comments to the agent's prompt box, and forget them here.
+    pub fn send_notes(&mut self, cx: &mut Context<Self>) {
+        if self.notes.is_empty() {
+            return;
+        }
+        let notes = std::mem::take(&mut self.notes);
+        let label = match notes.len() {
+            1 => format!("Review comment · {}", notes[0].path.rsplit('/').next().unwrap_or(&notes[0].path)),
+            n => format!("{n} review comments"),
+        };
+        cx.emit(ReviewEvent::SendToThread { label, text: notes_prompt(&notes) });
+        cx.notify();
+    }
 }
 
 impl Render for ReviewView {
@@ -507,7 +749,7 @@ impl Render for ReviewView {
         use gpui_kit::component::{
             ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _,
             button::{Button, ButtonVariants as _},
-            diff::{Diff, DiffAnnotation, DiffMode},
+            diff::{Diff, DiffAnnotation, DiffLinePosition, DiffMode, DiffSide},
         };
         use gpui_kit::prelude::FluentBuilder as _;
 
@@ -521,11 +763,38 @@ impl Render for ReviewView {
         let no_summaries = self.no_summaries;
         let mode = model.diff.read(cx).mode();
         let diff_state = model.diff.clone();
-        let annotations: Vec<DiffAnnotation> = model
+        let mut annotations: Vec<DiffAnnotation> = model
             .shown()
             .enumerate()
             .map(|(ix, f)| DiffAnnotation::file(SharedString::from(format!("summary-{ix}")), f.path.clone()))
             .collect();
+        // Comments under their last line (under their file's header if the line is gone), then
+        // the one being written.
+        let commenting = !self.navigator;
+        let place = |path: &str, old: bool, line: u64, id: SharedString| {
+            let side = if old { DiffSide::Original } else { DiffSide::Modified };
+            let at = DiffLinePosition::new(path.to_string(), side, line as usize);
+            if diff_state.read(cx).has_line(&at) {
+                DiffAnnotation::line(id, at)
+            } else {
+                DiffAnnotation::file(id, path.to_string())
+            }
+        };
+        if commenting {
+            annotations.extend(
+                self.notes
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, n)| place(&n.path, n.old, n.line, SharedString::from(format!("note-{ix}")))),
+            );
+            if let Some(compose) = &self.compose {
+                let n = &compose.note;
+                annotations.push(place(&n.path, n.old, n.line, "compose".into()));
+            }
+        }
+        let notes: HashMap<String, (usize, LineNote)> =
+            self.notes.iter().cloned().enumerate().map(|(ix, n)| (format!("note-{ix}"), (ix, n))).collect();
+        let compose_input = self.compose.as_ref().map(|c| c.input.clone());
         let shown: Vec<&FileChange> = model.shown().collect();
         let (additions, deletions): (usize, usize) =
             shown.iter().fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
@@ -568,8 +837,84 @@ impl Render for ReviewView {
             None => "No uncommitted changes.".into(),
         };
 
-        let diff = Diff::new(&diff_state).syntax_highlight(true).annotations(annotations).render_annotation(
-            move |annotation, _window, _cx| {
+        // Under the header: how to comment, or the comments waiting and what to do with them.
+        let note_count = self.notes.len();
+        let comment_bar = (commenting && !empty).then(|| {
+            let bar = h_flex().px_3().py_1().gap_2().border_b_1().border_color(border).text_xs().text_color(muted);
+            if note_count == 0 {
+                return bar.child(
+                    "Comment for the agent: hover a line and press +, or select lines with Shift+↓ and press Enter.",
+                );
+            }
+            bar.child(match note_count {
+                1 => "1 comment for the agent.".to_string(),
+                n => format!("{n} comments for the agent."),
+            })
+            .child("Ctrl+Enter sends them to the thread; Delete removes the selected line's.")
+            .child(div().flex_1())
+            .child(Button::new("review-discard-notes").xsmall().ghost().label("Discard").on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.notes.clear();
+                    cx.notify();
+                },
+            )))
+            .child(
+                Button::new("review-send-notes")
+                    .xsmall()
+                    .primary()
+                    .icon(IconName::MessageSquarePlus)
+                    .label("Send to thread")
+                    .tooltip("Put them in the agent's prompt box (Ctrl+Enter)")
+                    .on_click(cx.listener(|this, _, _, cx| this.send_notes(cx))),
+            )
+        });
+
+        let this = cx.entity().downgrade();
+        let diff = Diff::new(&diff_state)
+            .syntax_highlight(true)
+            .annotations(annotations)
+            .when(commenting, |diff| {
+                let this = this.clone();
+                diff.on_add_annotation(move |range, window, cx| {
+                    let _ = this.update(cx, |v, cx| v.start_comment(range, window, cx));
+                })
+            })
+            .render_annotation(move |annotation, _window, cx| {
+                let id = annotation.id().to_string();
+                if let Some((ix, note)) = notes.get(&id) {
+                    let (ix, this) = (*ix, this.clone());
+                    return crate::line_comment::pending_card(
+                        ix,
+                        crate::line_comment::lines_label(note.start, note.line),
+                        note.body.clone(),
+                        move |_, _, cx| {
+                            let _ = this.update(cx, |v, cx| v.remove_note(ix, cx));
+                        },
+                        cx,
+                    );
+                }
+                if id == "compose"
+                    && let Some(input) = &compose_input
+                {
+                    let (cancel, add) = (this.clone(), this.clone());
+                    return crate::line_comment::compose_card(
+                        input,
+                        Some("Ctrl+Enter adds it · Esc cancels"),
+                        [
+                            Button::new("review-compose-cancel").xsmall().ghost().label("Cancel").on_click(
+                                move |_, window, cx| {
+                                    let _ = cancel.update(cx, |v, cx| v.cancel_comment(window, cx));
+                                },
+                            ),
+                            Button::new("review-compose-add").xsmall().primary().label("Add comment").on_click(
+                                move |_, window, cx| {
+                                    let _ = add.update(cx, |v, cx| v.finish_comment(window, cx));
+                                },
+                            ),
+                        ],
+                        cx,
+                    );
+                }
                 let summary = summaries.get(annotation.path().as_ref()).cloned().flatten();
                 let text = match summary {
                     Some(summary) => summary,
@@ -579,9 +924,16 @@ impl Render for ReviewView {
                 };
                 // Out over the padding the diff puts around each annotation, so the whole box is
                 // the summary's colour.
-                div().mx(rems(-0.75)).my(rems(-0.75)).px_6().py_4().bg(secondary).text_sm().child(text)
-            },
-        );
+                div()
+                    .mx(rems(-0.75))
+                    .my(rems(-0.75))
+                    .px_6()
+                    .py_4()
+                    .bg(secondary)
+                    .text_sm()
+                    .child(text)
+                    .into_any_element()
+            });
 
         let (left, right) = (changes.clone(), changes);
         v_flex()
@@ -597,6 +949,35 @@ impl Render for ReviewView {
                     }
                     _ => {}
                 })
+            })
+            .when(commenting, |el| {
+                el.key_context(REVIEW_CONTEXT)
+                    .on_action(cx.listener(|this, _: &CommentOnLines, window, cx| {
+                        let range = this.changes.read(cx).diff.read(cx).selected_lines();
+                        match range {
+                            Some(range) if this.compose.is_none() => this.start_comment(&range, window, cx),
+                            _ => cx.propagate(),
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &RemoveComment, _, cx| {
+                        if this.compose.is_some() || !this.remove_selected(cx) {
+                            cx.propagate();
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &SendComments, _, cx| {
+                        if this.notes.is_empty() || this.compose.is_some() {
+                            cx.propagate();
+                        } else {
+                            this.send_notes(cx);
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &CancelComment, window, cx| {
+                        if this.compose.is_some() {
+                            this.cancel_comment(window, cx);
+                        } else {
+                            cx.propagate();
+                        }
+                    }))
             })
             .rounded_t(px(crate::panes::CONTENT_RADIUS))
             .bg(bg)
@@ -621,6 +1002,7 @@ impl Render for ReviewView {
                             .on_click(move |_, _, cx| state.update(cx, |d, cx| d.set_mode(m, cx)))
                     })),
             )
+            .children(comment_bar)
             .when_some(error, |el, error| el.child(div().px_3().py_1().text_sm().text_color(danger).child(error)))
             .child(if empty {
                 div().p_4().text_sm().text_color(muted).child(empty_text).into_any_element()
@@ -757,6 +1139,37 @@ mod tests {
         assert!(prompt.contains("- Make it faster"));
         assert!(prompt.contains("=== FILE: big.rs (Modified) ==="));
         assert!(prompt.len() < SUMMARY_FILE_CHARS + 500);
+    }
+
+    #[test]
+    fn patch_lines_reads_either_side_of_a_hunk() {
+        use super::patch_lines;
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10,4 +10,4 @@ fn f() {\n keep\n-old one\n-old two\n+new one\n+new two\n \n\\ No newline at end of file\n";
+        assert_eq!(patch_lines(patch, false, 11, 12), "new one\nnew two");
+        assert_eq!(patch_lines(patch, true, 11, 12), "old one\nold two");
+        assert_eq!(patch_lines(patch, false, 10, 10), "keep");
+        assert_eq!(patch_lines(patch, true, 13, 13), "", "the blank context line");
+        assert_eq!(patch_lines(patch, false, 40, 41), "", "lines the patch doesn't carry");
+    }
+
+    #[test]
+    fn notes_prompt_places_and_quotes_each_comment() {
+        use super::{LineNote, notes_prompt};
+        let note = |path: &str, old, start, line, quoted: &str, body: &str| LineNote {
+            path: path.into(),
+            old,
+            start,
+            line,
+            quoted: quoted.into(),
+            body: body.into(),
+        };
+        let text = notes_prompt(&[
+            note("src/a.rs", false, 3, 3, "let x = 1;", "Name this better."),
+            note("README.md", true, 5, 6, "```sh\nrun\n```", "Why remove this?"),
+        ]);
+        assert!(text.contains("\nsrc/a.rs:3\n```\nlet x = 1;\n```\nName this better.\n"), "{text}");
+        assert!(text.contains("README.md:5-6 (removed lines"), "{text}");
+        assert!(text.contains("\n````\n```sh\nrun\n```\n````\nWhy remove this?"), "a longer fence: {text}");
     }
 
     #[gpui_kit::test]

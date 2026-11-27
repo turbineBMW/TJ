@@ -17,7 +17,7 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use crate::agent::{AgentEvent, claude::SessionOptions};
 use crate::agent_slot::{AgentSlot, AgentSlotEvent};
 use crate::attention::{self, Attention, AttentionKind, Reminder};
-use crate::changes::{ProjectChanges, ReviewView, Summarizer};
+use crate::changes::{ProjectChanges, ReviewEvent, ReviewView, Summarizer};
 use crate::github_view::{GitHubEvent, GitHubView};
 use crate::notes::NotesStore;
 use crate::notes_view::{NotesEvent, NotesView};
@@ -1313,25 +1313,9 @@ impl Workspace {
         Some(changes)
     }
 
-    /// The active project's review, created on demand.
-    fn project_review(&mut self, cx: &mut Context<Self>) -> Option<Entity<ReviewView>> {
-        let changes = self.project_changes(cx)?;
-        let project_id = self.active_project()?.id.clone();
-        let no_summaries = self.no_summaries;
-        Some(
-            self.reviews
-                .entry(project_id)
-                .or_insert_with(|| cx.new(|cx| ReviewView::new(changes, no_summaries, cx)))
-                .clone(),
-        )
-    }
-
     /// Show the review tab with summaries being written: just `path`, if given, or every file.
     fn open_review(&mut self, path: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(changes) = self.project_changes(cx) else { return };
-        if self.project_review(cx).is_none() {
-            return;
-        }
         let summarizer = if self.no_summaries {
             Summarizer::Off
         } else {
@@ -1410,17 +1394,43 @@ impl Workspace {
     /// tab, another split) and put the caret in its prompt box. A closed agent opens again in
     /// a tab of its own; a project with no thread to show starts one.
     fn focus_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(project_id) = self.active_project_id() else { return };
+        if let Some(project_id) = self.active_project_id() {
+            self.focus_project_agent(&project_id, window, cx);
+        }
+    }
+
+    /// [`Self::focus_agent`] for `project_id`'s agent. Gives its thread.
+    fn focus_project_agent(
+        &mut self,
+        project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ThreadView>> {
         let shown = self
             .agents
-            .get(&project_id)
+            .get(project_id)
             .and_then(|a| a.read(cx).thread_id().map(str::to_string))
             .or_else(|| self.active.clone())
-            .filter(|id| self.state.thread(id).is_some());
+            .filter(|id| self.state.thread(id).is_some_and(|(p, _)| p.id == project_id));
         match shown {
             Some(thread_id) => self.open_thread(&thread_id, window, cx),
-            None => self.new_thread(&project_id, window, cx),
+            None => self.new_thread(project_id, window, cx),
         }
+        self.active_thread().filter(|_| self.active_project_id().as_deref() == Some(project_id))
+    }
+
+    /// Put `text` in `project_id`'s agent's prompt box as a chip reading `label`, for the next
+    /// message to carry (the review's comments, say), and focus it.
+    fn quote_to_agent(
+        &mut self,
+        project_id: &str,
+        label: String,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.focus_project_agent(project_id, window, cx) else { return };
+        thread.update(cx, |t, cx| t.add_quote(gpui_kit::assets::IconName::FileDiff, label, text, window, cx));
     }
 
     /// Show the project's GitHub tab.
@@ -1530,11 +1540,24 @@ impl Workspace {
             .or_insert_with(|| cx.new(|cx| ProjectChanges::new(project.path.clone(), cx)))
             .clone();
         let no_summaries = self.no_summaries;
-        let review = self
-            .reviews
-            .entry(project.id.clone())
-            .or_insert_with(|| cx.new(|cx| ReviewView::new(changes.clone(), no_summaries, cx)))
-            .clone();
+        let review = match self.reviews.get(&project.id) {
+            Some(review) => review.clone(),
+            None => {
+                let review = cx.new(|cx| ReviewView::new(changes.clone(), no_summaries, cx));
+                let review_project = project.id.clone();
+                self._subscriptions.push(cx.subscribe_in(
+                    &review,
+                    window,
+                    move |this, _, event: &ReviewEvent, window, cx| match event {
+                        ReviewEvent::SendToThread { label, text } => {
+                            this.quote_to_agent(&review_project, label.clone(), text.clone(), window, cx)
+                        }
+                    },
+                ));
+                self.reviews.insert(project.id.clone(), review.clone());
+                review
+            }
+        };
         let github = cx.new(|cx| {
             GitHubView::new(
                 project.path.clone(),
@@ -3033,6 +3056,70 @@ mod tests {
         });
         assert!(!panes.read_with(cx, |p, _| p.review_is_showing()));
         assert!(panes.read_with(cx, |p, cx| p.active_thread_id(cx).is_some()));
+    }
+
+    #[gpui_kit::test]
+    fn line_comments_on_the_review_go_to_the_agents_prompt_box(cx: &mut TestAppContext) {
+        use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+        let (window, workspace, _, project) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        assert!(
+            std::process::Command::new("git").arg("-C").arg(&project).args(["init", "-q"]).status().unwrap().success()
+        );
+        std::fs::write(project.join("notes.md"), "a new file\nsecond line\n").unwrap();
+        let changes = workspace.update(cx, |w, cx| w.project_changes(cx).unwrap());
+        cx.run_until_parked();
+        for _ in 0..200 {
+            if changes.read_with(cx, |c, _| c.changes.files.len() == 1) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+        workspace.update_in(cx, |w, window, cx| w.open_review(None, window, cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        let review = workspace.read_with(cx, |w, _| w.reviews.values().next().cloned().unwrap());
+
+        // Lines picked in the diff (Shift+↓ there), then Enter opens a comment on them; Ctrl+Enter
+        // keeps it, and the keyboard goes back to the diff.
+        changes.update(cx, |c, cx| {
+            let range = DiffLineRange::new("notes.md", DiffSide::Modified, 1, 2);
+            c.diff.update(cx, |d, cx| d.set_selected_lines(Some(range), cx));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_input("Say what this file is for");
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.update(|window, cx| window.render_frame(cx));
+        let notes = review.read_with(cx, |r, _| r.notes.clone());
+        assert_eq!(notes.len(), 1);
+        assert_eq!((notes[0].start, notes[0].line), (1, 2));
+        assert_eq!(notes[0].quoted, "a new file\nsecond line");
+        assert_eq!(notes[0].body, "Say what this file is for");
+
+        // Esc drops a comment being written; Delete removes the selected line's comment.
+        changes.update(cx, |c, cx| {
+            let range = DiffLineRange::new("notes.md", DiffSide::Modified, 1, 1);
+            c.diff.update(cx, |d, cx| d.set_selected_lines(Some(range), cx));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("Never mind");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(review.read_with(cx, |r, _| r.notes.len()), 1, "nothing added");
+        cx.simulate_keystrokes("delete");
+        assert!(review.read_with(cx, |r, _| r.notes.is_empty()));
+        review.update(cx, |r, _| r.notes = notes.clone());
+
+        // Ctrl+Enter in the diff sends them to the agent's prompt box as one chip.
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(review.read_with(cx, |r, _| r.notes.is_empty()), "handed over");
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        let (labels, texts) = thread.read_with(cx, |t, _| t.quote_parts());
+        assert_eq!(labels, ["Review comment · notes.md"]);
+        assert!(texts[0].contains("notes.md:1-2\n```\na new file\nsecond line\n```\nSay what this file is for"));
+        let focused = cx.update(|window, cx| thread.read(cx).prompt_focus(cx).is_focused(window));
+        assert!(focused, "the caret is in the prompt box");
     }
 
     #[gpui_kit::test]

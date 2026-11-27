@@ -802,7 +802,8 @@ impl Panes {
             }
             Some(View::GitHub(github)) => github.update(cx, |g, cx| g.shown(window, cx)),
             Some(View::Notes(notes)) => notes.update(cx, |n, cx| n.shown(window, cx)),
-            Some(View::Review(_)) | None => self.focus.focus(window, cx),
+            Some(View::Review(review)) => review.update(cx, |r, cx| r.focus(window, cx)),
+            None => self.focus.focus(window, cx),
         }
     }
 
