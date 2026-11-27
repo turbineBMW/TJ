@@ -1451,7 +1451,7 @@ mod tests {
                 let thread = cx.new(|cx| ThreadView::new(Backend::Scripted(Vec::new()), window, cx));
                 let changes = cx.new(|cx| ProjectChanges::new(project.clone(), cx));
                 let review = cx.new(|cx| ReviewView::new(changes.clone(), true, cx));
-                let github = cx.new(|cx| crate::github_view::GitHubView::new(project.clone(), None, window, cx));
+                let github = cx.new(|cx| crate::github_view::GitHubView::new(project.clone(), None, None, window, cx));
                 let agent = cx.new(|cx| crate::agent_slot::AgentSlot::new(project.clone(), changes, cx));
                 let start = Start { thread: start_thread.then(|| ("t1".to_string(), thread.clone())), terminal: true };
                 let panes = cx.new(|cx| {
