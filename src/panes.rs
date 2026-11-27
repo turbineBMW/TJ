@@ -1402,6 +1402,13 @@ mod tests {
         let right = s.panes.read_with(cx, |p, _| p.focused_pane());
         assert_ne!(right, first, "focus moves to the new pane");
 
+        cx.update(|window, cx| window.press("ctrl-t", cx));
+        cx.update(|window, cx| window.press("ctrl-w", cx));
+        assert_eq!(
+            s.panes.read_with(cx, |p, _| p.shape()),
+            vec![2],
+            "in a terminal, Ctrl+T and Ctrl+W are the shell's"
+        );
         cx.update(|window, cx| window.press("ctrl-shift-t", cx));
         assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "Ctrl+Shift+T opens a new tab");
         cx.update(|window, cx| window.press("ctrl-pageup", cx));
@@ -1443,8 +1450,13 @@ mod tests {
         let s = open(cx, None, true);
         let cx = &mut VisualTestContext::from_window(s.window, cx);
         focus_active(&s.panes, cx);
+        cx.update(|window, cx| window.press("ctrl-t", cx));
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![1, 1, 1], "Ctrl+T from the prompt opens a tab");
+        cx.update(|window, cx| window.press("ctrl-pageup", cx));
+        cx.update(|window, cx| window.press("ctrl-pageup", cx));
+        focus_active(&s.panes, cx);
         cx.update(|window, cx| window.press("ctrl-alt-v", cx));
-        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1], "Ctrl+Alt+V from the prompt splits down");
+        assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1, 1], "Ctrl+Alt+V from the prompt splits down");
     }
 
     #[gpui_kit::test]

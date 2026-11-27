@@ -70,8 +70,17 @@ pub static COMMANDS: &[Command] = &[
     command!("open_github", "Open the project's GitHub tab", Projects, WS, ["ctrl-shift-g"], workspace::OpenGitHub),
     command!("settings", "Open settings", Window, WS, ["ctrl-,"], workspace::OpenSettings),
     command!("toggle_sidebar", "Show or hide the sidebar", Window, WS, ["ctrl-shift-s"], workspace::ToggleSidebar),
-    command!("new_tab", "New terminal tab", Panes, PANES, ["ctrl-shift-t"], panes::NewTab),
-    command!("close_tab", "Close the pane (its tab, with the last)", Panes, PANES, ["ctrl-shift-w"], panes::CloseTab),
+    // Ctrl+T and Ctrl+W, like a browser. A terminal keeps them for its shell (transpose, delete a
+    // word), so the Shift spellings work there too.
+    command!("new_tab", "New terminal tab", Panes, PANES, ["ctrl-t", "ctrl-shift-t"], panes::NewTab),
+    command!(
+        "close_tab",
+        "Close the pane (its tab, with the last)",
+        Panes,
+        PANES,
+        ["ctrl-w", "ctrl-shift-w"],
+        panes::CloseTab
+    ),
     command!("next_tab", "Next tab", Panes, PANES, ["ctrl-pagedown"], panes::NextTab),
     command!("previous_tab", "Previous tab", Panes, PANES, ["ctrl-pageup"], panes::PreviousTab),
     command!("move_tab_right", "Move the tab right", Panes, PANES, ["ctrl-shift-pagedown"], panes::MoveTabRight),
@@ -235,9 +244,11 @@ pub fn unusable(key: &str) -> Option<&'static str> {
 }
 
 /// Whether the shell would miss `key`: plain Ctrl plus a letter is the shell's (Ctrl+C,
-/// Ctrl+R...), and ROADMAP.md keeps app shortcuts off those.
+/// Ctrl+R...), and ROADMAP.md keeps app shortcuts off those, except the few a terminal keeps
+/// for itself while it has focus (Ctrl+T, Ctrl+W).
 pub fn shadows_shell(key: &str) -> bool {
-    matches!(split(key), Some((true, false, false, false, k)) if k.len() == 1 && k.chars().all(|c| c.is_ascii_alphabetic()))
+    let ctrl_letter = matches!(split(key), Some((true, false, false, false, k)) if k.len() == 1 && k.chars().all(|c| c.is_ascii_alphabetic()));
+    ctrl_letter && !normalize(key).is_some_and(|k| crate::terminal::PASSTHROUGH_KEYS.contains(&k.as_str()))
 }
 
 /// `key` in one spelling: modifiers in a fixed order, lower case. `None` if it isn't a key.
@@ -362,6 +373,7 @@ mod tests {
         assert!(unusable("shift-a").is_some());
         assert!(unusable("f2").is_none() && unusable("alt-x").is_none());
         assert!(shadows_shell("ctrl-r") && !shadows_shell("ctrl-alt-r") && !shadows_shell("ctrl-space"));
+        assert!(!shadows_shell("ctrl-w") && !shadows_shell("Ctrl-T"), "a terminal keeps these for its shell");
     }
 
     #[test]

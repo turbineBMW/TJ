@@ -2438,10 +2438,10 @@ mod tests {
         });
         assert_eq!(shown(cx), (None, 2, 2));
 
-        // Ctrl+Shift+W closes it like any tab, and the conversation shows again.
+        // Ctrl+W closes it like any tab, and the conversation shows again.
         cx.update(|window, cx| {
             window.render_frame(cx);
-            window.press("ctrl-shift-w", cx);
+            window.press("ctrl-w", cx);
         });
         assert!(!panes.read_with(cx, |p, _| p.review_is_showing()));
         assert!(panes.read_with(cx, |p, cx| p.active_thread_id(cx).is_some()));

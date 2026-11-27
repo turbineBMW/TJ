@@ -43,7 +43,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
 
   | Keys | Action |
   |---|---|
-  | `Ctrl+Shift+T` / `Ctrl+Shift+W` | New terminal tab / close the focused pane (the tab, with its last pane) |
+  | `Ctrl+T` / `Ctrl+W` | New terminal tab / close the focused pane (the tab, with its last pane). Inside a terminal these go to the shell, so use `Ctrl+Shift+T` / `Ctrl+Shift+W` there |
   | `Ctrl+Alt+H` / `Ctrl+Alt+V` | Split the focused pane right (side by side) / down, within its tab |
   | `Ctrl+Alt+S/F/E/D` (or `Ctrl+Alt+←/→/↑/↓`) | Focus the pane left / right / above / below |
   | `Ctrl+Shift+A` | Focus the next pane |
