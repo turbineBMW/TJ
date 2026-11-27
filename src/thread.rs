@@ -3652,13 +3652,13 @@ mod tests {
         let (short, long) = two_bash_cards(&thread, cx);
         let tool = |ix: usize, cx: &mut VisualTestContext| {
             thread.read_with(cx, |t, _| match &t.rows[ix] {
-                Row::Tool(tool) => (tool.expanded, tool.shell.as_ref().unwrap().hidden_lines(), tool.took.is_some()),
+                Row::Tool(tool) => (tool.expanded, tool.shell.as_ref().unwrap().is_cut(), tool.took.is_some()),
                 _ => panic!("not a tool row"),
             })
         };
-        // Both are timed; only the long one leaves lines out (its command, then 29 of 300).
-        assert_eq!(tool(short, cx), (true, 0, true));
-        assert_eq!(tool(long, cx), (true, 271, true));
+        // Both are timed; only the long one is cut off.
+        assert_eq!(tool(short, cx), (true, false, true));
+        assert_eq!(tool(long, cx), (true, true, true));
 
         // The header neither folds a Bash card nor opens the dialog.
         for ix in [short, long] {
@@ -3671,6 +3671,35 @@ mod tests {
         cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("tool-expand-{long}")), cx));
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(tool(long, cx).0);
+    }
+
+    #[gpui_kit::test]
+    fn a_bash_card_with_one_long_wrapping_line_is_cut_off_by_its_height(cx: &mut TestAppContext) {
+        use gpui_kit::component::WindowExt as _;
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        // Two thousand characters on one line: few enough to lay out whole, but they wrap far
+        // past the card's height.
+        let output = "word ".repeat(400);
+        thread.update(cx, |t, cx| {
+            t.send("Print a long line", cx);
+            let input = serde_json::json!({ "command": "cat one-line.txt", "description": "Print it" });
+            t.handle(AgentEvent::ToolStarted { id: "w".into(), name: "Bash".into(), input }, cx);
+            let finished =
+                AgentEvent::ToolFinished { id: "w".into(), output, is_error: false, images: Vec::new(), took_ms: None };
+            t.handle(finished, cx);
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        let ix = thread.read_with(cx, |t, _| t.rows.len() - 1);
+        let cut = thread.read_with(cx, |t, _| match &t.rows[ix] {
+            Row::Tool(tool) => tool.shell.as_ref().unwrap().is_cut(),
+            _ => panic!("not a tool row"),
+        });
+        assert!(cut, "the wrapped line is taller than the card");
+        cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("tool-expand-{ix}")), cx));
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
     #[gpui_kit::test]
