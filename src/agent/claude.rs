@@ -57,6 +57,8 @@ pub struct SessionOptions {
     pub permission_mode: PermissionMode,
     /// Continue an earlier conversation.
     pub resume: Option<String>,
+    /// Also ask for an 80/20 summary at the end of finished work (`summary::INSTRUCTIONS`).
+    pub eighty_twenty: bool,
 }
 
 impl SessionOptions {
@@ -71,11 +73,14 @@ impl SessionOptions {
             "--include-partial-messages",
             // Permission prompts come to us as `can_use_tool` control requests.
             "--permission-prompt-tool=stdio",
-            "--append-system-prompt",
-            TJ_INSTRUCTIONS,
         ]
         .map(String::from)
         .to_vec();
+        let instructions = match self.eighty_twenty {
+            true => format!("{TJ_INSTRUCTIONS}\n\n{}", crate::summary::INSTRUCTIONS),
+            false => TJ_INSTRUCTIONS.to_string(),
+        };
+        args.extend(["--append-system-prompt".into(), instructions]);
         args.extend(["--permission-mode".into(), self.permission_mode.claude_name().into()]);
         if let Some(model) = &self.model {
             args.extend(["--model".into(), model.clone()]);
@@ -1396,6 +1401,10 @@ mod tests {
         let at = args.iter().position(|a| a == "--append-system-prompt").expect("flag");
         assert_eq!(args[at + 1], TJ_INSTRUCTIONS);
         assert!(TJ_INSTRUCTIONS.contains("exactly one command in each code block"));
+        let args = SessionOptions { eighty_twenty: true, ..Default::default() }.args();
+        let at = args.iter().position(|a| a == "--append-system-prompt").expect("flag");
+        assert!(args[at + 1].starts_with(TJ_INSTRUCTIONS), "the 80/20 rule comes after TJ's own");
+        assert!(args[at + 1].ends_with(crate::summary::INSTRUCTIONS));
     }
 
     /// `cargo test -- --ignored live_` (no tokens: the session is stopped after its handshake)

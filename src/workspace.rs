@@ -309,6 +309,7 @@ impl Workspace {
                     model: model_choice,
                     effort,
                     permission_mode: mode,
+                    eighty_twenty: cx.try_global::<crate::settings::Settings>().is_none_or(|s| s.eighty_twenty),
                     ..Default::default()
                 }),
             };

@@ -26,6 +26,8 @@ pub struct Settings {
     pub ui_font: Option<String>,
     /// The monospace family, for code, tool output and the terminal; `None` for the default.
     pub mono_font: Option<String>,
+    /// Ask Claude to end finished work with an 80/20 summary (see `summary`); new sessions only.
+    pub eighty_twenty: bool,
     /// Shortcuts changed from their defaults: a command's id (see `keybindings::COMMANDS`) and
     /// its keys; an empty list leaves it without one. Last, so TOML writes it as a table.
     pub keybindings: BTreeMap<String, Vec<String>>,
@@ -40,6 +42,7 @@ impl Default for Settings {
             cursor_glide_ms: 100,
             ui_font: None,
             mono_font: None,
+            eighty_twenty: true,
             keybindings: BTreeMap::new(),
         }
     }

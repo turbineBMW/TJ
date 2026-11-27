@@ -27,6 +27,7 @@ mod sample;
 mod settings;
 mod settings_view;
 mod store;
+mod summary;
 mod switcher;
 mod terminal;
 mod thread;
