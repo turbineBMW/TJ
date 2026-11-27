@@ -66,6 +66,7 @@ pub static COMMANDS: &[Command] = &[
     command!("next_project", "Next project", Projects, WS, ["ctrl-alt-n"], workspace::NextProject),
     command!("previous_project", "Previous project", Projects, WS, ["ctrl-alt-p"], workspace::PreviousProject),
     command!("new_thread", "New thread in this project", Projects, WS, ["ctrl-shift-o"], workspace::NewThread),
+    command!("focus_agent", "Focus the agent's prompt box", Projects, WS, ["ctrl-shift-l"], workspace::FocusAgent),
     command!("find", "Find a project or thread", Projects, WS, ["ctrl-space"], workspace::OpenSwitcher),
     command!("open_github", "Open the project's GitHub tab", Projects, WS, ["ctrl-shift-g"], workspace::OpenGitHub),
     command!("settings", "Open settings", Window, WS, ["ctrl-,"], workspace::OpenSettings),
