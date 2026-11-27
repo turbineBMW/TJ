@@ -1427,7 +1427,11 @@ mod tests {
     /// Terminals that print nothing (`sleep`), for tests that let the scheduler run: a shell's
     /// prompt would wake the view from the PTY's thread, which the test scheduler rejects.
     fn open_quiet(cx: &mut TestAppContext) -> Setup {
-        open_with(cx, None, false, Shell::new("sleep".into(), vec!["60".into()]))
+        open_with(cx, None, false, quiet_shell())
+    }
+
+    fn quiet_shell() -> Shell {
+        Shell::new("sleep".into(), vec!["60".into()])
     }
 
     fn open_with(cx: &mut TestAppContext, layout: Option<AreaLayout>, start_thread: bool, shell: Shell) -> Setup {
@@ -1843,7 +1847,8 @@ mod tests {
             ],
             active: 2,
         };
-        let s = open(cx, Some(layout), false);
+        // Quiet: a shell's prompt, if it came before the test ended, would fail it (see `open_quiet`).
+        let s = open_with(cx, Some(layout), false, quiet_shell());
         let cx = &mut VisualTestContext::from_window(s.window, cx);
         assert_eq!(s.panes.read_with(cx, |p, _| p.shape()), vec![2, 1, 1]);
         let restored = s.panes.read_with(cx, |p, cx| p.snapshot(cx)).unwrap();
