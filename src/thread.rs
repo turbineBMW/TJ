@@ -1,7 +1,7 @@
 //! A conversation with an agent: the transcript, approval cards, and the prompt box.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -23,6 +23,7 @@ use crate::agent::{
     claude::{self, ClaudeSession, SessionOptions},
 };
 use crate::attention::{AttentionKind, one_line};
+use crate::md_link;
 use crate::overview::{self, Overview};
 use crate::store::{Record, TranscriptWriter};
 use crate::summary::{self, SummaryCard};
@@ -278,29 +279,42 @@ struct AssistantRow {
     raw: String,
     /// Where the summary starts in `raw`, and its card.
     summary: Option<(usize, SummaryCard)>,
+    /// The project folder, which Markdown files named in the text are relative to.
+    root: PathBuf,
+    /// What `body` shows: the text above the summary, with Markdown files it names made links.
+    linked: String,
+    /// Whether each path the text named is a file. No tool runs while one block of text
+    /// streams in, so the answer holds for the whole block.
+    exists: HashMap<String, bool>,
 }
 
 impl AssistantRow {
-    fn new(text: &str, cx: &mut App) -> Self {
+    fn new(text: &str, root: PathBuf, cx: &mut App) -> Self {
         let body = cx.new(|cx| TextViewState::markdown("", cx).selectable(true));
-        let mut row = Self { body, raw: String::new(), summary: None };
+        let mut row =
+            Self { body, raw: String::new(), summary: None, root, linked: String::new(), exists: HashMap::new() };
         row.push_str(text, cx);
         row
     }
 
     fn push_str(&mut self, text: &str, cx: &mut App) {
         self.raw.push_str(text);
-        let Some(at) = summary::split(&self.raw) else {
-            if self.summary.take().is_some() {
-                self.body.update(cx, |b, cx| b.set_text(&self.raw, cx));
-            } else {
-                self.body.update(cx, |b, cx| b.push_str(text, cx));
-            }
+        let at = summary::split(&self.raw);
+        let shown = match at {
+            Some(at) => self.raw[..at].trim_end(),
+            None => &self.raw,
+        };
+        let (root, exists) = (&self.root, &mut self.exists);
+        self.linked = md_link::linkify(shown, |path| {
+            *exists.entry(path.to_string()).or_insert_with(|| md_link::resolve(root, path).is_file())
+        });
+        // Text that only grew is appended, so it streams; a mention that just became a link
+        // replaces the text.
+        self.body.update(cx, |b, cx| b.set_text(&self.linked, cx));
+        let Some(at) = at else {
+            self.summary = None;
             return;
         };
-        if self.summary.as_ref().is_none_or(|(was, _)| *was != at) {
-            self.body.update(cx, |b, cx| b.set_text(self.raw[..at].trim_end(), cx));
-        }
         let (was, card) = self.summary.get_or_insert_with(|| (at, SummaryCard::new()));
         *was = at;
         card.sync(summary::parse(&self.raw[at..]), cx);
@@ -1733,6 +1747,46 @@ impl ThreadView {
         });
     }
 
+    /// The Markdown files Claude's replies in this thread link to, oldest first, each once.
+    fn mentioned_markdown(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = Vec::new();
+        for row in &self.rows {
+            if let Row::Assistant(row) = row {
+                for file in md_link::linked_files(&row.linked, &row.root) {
+                    files.retain(|f| *f != file);
+                    files.push(file);
+                }
+            }
+        }
+        files
+    }
+
+    /// Show a Markdown file in a dialog, rendered, with the thread's other mentioned files
+    /// a step away (← and →).
+    fn open_markdown(&mut self, file: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let mut files = self.mentioned_markdown();
+        let ix = match files.iter().position(|f| *f == file) {
+            Some(ix) => ix,
+            None => {
+                files.push(file);
+                files.len() - 1
+            }
+        };
+        let root = self.project_dir();
+        let viewer = cx.new(|cx| md_link::MarkdownViewer::new(files, ix, root, cx));
+        let shown = viewer.clone();
+        window.open_dialog(cx, move |dialog, window, cx| md_link::dialog(dialog, &shown, window, cx));
+        viewer.update(cx, |v, cx| v.focus(window, cx));
+    }
+
+    /// Open the Markdown file Claude mentioned last. Says so when it hasn't mentioned one.
+    pub fn open_latest_markdown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.mentioned_markdown().pop() {
+            Some(file) => self.open_markdown(file, window, cx),
+            None => window.push_notification("Claude hasn't mentioned a Markdown file in this thread.", cx),
+        }
+    }
+
     fn fold_tool(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(Row::Tool(tool)) = self.rows.get_mut(ix) {
             tool.expanded = !tool.expanded;
@@ -2311,7 +2365,7 @@ impl ThreadView {
         let row = if user {
             Row::User(cx.new(|cx| TextViewState::markdown(text, cx).selectable(true)), Vec::new())
         } else {
-            Row::Assistant(AssistantRow::new(text, cx))
+            Row::Assistant(AssistantRow::new(text, self.project_dir(), cx))
         };
         self.push_row(row, cx)
     }
@@ -2396,6 +2450,7 @@ impl ThreadView {
                 .into_any_element(),
             Row::Assistant(row) => {
                 let thread = cx.entity().downgrade();
+                let (link_thread, root) = (thread.clone(), row.root.clone());
                 // A reply that is only a summary has no text above its card.
                 let text = row.summary.as_ref().is_none_or(|(at, _)| !row.raw[..*at].trim().is_empty());
                 pad(v_flex())
@@ -2406,7 +2461,21 @@ impl ThreadView {
                             TextView::new(&row.body)
                                 .selectable(true)
                                 .stream_fade(true)
-                                .code_block_actions(move |block, _, _| code_block_buttons(block, thread.clone())),
+                                .code_block_actions(move |block, _, _| code_block_buttons(block, thread.clone()))
+                                .on_link_click(move |url, event, window, cx| {
+                                    if let ClickEvent::Mouse(click) = event
+                                        && !matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
+                                    {
+                                        return;
+                                    }
+                                    // A Markdown file opens in a dialog; anything else as before.
+                                    match md_link::target(url, &root) {
+                                        Some(file) => {
+                                            link_thread.update(cx, |t, cx| t.open_markdown(file, window, cx)).ok();
+                                        }
+                                        None => cx.open_url(url),
+                                    }
+                                }),
                         )
                     })
                     .when_some(row.summary.as_ref(), |el, (_, card)| el.child(card.render(cx)))
@@ -3115,7 +3184,7 @@ pub fn default_cwd() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, Row, Status, ThreadView, command_text, is_shell};
+    use super::{Backend, Row, Status, ThreadView, command_text, default_cwd, is_shell};
 
     #[test]
     fn shell_blocks_give_the_command_as_typed() {
@@ -3737,6 +3806,36 @@ mod tests {
         cx.update(|window, cx| window.click(gpui_kit::SharedString::from(format!("tool-expand-{long}")), cx));
         assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
         assert!(tool(long, cx).0);
+    }
+
+    #[gpui_kit::test]
+    fn markdown_files_claude_mentions_open_in_a_dialog(cx: &mut TestAppContext) {
+        use gpui_kit::component::WindowExt as _;
+        // A scripted thread's project is the working directory: the crate, where tests run.
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        thread.update(cx, |t, cx| {
+            t.handle(AgentEvent::TextStarted, cx);
+            // Streamed in pieces, the name split across them.
+            for piece in ["I updated `READ", "ME.md` and ROADMAP.md, ", "not `gone.md`."] {
+                t.handle(AgentEvent::TextDelta(piece.into()), cx);
+            }
+        });
+        let linked = thread.read_with(cx, |t, _| match t.rows.last() {
+            Some(Row::Assistant(row)) => row.linked.clone(),
+            _ => panic!("an assistant row"),
+        });
+        assert_eq!(linked, "I updated [`README.md`](<README.md>) and [ROADMAP.md](<ROADMAP.md>), not `gone.md`.");
+        let root = default_cwd();
+        assert_eq!(
+            thread.read_with(cx, |t, _| t.mentioned_markdown()),
+            vec![root.join("README.md"), root.join("ROADMAP.md")]
+        );
+
+        // The key opens the newest one.
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+        thread.update_in(cx, |t, window, cx| t.open_latest_markdown(window, cx));
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
     }
 
     #[gpui_kit::test]

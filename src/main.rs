@@ -19,6 +19,7 @@ mod history;
 mod images;
 mod keybindings;
 mod keymap;
+mod md_link;
 mod notes;
 mod notes_mcp;
 mod notes_view;
