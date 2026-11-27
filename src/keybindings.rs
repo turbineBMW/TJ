@@ -78,6 +78,14 @@ pub static COMMANDS: &[Command] = &[
         ["ctrl-shift-m"],
         workspace::OpenMarkdown
     ),
+    command!(
+        "open_activity",
+        "Open what's running in the background, or the latest background shell or subagent",
+        Projects,
+        WS,
+        ["ctrl-shift-j"],
+        workspace::OpenActivity
+    ),
     command!("settings", "Open settings", Window, WS, ["ctrl-,"], workspace::OpenSettings),
     command!("toggle_sidebar", "Show or hide the sidebar", Window, WS, ["ctrl-shift-s"], workspace::ToggleSidebar),
     // Ctrl+T and Ctrl+W, like a browser. A terminal keeps them for its shell (transpose, delete a

@@ -56,6 +56,7 @@ gpui_kit::actions!(
         OpenGitHub,
         OpenNotes,
         OpenMarkdown,
+        OpenActivity,
         FocusAgent
     ]
 );
@@ -2327,6 +2328,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenMarkdown, window, cx| {
                 if let Some(thread) = this.active_thread() {
                     thread.update(cx, |t, cx| t.open_latest_markdown(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenActivity, window, cx| {
+                if let Some(thread) = this.active_thread() {
+                    thread.update(cx, |t, cx| t.open_latest_activity(window, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusAgent, window, cx| this.focus_agent(window, cx)))
