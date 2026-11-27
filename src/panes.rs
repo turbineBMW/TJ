@@ -1073,24 +1073,33 @@ impl Panes {
         }
     }
 
-    fn render_node(&self, node: &Node, path: Vec<bool>, cx: &mut Context<Self>) -> AnyElement {
+    /// `outer` is which of the content's top corners the node reaches, where the panes round theirs.
+    fn render_node(&self, node: &Node, path: Vec<bool>, outer: Corners, cx: &mut Context<Self>) -> AnyElement {
         let child_path = |second: bool| path.iter().copied().chain([second]).collect::<Vec<_>>();
         // A pane being dragged is out of the layout until it's let go, as if already taken out:
         // its sibling has its place, and the shadow shows exactly where it will land.
         let dragged = self.dragging.as_ref().filter(|_| cx.has_active_drag()).map(|d| d.pane);
         let is_dragged = |node: &Node| matches!(node, Node::Pane(pane) if Some(pane.id) == dragged);
         match node {
-            Node::Pane(pane) => self.render_pane(pane, cx),
-            Node::Split { first, second, .. } if is_dragged(first) => self.render_node(second, child_path(true), cx),
-            Node::Split { first, second, .. } if is_dragged(second) => self.render_node(first, child_path(false), cx),
+            Node::Pane(pane) => self.render_pane(pane, outer, cx),
+            Node::Split { first, second, .. } if is_dragged(first) => {
+                self.render_node(second, child_path(true), outer, cx)
+            }
+            Node::Split { first, second, .. } if is_dragged(second) => {
+                self.render_node(first, child_path(false), outer, cx)
+            }
             Node::Split { direction, ratio, first, second } => {
                 let (border, accent) = (cx.theme().border, cx.theme().primary);
-                let (a, b) =
-                    (self.render_node(first, child_path(false), cx), self.render_node(second, child_path(true), cx));
                 let across = *direction == SplitDirection::Right;
+                let (a, b) = (
+                    self.render_node(first, child_path(false), outer.first(across), cx),
+                    self.render_node(second, child_path(true), outer.second(across), cx),
+                );
                 let path: Rc<[bool]> = path.into();
                 let key = path.iter().map(|b| if *b { '1' } else { '0' }).collect::<String>();
-                // A strip to grab between the two sides, with a 1px line down its middle.
+                // A strip to grab between the two sides, with a 1px line down its middle. It lies
+                // over their edges rather than between them, so each side's background (a
+                // terminal's dark one, say) runs right up to the line.
                 let divider = div()
                     .id(SharedString::from(format!("divider-{key}")))
                     .debug_selector(|| format!("divider-{key}"))
@@ -1099,11 +1108,14 @@ impl Panes {
                     .flex()
                     .justify_center()
                     .items_center()
+                    .absolute()
                     .map(|el| {
                         if across {
-                            el.w(px(DIVIDER)).h_full().cursor_col_resize()
+                            let el = el.top_0().bottom_0().left(relative(*ratio)).ml(px(-DIVIDER / 2.));
+                            el.w(px(DIVIDER)).cursor_col_resize()
                         } else {
-                            el.h(px(DIVIDER)).w_full().cursor_row_resize()
+                            let el = el.left_0().right_0().top(relative(*ratio)).mt(px(-DIVIDER / 2.));
+                            el.h(px(DIVIDER)).cursor_row_resize()
                         }
                     })
                     .child(
@@ -1126,6 +1138,7 @@ impl Panes {
                 let container = if across { h_flex() } else { v_flex() };
                 container
                     .size_full()
+                    .relative()
                     .on_drag_move(cx.listener({
                         let path = path.clone();
                         move |this, event: &DragMoveEvent<DividerDrag>, _, cx| {
@@ -1146,14 +1159,13 @@ impl Panes {
                     .map(|el| {
                         if across {
                             el.child(div().h_full().w(relative(*ratio)).min_w_0().child(a))
-                                .child(divider)
                                 .child(div().h_full().flex_1().min_w_0().child(b))
                         } else {
                             el.child(div().w_full().h(relative(*ratio)).min_h_0().child(a))
-                                .child(divider)
                                 .child(div().w_full().flex_1().min_h_0().child(b))
                         }
                     })
+                    .child(divider)
                     .into_any_element()
             }
         }
@@ -1174,7 +1186,7 @@ impl Panes {
         }
     }
 
-    fn render_pane(&self, pane: &Pane, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pane(&self, pane: &Pane, outer: Corners, cx: &mut Context<Self>) -> AnyElement {
         let (accent, border) = (cx.theme().primary, cx.theme().border);
         let tab = self.tabs.get(self.active);
         let split = tab.is_some_and(|t| matches!(t.root, Node::Split { .. }));
@@ -1188,6 +1200,9 @@ impl Panes {
             View::Review(review) => review.clone().into_any_element(),
             View::GitHub(github) => github.clone().into_any_element(),
         };
+        // A terminal's own background fills its whole pane, grip bar and all, so no strip of
+        // the content's background shows round it. Other views paint the content's background.
+        let fill = matches!(pane.view, View::Terminal(_)).then(|| crate::terminal::background(cx));
         let title: SharedString = view_label(&pane.view, cx).0.into();
         let this = cx.entity().downgrade();
         // The tab is titled after its focused pane; when split, a bar over each pane says which
@@ -1203,14 +1218,13 @@ impl Panes {
             .justify_center()
             .items_center()
             .cursor_grab()
-            .child(div().absolute().top_0().left_0().right_0().h(px(2.)).when(focused, |el| el.bg(accent)))
             .child(
                 div()
                     .w(px(32.))
                     .h(px(3.))
                     .mt(px(1.))
                     .rounded_full()
-                    .bg(border)
+                    .bg(if focused { accent } else { border })
                     .group_hover("pane-grip", |el| el.bg(accent)),
             )
             .on_drag(PaneDrag { pane: pane_id, title }, move |drag, _, _, cx| {
@@ -1228,6 +1242,11 @@ impl Panes {
         v_flex()
             .size_full()
             .relative()
+            .when_some(fill, |el, fill| {
+                el.bg(fill)
+                    .when(outer.left, |el| el.rounded_tl(px(CONTENT_RADIUS)))
+                    .when(outer.right, |el| el.rounded_tr(px(CONTENT_RADIUS)))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -1321,6 +1340,27 @@ fn view_label(view: &View, cx: &App) -> (String, Option<Hsla>) {
     }
 }
 
+/// Which of the content's rounded top corners a node of the split reaches.
+#[derive(Clone, Copy)]
+struct Corners {
+    left: bool,
+    right: bool,
+}
+
+impl Corners {
+    /// The first (left or upper) side's corners: side by side, it loses the right one; stacked,
+    /// it keeps both.
+    fn first(self, across: bool) -> Self {
+        Corners { right: self.right && !across, ..self }
+    }
+
+    /// The second (right or lower) side's corners: side by side, it loses the left one; stacked,
+    /// it's below the top and has none.
+    fn second(self, across: bool) -> Self {
+        if across { Corners { left: false, ..self } } else { Corners { left: false, right: false } }
+    }
+}
+
 /// The content's top corners, where it meets the top bar, like a browser's page. Views that
 /// paint their own background round it to match.
 pub const CONTENT_RADIUS: f32 = 10.0;
@@ -1357,7 +1397,7 @@ impl Render for Panes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let body = match self.tabs.get(self.active) {
-            Some(tab) => self.render_node(&tab.root, Vec::new(), cx),
+            Some(tab) => self.render_node(&tab.root, Vec::new(), Corners { left: true, right: true }, cx),
             None => v_flex()
                 .size_full()
                 .items_center()
