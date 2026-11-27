@@ -18,6 +18,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentEvent, AgentKind, PermissionMode};
+use crate::attention::{Attention, Reminder};
 
 /// Where TJ's files live.
 #[derive(Clone, Debug)]
@@ -251,6 +252,10 @@ pub struct ThreadMeta {
     /// The title was given by the user, so the overview doesn't replace it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub named: bool,
+    /// The agent asked something or finished while the user wasn't looking, and the thread
+    /// hasn't been looked at since: the sidebar marks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unseen: Option<Attention>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -435,6 +440,9 @@ pub struct State {
     /// The sidebar is folded away (Ctrl+Shift+S, or the button at the left of the top bar).
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// Notifications to show again later (picked on a notification).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reminders: Vec<Reminder>,
 }
 
 impl State {
@@ -517,6 +525,7 @@ impl State {
                 agent: AgentKind::default(),
                 archived: false,
                 named: false,
+                unseen: None,
             },
         );
         Some(id)

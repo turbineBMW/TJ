@@ -21,7 +21,8 @@ use anyhow::Context as _;
 use serde_json::{Value, json};
 
 use super::{
-    AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, SlashCommand, Spend, ToolImage, UsageWindow,
+    AgentEvent, AgentSession, Decision, ELICITATION_TOOL, ElicitAction, PermissionMode, PermissionRequest,
+    SlashCommand, Spend, ToolImage, UsageWindow,
 };
 
 /// The `claude` version the protocol handling was written and recorded against.
@@ -345,6 +346,20 @@ impl Drop for ClaudeSession {
 
 /// The `can_use_tool` answer for a decision.
 pub fn permission_result(request: &PermissionRequest, decision: &Decision) -> Value {
+    // An MCP server's request for input is answered in MCP's terms.
+    if request.tool_name == ELICITATION_TOOL {
+        let (action, content) = match decision {
+            Decision::Elicit { action, content } => (*action, content.clone()),
+            Decision::Approve | Decision::ApproveForSession => (ElicitAction::Accept, None),
+            Decision::Decline { .. } => (ElicitAction::Decline, None),
+            _ => (ElicitAction::Cancel, None),
+        };
+        let mut answer = json!({ "action": action.name() });
+        if let (ElicitAction::Accept, Some(content)) = (action, content) {
+            answer["content"] = content;
+        }
+        return answer;
+    }
     match decision {
         Decision::Approve => json!({ "behavior": "allow", "updatedInput": request.input }),
         Decision::ApproveForSession => json!({
@@ -362,6 +377,8 @@ pub fn permission_result(request: &PermissionRequest, decision: &Decision) -> Va
         Decision::Cancel => {
             json!({ "behavior": "deny", "message": "The user cancelled the turn.", "interrupt": true })
         }
+        // Only an MCP server's request for input is answered this way; a tool call isn't run.
+        Decision::Elicit { .. } => json!({ "behavior": "deny", "message": "The user declined this tool call." }),
         // The answers ride in the tool's own input, which is how Claude Code's dialog returns them.
         Decision::Answer { answers } => {
             let mut input = request.input.clone();
@@ -660,6 +677,18 @@ impl Parser {
                             .get("suppress_always_allow_rule")
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
+                    })],
+                    // An MCP server asking the user for input. Claude waits for the answer, so
+                    // it's shown like an approval.
+                    (Some("elicitation"), Some(id)) => vec![AgentEvent::PermissionRequested(PermissionRequest {
+                        id,
+                        tool_name: ELICITATION_TOOL.into(),
+                        tool_use_id: None,
+                        description: str_at(request, "message"),
+                        input: request.clone(),
+                        suggestions: Vec::new(),
+                        reason: None,
+                        no_standing_grant: true,
                     })],
                     _ => Vec::new(),
                 }
@@ -1287,6 +1316,32 @@ mod tests {
         assert_eq!(start["updatedPermissions"][0]["mode"], "acceptEdits");
         let ask = permission_result(&r, &Decision::StartPlan { accept_edits: false });
         assert_eq!(ask["updatedPermissions"][0]["mode"], "default");
+    }
+
+    #[test]
+    fn an_mcp_servers_request_for_input_is_shown_and_answered_in_mcps_terms() {
+        use crate::agent::{ELICITATION_TOOL, ElicitAction};
+        let events = Parser::default().parse(&json!({
+            "type": "control_request",
+            "request_id": "e1",
+            "request": {
+                "subtype": "elicitation", "mcp_server_name": "fieldhook", "message": "Confirm it",
+                "mode": "form", "requested_schema": { "type": "object", "properties": {} }
+            },
+        }));
+        let [AgentEvent::PermissionRequested(r)] = events.as_slice() else { panic!("{events:?}") };
+        assert_eq!((r.id.as_str(), r.tool_name.as_str()), ("e1", ELICITATION_TOOL));
+        assert_eq!(r.description.as_deref(), Some("Confirm it"));
+        assert_eq!(r.input["mcp_server_name"], "fieldhook", "the request rides along for the card");
+
+        let accept = Decision::Elicit { action: ElicitAction::Accept, content: Some(json!({ "ok": true })) };
+        assert_eq!(permission_result(r, &accept), json!({ "action": "accept", "content": { "ok": true } }));
+        let link = Decision::Elicit { action: ElicitAction::Accept, content: None };
+        assert_eq!(permission_result(r, &link), json!({ "action": "accept" }));
+        let decline = Decision::Elicit { action: ElicitAction::Decline, content: Some(json!({ "ok": true })) };
+        assert_eq!(permission_result(r, &decline), json!({ "action": "decline" }), "declining sends nothing");
+        // A turn cancelled with the request still open cancels it.
+        assert_eq!(permission_result(r, &Decision::Cancel), json!({ "action": "cancel" }));
     }
 
     #[test]

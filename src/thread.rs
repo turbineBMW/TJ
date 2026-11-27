@@ -19,16 +19,22 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use serde_json::Value;
 
 use crate::agent::{
-    AgentEvent, AgentSession, Decision, PermissionMode, PermissionRequest, ScriptedAgent, ScriptedCall,
+    AgentEvent, AgentSession, Decision, ElicitAction, PermissionMode, PermissionRequest, ScriptedAgent, ScriptedCall,
     claude::{self, ClaudeSession, SessionOptions},
 };
+use crate::attention::{AttentionKind, one_line};
 use crate::overview::{self, Overview};
 use crate::store::{Record, TranscriptWriter};
 use crate::tool_card::{self, ToolStatus};
 
+mod elicitation;
 mod questions;
+use elicitation::ElicitationCard;
 use questions::QuestionCard;
 pub use questions::bindings as question_bindings;
+
+/// How long the line in a notification about the thread may be.
+const NEEDS_YOU_DETAIL: usize = 180;
 
 /// How often a long turn's overview is refreshed while it runs.
 const OVERVIEW_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -42,6 +48,15 @@ impl EventEmitter<ThreadChanged> for ThreadView {}
 pub struct ThreadSent;
 
 impl EventEmitter<ThreadSent> for ThreadView {}
+
+/// The agent wants the user: it asked something, wants approval, has a plan, or finished its
+/// turn. Only sent live, never while a transcript is replayed.
+pub struct ThreadNeedsYou {
+    pub kind: AttentionKind,
+    pub detail: String,
+}
+
+impl EventEmitter<ThreadNeedsYou> for ThreadView {}
 
 /// Something the composer's menus ask the workspace to do.
 #[derive(Clone, Debug, PartialEq)]
@@ -231,12 +246,14 @@ struct ApprovalRow {
     feedback: Option<Entity<InputState>>,
 }
 
-/// What the agent is waiting on: an ordinary tool call, a question for the user, or a plan.
+/// What the agent is waiting on: an ordinary tool call, a question for the user, a plan, or
+/// an MCP server's request for input.
 enum ApprovalKind {
     Tool,
     /// Boxed: a question card is much larger than the other transcript rows.
     Question(Box<QuestionCard>),
     Plan(Entity<TextViewState>),
+    Elicitation(Box<ElicitationCard>),
 }
 
 // An approval row is several times larger than the others, but a transcript holds hundreds
@@ -295,6 +312,8 @@ pub struct ThreadView {
     /// The conversation as plain text ("User: ..." / "Claude: ..."), for account handoffs.
     plain: Vec<String>,
     plain_current: Option<usize>,
+    /// The user pressed Stop during this turn, so its end isn't announced.
+    interrupted: bool,
     log: Option<TranscriptWriter>,
     /// Streamed text not yet written to the transcript; saved as one delta per block.
     pending_text: String,
@@ -417,6 +436,7 @@ impl ThreadView {
             rows: Vec::new(),
             plain: Vec::new(),
             plain_current: None,
+            interrupted: false,
             log: None,
             pending_text: String::new(),
             replaying: false,
@@ -1547,10 +1567,11 @@ impl ThreadView {
             cx.emit(ThreadChanged);
             return;
         }
-        if let Some(agent) = &self.agent
-            && let Err(err) = agent.interrupt()
-        {
-            self.notice(NoticeKind::Error, format!("Could not stop: {err:#}"), cx);
+        if let Some(agent) = &self.agent {
+            match agent.interrupt() {
+                Ok(()) => self.interrupted = self.status != Status::Idle,
+                Err(err) => self.notice(NoticeKind::Error, format!("Could not stop: {err:#}"), cx),
+            }
         }
     }
 
@@ -1582,6 +1603,10 @@ impl ThreadView {
         };
         let is_question = matches!(row.kind, ApprovalKind::Question(_));
         let is_plan = matches!(row.kind, ApprovalKind::Plan(_));
+        let elicitation = match &row.kind {
+            ApprovalKind::Elicitation(card) => Some((card.server.clone(), card.url.is_some())),
+            _ => None,
+        };
         let outcome = match &decision {
             Decision::Approve => "Approved".to_string(),
             Decision::ApproveForSession => "Approved for this session".to_string(),
@@ -1594,6 +1619,12 @@ impl ThreadView {
             }
             Decision::StartPlan { accept_edits: true } => "Started, accepting edits".to_string(),
             Decision::StartPlan { accept_edits: false } => "Started, asking first".to_string(),
+            Decision::Elicit { action, .. } => match (action, elicitation.as_ref().is_some_and(|(_, url)| *url)) {
+                (ElicitAction::Accept, true) => "Opened the link".to_string(),
+                (ElicitAction::Accept, false) => "Submitted".to_string(),
+                (ElicitAction::Decline, _) => "Declined".to_string(),
+                (ElicitAction::Cancel, _) => "Cancelled".to_string(),
+            },
         };
         row.outcome = Some(outcome.clone());
         let request = row.request.clone();
@@ -1611,6 +1642,9 @@ impl ThreadView {
         }
         if is_plan {
             self.plain.push(format!("(User: {outcome})"));
+        }
+        if let Some((server, _)) = &elicitation {
+            self.plain.push(format!("({server} asked the user for input. User: {outcome})"));
         }
         // Approving a plan leaves plan mode; show the mode the session now runs in.
         if let Decision::StartPlan { accept_edits } = &decision {
@@ -2043,8 +2077,15 @@ impl ThreadView {
                         }
                         None => ApprovalKind::Tool,
                     },
+                    crate::agent::ELICITATION_TOOL => {
+                        ApprovalKind::Elicitation(Box::new(ElicitationCard::parse(&request.input)))
+                    }
                     _ => ApprovalKind::Tool,
                 };
+                if !self.replaying {
+                    let needs_you = self.approval_needs_you(&request, &kind);
+                    cx.emit(needs_you);
+                }
                 self.push_row(Row::Approval(ApprovalRow { request, kind, outcome: None, feedback: None }), cx);
                 self.status = Status::AwaitingApproval;
             }
@@ -2092,6 +2133,15 @@ impl ThreadView {
                     self.cost_usd += cost;
                     self.cost_estimate = 0.0;
                 }
+                // A turn the user stopped themselves needs no telling.
+                if !self.replaying && !std::mem::take(&mut self.interrupted) {
+                    let (kind, detail) = match (is_error, &error) {
+                        (true, Some(error)) => (AttentionKind::Stopped, format!("The turn failed: {error}")),
+                        (true, None) => (AttentionKind::Stopped, "The turn failed.".into()),
+                        (false, _) => (AttentionKind::Finished, self.last_reply().unwrap_or_default()),
+                    };
+                    cx.emit(ThreadNeedsYou { kind, detail: one_line(&detail, NEEDS_YOU_DETAIL) });
+                }
                 if is_error {
                     self.notice(NoticeKind::Error, error.unwrap_or_else(|| "The turn failed.".into()), cx);
                 }
@@ -2120,6 +2170,13 @@ impl ThreadView {
                 if self.status != Status::Idle || code.is_some_and(|c| c != 0) {
                     let detail = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
                     let code = code.map_or("a signal".to_string(), |c| format!("code {c}"));
+                    if !std::mem::take(&mut self.interrupted) && !self.replaying {
+                        let why = format!("Claude's process exited ({code}). {detail}");
+                        cx.emit(ThreadNeedsYou {
+                            kind: AttentionKind::Stopped,
+                            detail: one_line(&why, NEEDS_YOU_DETAIL),
+                        });
+                    }
                     self.notice(
                         NoticeKind::Error,
                         format!("Claude stopped ({code}). {detail} Sending another message resumes the conversation."),
@@ -2130,6 +2187,54 @@ impl ThreadView {
             }
         }
         cx.notify();
+    }
+
+    /// What a permission request asks of the user, for the notification.
+    fn approval_needs_you(&self, request: &crate::agent::PermissionRequest, kind: &ApprovalKind) -> ThreadNeedsYou {
+        let text = |key: &str| request.input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+        let (kind, detail) = match kind {
+            ApprovalKind::Question(_) => {
+                let questions = request.input.get("questions").and_then(Value::as_array);
+                let first = questions
+                    .and_then(|q| q.first())
+                    .and_then(|q| q.get("question"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let more = questions.map_or(0, |q| q.len().saturating_sub(1));
+                let detail = if more > 0 {
+                    format!("{} (and {more} more)", one_line(first, NEEDS_YOU_DETAIL))
+                } else {
+                    first.into()
+                };
+                (AttentionKind::Question, detail)
+            }
+            // The plan's first line, usually its heading.
+            ApprovalKind::Plan(_) => {
+                let plan = text("plan");
+                let first = plan.lines().map(|l| l.trim_start_matches('#').trim()).find(|l| !l.is_empty());
+                (AttentionKind::Plan, first.unwrap_or_default().to_string())
+            }
+            ApprovalKind::Elicitation(card) => (AttentionKind::Input, card.summary()),
+            ApprovalKind::Tool => {
+                let summary = request.description.clone().filter(|d| !d.trim().is_empty()).unwrap_or_else(|| {
+                    tool_card::header_summary(&request.tool_name, &request.input, "", &self.project_dir())
+                });
+                let title = tool_card::title(&request.tool_name);
+                let detail = if summary.trim().is_empty() { title } else { format!("{title}: {summary}") };
+                (AttentionKind::Approval, detail)
+            }
+        };
+        ThreadNeedsYou { kind, detail: one_line(&detail, NEEDS_YOU_DETAIL) }
+    }
+
+    /// The text of Claude's last reply in this turn (none if it only used tools).
+    fn last_reply(&self) -> Option<String> {
+        self.plain
+            .iter()
+            .rev()
+            .take_while(|line| !line.starts_with("User: "))
+            .find_map(|line| line.strip_prefix("Claude: ").filter(|text| !text.trim().is_empty()))
+            .map(str::to_owned)
     }
 
     fn has_pending_approval(&self) -> bool {
@@ -2187,9 +2292,11 @@ impl ThreadView {
     // ---------- rendering ----------
 
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.ensure_elicitation_inputs(ix, window, cx);
         if let Some(Row::Approval(row)) = self.rows.get_mut(ix)
             && row.outcome.is_none()
             && row.feedback.is_none()
+            && !matches!(row.kind, ApprovalKind::Elicitation(_))
         {
             let hint = match row.kind {
                 ApprovalKind::Plan(_) => "Optional: what should change in the plan?",
@@ -2366,6 +2473,9 @@ impl ThreadView {
                             }),
                     )
                     .into_any_element()
+            }
+            Row::Approval(ApprovalRow { kind: ApprovalKind::Elicitation(card), outcome, .. }) => {
+                pad(div()).child(self.render_elicitation(ix, card, outcome.as_ref(), cx)).into_any_element()
             }
             Row::Approval(ApprovalRow { kind: ApprovalKind::Plan(plan), outcome, feedback, .. }) => {
                 let pending = outcome.is_none();
@@ -2985,6 +3095,93 @@ mod tests {
         })
     }
 
+    #[gpui_kit::test]
+    fn questions_approvals_plans_and_finished_turns_ask_for_the_user(cx: &mut TestAppContext) {
+        use crate::attention::AttentionKind::{self, *};
+        for (fixture_name, first) in
+            [("2.1.331-question.jsonl", Question), ("2.1.331-approve.jsonl", Approval), ("2.1.331-plan.jsonl", Plan)]
+        {
+            let (window, thread) = open(cx);
+            let cx = &mut VisualTestContext::from_window(window, cx);
+            let heard: std::rc::Rc<std::cell::RefCell<Vec<(AttentionKind, String)>>> = Default::default();
+            let sink = heard.clone();
+            let _subscription = cx.update(|_, cx| {
+                cx.subscribe(&thread, move |_, event: &super::ThreadNeedsYou, _| {
+                    sink.borrow_mut().push((event.kind, event.detail.clone()))
+                })
+            });
+            thread.update(cx, |t, cx| {
+                for event in fixture(fixture_name) {
+                    t.handle(event, cx);
+                }
+            });
+            let heard = heard.borrow();
+            assert_eq!(heard.first().map(|(kind, _)| *kind), Some(first), "{fixture_name}: {heard:?}");
+            assert!(heard.iter().all(|(_, detail)| !detail.is_empty() && !detail.contains('\n')), "{heard:?}");
+            assert_eq!(heard.last().map(|(kind, _)| *kind), Some(Finished), "{fixture_name}: {heard:?}");
+        }
+
+        // A reopened thread replays its transcript without asking again.
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let heard = std::rc::Rc::new(std::cell::Cell::new(0));
+        let sink = heard.clone();
+        let _subscription =
+            cx.update(|_, cx| cx.subscribe(&thread, move |_, _: &super::ThreadNeedsYou, _| sink.set(sink.get() + 1)));
+        thread.update(cx, |t, cx| {
+            t.replaying = true;
+            for event in fixture("2.1.331-question.jsonl") {
+                t.handle(event, cx);
+            }
+            t.replaying = false;
+        });
+        assert_eq!(heard.get(), 0);
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_turn_or_a_dead_process_stops_for_the_user_but_a_turn_they_stopped_doesnt(cx: &mut TestAppContext) {
+        use crate::attention::AttentionKind::{self, *};
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let heard: std::rc::Rc<std::cell::RefCell<Vec<(AttentionKind, String)>>> = Default::default();
+        let sink = heard.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&thread, move |_, event: &super::ThreadNeedsYou, _| {
+                sink.borrow_mut().push((event.kind, event.detail.clone()))
+            })
+        });
+        let failed = |error: &str| AgentEvent::TurnFinished {
+            cost_usd: None,
+            process_total_usd: None,
+            duration_ms: None,
+            is_error: true,
+            error: Some(error.into()),
+        };
+        let take = || std::mem::take(&mut *heard.borrow_mut());
+
+        thread.update(cx, |t, cx| {
+            t.handle(AgentEvent::TextStarted, cx);
+            t.handle(failed("Usage limit reached"), cx);
+        });
+        assert_eq!(take(), [(Stopped, "The turn failed: Usage limit reached".to_string())]);
+
+        // Stopped by the user: nothing to tell them.
+        thread.update(cx, |t, cx| {
+            t.handle(AgentEvent::TextStarted, cx);
+            t.interrupt(cx);
+            t.handle(failed("Interrupted"), cx);
+        });
+        assert_eq!(take(), []);
+
+        // The process died in the middle of a turn.
+        thread.update(cx, |t, cx| {
+            t.handle(AgentEvent::TextStarted, cx);
+            t.handle(AgentEvent::Exited { code: Some(1), stderr: "boom\n".into() }, cx);
+        });
+        let heard = take();
+        assert!(heard.len() == 1 && heard[0].0 == Stopped && heard[0].1.contains("boom"), "{heard:?}");
+    }
+
     fn calls(thread: &Entity<ThreadView>, cx: &mut VisualTestContext) -> Vec<ScriptedCall> {
         thread.read_with(cx, |t, _| t.scripted_log.as_ref().unwrap().lock().unwrap().clone())
     }
@@ -3026,6 +3223,64 @@ mod tests {
             .collect();
         assert_eq!(answered, vec![Decision::Approve]);
         assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)).as_deref(), Some("Approved"));
+        assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Running);
+    }
+
+    #[gpui_kit::test]
+    fn an_mcp_servers_form_waits_for_the_user_and_sends_what_they_filled_in(cx: &mut TestAppContext) {
+        use crate::attention::AttentionKind;
+        let (window, thread) = open(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let heard: std::rc::Rc<std::cell::RefCell<Vec<(AttentionKind, String)>>> = Default::default();
+        let sink = heard.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&thread, move |_, event: &super::ThreadNeedsYou, _| {
+                sink.borrow_mut().push((event.kind, event.detail.clone()))
+            })
+        });
+        let request = crate::agent::PermissionRequest {
+            id: "e1".into(),
+            tool_name: crate::agent::ELICITATION_TOOL.into(),
+            tool_use_id: None,
+            description: Some("Confirm the hours".into()),
+            input: serde_json::json!({
+                "mcp_server_name": "fieldhook", "message": "Confirm the hours", "mode": "form",
+                "requested_schema": { "properties": { "hours": { "type": "integer" } }, "required": ["hours"] }
+            }),
+            suggestions: Vec::new(),
+            reason: None,
+            no_standing_grant: true,
+        };
+        let ix = until_approval(&thread, vec![AgentEvent::PermissionRequested(request)], cx);
+        assert_eq!(thread.read_with(cx, |t, _| t.status), Status::AwaitingApproval);
+        assert_eq!(*heard.borrow(), [(AttentionKind::Input, "fieldhook: Confirm the hours".to_string())]);
+
+        let submit = gpui_kit::SharedString::from(format!("elicit-submit-{ix}"));
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(submit.clone(), cx);
+        });
+        let responded = |cx: &mut VisualTestContext| {
+            calls(&thread, cx)
+                .into_iter()
+                .filter_map(|c| match c {
+                    ScriptedCall::Respond { decision, .. } => Some(decision),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(responded(cx).is_empty(), "nothing is sent while a needed field is empty");
+        assert_eq!(thread.read_with(cx, |t, _| t.elicitation_error(ix)).as_deref(), Some("hours is needed."));
+
+        cx.update(|window, cx| {
+            let hours = thread.read(cx).elicitation_input(ix, 0).expect("the field is made when drawn");
+            hours.update(cx, |h, cx| h.set_value("8", window, cx));
+            window.render_frame(cx);
+            window.click(submit, cx);
+        });
+        let content = Some(serde_json::json!({ "hours": 8 }));
+        assert_eq!(responded(cx), [Decision::Elicit { action: crate::agent::ElicitAction::Accept, content }]);
+        assert_eq!(thread.read_with(cx, |t, _| t.approval_outcome(ix)).as_deref(), Some("Submitted"));
         assert_eq!(thread.read_with(cx, |t, _| t.status), Status::Running);
     }
 

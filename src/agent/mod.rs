@@ -124,6 +124,11 @@ pub struct ToolImage {
     pub file: Option<String>,
 }
 
+/// The `tool_name` of a [`PermissionRequest`] that is an MCP server asking the user for input
+/// (an elicitation): a form to fill in, or a link to open. Its `input` is the request as the
+/// agent sent it. No real tool has this name.
+pub const ELICITATION_TOOL: &str = "tj:elicitation";
+
 /// The agent wants to use a tool and is waiting for the user.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
@@ -162,6 +167,32 @@ pub enum Decision {
     StartPlan {
         accept_edits: bool,
     },
+    /// Answer an MCP server's request for input: accept (with the form's values, if it had a
+    /// form), decline, or cancel (dismiss it without choosing).
+    Elicit {
+        action: ElicitAction,
+        content: Option<Value>,
+    },
+}
+
+/// How the user answered an MCP server's request for input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElicitAction {
+    Accept,
+    Decline,
+    Cancel,
+}
+
+impl ElicitAction {
+    /// The name in the MCP protocol.
+    pub fn name(self) -> &'static str {
+        match self {
+            ElicitAction::Accept => "accept",
+            ElicitAction::Decline => "decline",
+            ElicitAction::Cancel => "cancel",
+        }
+    }
 }
 
 /// A usage limit on the account: a subscription's 5-hour or weekly window, or a spending limit.
