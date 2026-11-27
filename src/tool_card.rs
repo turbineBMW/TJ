@@ -107,9 +107,45 @@ pub fn title(name: &str) -> String {
     format!("{server} · {}", tool.replace('_', " "))
 }
 
-/// Cards whose body is worth watching start open: commands and edits.
+/// Cards whose body is worth watching start open: commands, edits, and a code review's
+/// findings, which `/code-review` reports only through its tool and never prints as text.
 pub fn opens_by_default(name: &str) -> bool {
-    matches!(name, "Bash" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit")
+    matches!(name, "Bash" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit" | "ReportFindings")
+}
+
+/// A code review's findings (ReportFindings), or none when the input has no list.
+fn findings(input: &Value) -> &[Value] {
+    input.get("findings").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default()
+}
+
+/// How many findings a review reported, e.g. "3 findings · high".
+pub fn findings_count(input: &Value) -> String {
+    let count = match findings(input).len() {
+        0 => "No findings".to_string(),
+        1 => "1 finding".to_string(),
+        n => format!("{n} findings"),
+    };
+    match input.get("level").and_then(Value::as_str) {
+        Some(level) => format!("{count} · {level}"),
+        None => count,
+    }
+}
+
+/// A review's findings as plain lines, `file:line summary`, for the thread's text record.
+pub fn findings_text(input: &Value) -> String {
+    let lines: Vec<String> = findings(input)
+        .iter()
+        .map(|f| {
+            let get = |k: &str| f.get(k).and_then(Value::as_str).filter(|s| !s.trim().is_empty());
+            let summary = get("summary").or(get("short_summary")).unwrap_or_default();
+            match (get("file"), f.get("line").and_then(Value::as_i64)) {
+                (Some(file), Some(line)) => format!("{file}:{line} {summary}"),
+                (Some(file), None) => format!("{file} {summary}"),
+                _ => summary.to_string(),
+            }
+        })
+        .collect();
+    if lines.is_empty() { findings_count(input) } else { format!("{}: {}", findings_count(input), lines.join("; ")) }
 }
 
 /// The header's one line: Bash's own description of its command, a path relative to the
@@ -134,6 +170,7 @@ pub fn header_summary(name: &str, input: &Value, summary: &str, project: &Path) 
         }
         "Write" | "Edit" | "MultiEdit" => field("file_path").map(relative).unwrap_or_else(|| summary.to_string()),
         "NotebookEdit" => field("notebook_path").map(relative).unwrap_or_else(|| summary.to_string()),
+        "ReportFindings" => findings_count(input),
         "Grep" | "Glob" => match field("path") {
             Some(path) => format!("{summary} in {}", relative(path)),
             None => summary.to_string(),
@@ -507,7 +544,7 @@ where
     } else if let Some(shell) = card.shell {
         Some(shell_card_body(&card, shell, &look, expand))
     } else {
-        tool_body(&card, &look, mono.clone())
+        tool_body(&card, &look, mono.clone(), theme.font_family.clone())
     };
     // The border's corners are round, so the parts that touch them are too.
     let header_ends = card.now.is_none() && body.is_none();
@@ -613,7 +650,7 @@ fn shell_card_body(
 }
 
 /// The body shaped for the tool, or `None` when there's nothing to show yet.
-fn tool_body(card: &Card, look: &Look, mono: SharedString) -> Option<AnyElement> {
+fn tool_body(card: &Card, look: &Look, mono: SharedString, sans: SharedString) -> Option<AnyElement> {
     let input = card.input;
     let str_field = |key: &str| input.get(key).and_then(Value::as_str);
     let failed = card.status == ToolStatus::Failed;
@@ -672,6 +709,16 @@ fn tool_body(card: &Card, look: &Look, mono: SharedString) -> Option<AnyElement>
             ]
         }
         "Read" => output.map(|o| output_block(o, if failed { look.error } else { look.dim })).into_iter().collect(),
+        "ReportFindings" => {
+            let list = findings(input);
+            let mut parts: Vec<AnyElement> = if list.is_empty() {
+                vec![div().font_family(sans).text_sm().text_color(look.dim).child("No findings.").into_any_element()]
+            } else {
+                list.iter().map(|f| finding_block(f, look, &sans)).collect()
+            };
+            parts.extend(error_only(output));
+            parts
+        }
         _ => {
             // Anything else: its arguments, then what came back.
             let mut parts = Vec::new();
@@ -698,6 +745,57 @@ fn tool_body(card: &Card, look: &Look, mono: SharedString) -> Option<AnyElement>
             }))
             .into_any_element(),
     )
+}
+
+/// One finding from a code review: its severity and place, what's wrong, and how it fails.
+fn finding_block(finding: &Value, look: &Look, sans: &SharedString) -> AnyElement {
+    let get = |k: &str| finding.get(k).and_then(Value::as_str).filter(|s| !s.trim().is_empty());
+    let place = match (get("file"), finding.get("line").and_then(Value::as_i64)) {
+        (Some(file), Some(line)) => Some(format!("{file}:{line}")),
+        (Some(file), None) => Some(file.to_string()),
+        _ => None,
+    };
+    let (severity, severity_color) = match get("severity") {
+        Some("important") => (Some("Important"), look.error),
+        Some("pre_existing") => (Some("Pre-existing"), look.palette.ansi[3]),
+        Some("nit") => (Some("Nit"), look.dim),
+        Some(other) => (Some(other), look.dim),
+        None => (None, look.dim),
+    };
+    // Tags after the place: the category, a verify pass's verdict, and what a fix did.
+    let tags: Vec<String> = [get("category"), get("verdict").map(str::to_lowercase).as_deref(), get("outcome")]
+        .into_iter()
+        .flatten()
+        .map(|t| t.replace('_', " "))
+        .collect();
+    let summary = get("summary").or(get("short_summary")).unwrap_or_default().to_string();
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .when_some(severity, |el, severity| {
+                    el.child(
+                        div()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(severity_color.opacity(0.5))
+                            .text_color(severity_color)
+                            .child(severity.to_string()),
+                    )
+                })
+                .when_some(place, |el, place| el.child(div().text_color(look.accent).child(place)))
+                .when(!tags.is_empty(), |el| el.child(div().text_color(look.dim).child(tags.join(" · ")))),
+        )
+        .child(div().font_family(sans.clone()).text_sm().text_color(look.text).child(summary))
+        .when_some(get("failure_scenario"), |el, scenario| {
+            el.child(
+                div().font_family(sans.clone()).text_sm().text_color(look.dim).child(format!("Fails when: {scenario}")),
+            )
+        })
+        .into_any_element()
 }
 
 /// A command after a `$`, then what it printed, both coloured. `command_cut` marks a command
@@ -918,8 +1016,8 @@ pub fn first_line(text: &str) -> String {
 mod tests {
     // Named imports: `super::*` would bring in gpui's `test` attribute in place of the standard one.
     use super::{
-        Diff, Duration, Family, Path, SHELL_CHARS, SHELL_LINES, ShellText, clean, header_summary, kind, line_diff,
-        opens_by_default, quote, title, took_label,
+        Diff, Duration, Family, Path, SHELL_CHARS, SHELL_LINES, ShellText, clean, findings_text, header_summary, kind,
+        line_diff, opens_by_default, quote, title, took_label,
     };
     use serde_json::json;
 
@@ -1025,5 +1123,25 @@ mod tests {
         assert!(opens_by_default("Edit"));
         assert!(!opens_by_default("Read"));
         assert!(!opens_by_default("Grep"));
+    }
+
+    #[test]
+    fn a_code_review_shows_its_findings_open_and_counted() {
+        assert!(opens_by_default("ReportFindings"));
+        let project = Path::new("/p");
+        let review = json!({
+            "level": "high",
+            "findings": [
+                { "file": "src/a.rs", "line": 12, "summary": "Off by one", "failure_scenario": "n = 0" },
+                { "file": "src/b.rs", "summary": "Leaks a handle", "failure_scenario": "on error" },
+            ],
+        });
+        assert_eq!(header_summary("ReportFindings", &review, "", project), "2 findings · high");
+        assert_eq!(findings_text(&review), "2 findings · high: src/a.rs:12 Off by one; src/b.rs Leaks a handle");
+        let empty = json!({ "findings": [] });
+        assert_eq!(header_summary("ReportFindings", &empty, "", project), "No findings");
+        assert_eq!(findings_text(&empty), "No findings");
+        let bare = json!({ "findings": [{ "file": "", "short_summary": "Leaks fd" }] });
+        assert_eq!(findings_text(&bare), "1 finding: Leaks fd");
     }
 }

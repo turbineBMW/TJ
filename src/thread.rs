@@ -2219,7 +2219,9 @@ impl ThreadView {
                 self.current_text = None;
                 if !text.trim().is_empty() {
                     self.push_text_row(false, &text, cx);
-                    self.plain.push(format!("(/{command} printed: {})", truncate(text.trim(), 600)));
+                    let what = if command.is_empty() { "A slash command".to_string() } else { format!("/{command}") };
+                    // A review's findings are the next agent's work, so they're kept whole.
+                    self.plain.push(format!("({what} printed: {})", truncate(text.trim(), 4000)));
                     self.plain_current = None;
                 }
             }
@@ -2297,6 +2299,7 @@ impl ThreadView {
                             .collect();
                         format!("(Claude updated its task list: {})", items.join("; "))
                     }
+                    ("ReportFindings", _) => format!("(Claude reported code review findings: {summary})"),
                     _ => format!("(Claude used {name}: {})", truncate(&summary, 300)),
                 };
                 self.plain.push(line);
@@ -3312,6 +3315,7 @@ pub fn tool_summary(name: &str, input: &Value) -> String {
         "WebSearch" => field("query"),
         "Task" | "Agent" => field("description"),
         "TodoWrite" => input.get("todos").and_then(Value::as_array).map(|t| format!("{} tasks", t.len())),
+        "ReportFindings" => Some(crate::tool_card::findings_text(input)),
         _ => None,
     };
     found.unwrap_or_else(|| truncate(&input.to_string(), 160))
