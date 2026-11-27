@@ -5,6 +5,7 @@
 //! ([`claude`]); [`ScriptedAgent`] replays canned events for demos and tests.
 
 pub mod claude;
+pub mod pricing;
 
 use std::{
     sync::{Arc, Mutex},
@@ -289,8 +290,17 @@ pub enum AgentEvent {
         status: String,
         summary: Option<String>,
     },
+    /// What a model response just added to the turn's cost, priced from its tokens while the
+    /// turn runs. The turn's own cost in [`AgentEvent::TurnFinished`] replaces these.
+    CostEstimate(f64),
     TurnFinished {
+        /// What this turn cost, in dollars.
+        #[serde(rename = "turn_cost_usd", default)]
         cost_usd: Option<f64>,
+        /// Transcripts saved before the turn's own cost was kept hold Claude Code's running total
+        /// for its process here instead; replay works the turn's cost out from it.
+        #[serde(rename = "cost_usd", default, skip_serializing)]
+        process_total_usd: Option<f64>,
         duration_ms: Option<u64>,
         is_error: bool,
         error: Option<String>,
