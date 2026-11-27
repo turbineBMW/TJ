@@ -59,6 +59,33 @@ pub struct SessionOptions {
     pub resume: Option<String>,
     /// Also ask for an 80/20 summary at the end of finished work (`summary::INSTRUCTIONS`).
     pub eighty_twenty: bool,
+    /// Give the session TJ's notes server (`tj notes-mcp`), run by this binary, and tell
+    /// Claude what the notes are for (`notes::INSTRUCTIONS`).
+    pub notes: Option<Box<NotesServer>>,
+}
+
+/// The notes server a session is given.
+#[derive(Clone, Debug)]
+pub struct NotesServer {
+    /// The `tj` binary that runs it.
+    pub binary: PathBuf,
+    pub context: crate::notes_mcp::Context,
+}
+
+impl NotesServer {
+    /// The `--mcp-config` JSON naming the server `tj`, so its tools are `mcp__tj__…`.
+    pub fn mcp_config(&self) -> String {
+        serde_json::json!({
+            "mcpServers": {
+                "tj": {
+                    "type": "stdio",
+                    "command": self.binary.display().to_string(),
+                    "args": self.context.to_args(),
+                }
+            }
+        })
+        .to_string()
+    }
 }
 
 impl SessionOptions {
@@ -76,11 +103,18 @@ impl SessionOptions {
         ]
         .map(String::from)
         .to_vec();
-        let instructions = match self.eighty_twenty {
-            true => format!("{TJ_INSTRUCTIONS}\n\n{}", crate::summary::INSTRUCTIONS),
-            false => TJ_INSTRUCTIONS.to_string(),
-        };
+        let mut instructions = TJ_INSTRUCTIONS.to_string();
+        if self.notes.is_some() {
+            instructions = format!("{instructions}\n\n{}", crate::notes::INSTRUCTIONS);
+        }
+        if self.eighty_twenty {
+            instructions = format!("{instructions}\n\n{}", crate::summary::INSTRUCTIONS);
+        }
         args.extend(["--append-system-prompt".into(), instructions]);
+        if let Some(notes) = &self.notes {
+            // Its tools only touch TJ's own notes file, so they don't ask for approval.
+            args.extend(["--mcp-config".into(), notes.mcp_config(), "--allowedTools".into(), "mcp__tj".into()]);
+        }
         args.extend(["--permission-mode".into(), self.permission_mode.claude_name().into()]);
         if let Some(model) = &self.model {
             args.extend(["--model".into(), model.clone()]);
@@ -1405,6 +1439,28 @@ mod tests {
         let at = args.iter().position(|a| a == "--append-system-prompt").expect("flag");
         assert!(args[at + 1].starts_with(TJ_INSTRUCTIONS), "the 80/20 rule comes after TJ's own");
         assert!(args[at + 1].ends_with(crate::summary::INSTRUCTIONS));
+    }
+
+    #[test]
+    fn sessions_get_the_notes_server_and_its_instructions() {
+        let context = crate::notes_mcp::Context {
+            file: "/data/notes/p1.json".into(),
+            project_dir: "/home/me/proj".into(),
+            project_name: "proj".into(),
+            thread: Some("t1".into()),
+            transcript: None,
+        };
+        let notes = NotesServer { binary: "/usr/bin/tj".into(), context };
+        let args = SessionOptions { notes: Some(Box::new(notes)), eighty_twenty: true, ..Default::default() }.args();
+        let at = args.iter().position(|a| a == "--append-system-prompt").expect("flag");
+        assert!(args[at + 1].contains(crate::notes::INSTRUCTIONS));
+        assert!(args[at + 1].ends_with(crate::summary::INSTRUCTIONS), "the 80/20 rule stays last");
+        let at = args.iter().position(|a| a == "--mcp-config").expect("flag");
+        let config: Value = serde_json::from_str(&args[at + 1]).unwrap();
+        assert_eq!(config["mcpServers"]["tj"]["command"], "/usr/bin/tj");
+        assert_eq!(config["mcpServers"]["tj"]["args"][0], "notes-mcp");
+        assert!(args.windows(2).any(|w| w == ["--allowedTools", "mcp__tj"]));
+        assert!(!SessionOptions::default().args().contains(&"--mcp-config".to_string()));
     }
 
     /// `cargo test -- --ignored live_` (no tokens: the session is stopped after its handshake)

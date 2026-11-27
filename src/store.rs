@@ -353,6 +353,8 @@ pub enum TabState {
     /// The project's pull requests and branches on GitHub.
     #[serde(rename = "github")]
     GitHub,
+    /// The project's notes.
+    Notes,
 }
 
 /// A saved main area: the tabs along the top bar, and which one is on show.

@@ -19,6 +19,8 @@ use crate::agent_slot::{AgentSlot, AgentSlotEvent};
 use crate::attention::{self, Attention, AttentionKind, Reminder};
 use crate::changes::{ProjectChanges, ReviewView, Summarizer};
 use crate::github_view::{GitHubEvent, GitHubView};
+use crate::notes::NotesStore;
+use crate::notes_view::{NotesEvent, NotesView};
 use crate::panes::{FLOAT_HEIGHT, FLOAT_INSET, PaneEvent, Panes, Start};
 use crate::settings::Settings;
 use crate::store::SplitDirection;
@@ -44,7 +46,17 @@ pub const CONTEXT: &str = "Workspace";
 // Window-wide commands. Their keys are in `keybindings::COMMANDS`, and settings can change them.
 gpui_kit::actions!(
     workspace,
-    [ToggleSidebar, NextProject, PreviousProject, NewThread, OpenSwitcher, OpenSettings, OpenGitHub, FocusAgent]
+    [
+        ToggleSidebar,
+        NextProject,
+        PreviousProject,
+        NewThread,
+        OpenSwitcher,
+        OpenSettings,
+        OpenGitHub,
+        OpenNotes,
+        FocusAgent
+    ]
 );
 /// The agent mark at the end of a thread's row in the sidebar.
 const MARK_SIZE: f32 = 14.0;
@@ -77,6 +89,8 @@ pub struct Launch {
     pub review: bool,
     /// Open the project's GitHub tab at launch (test hook).
     pub github: bool,
+    /// Open the project's notes at launch (test hook).
+    pub notes: bool,
 }
 
 pub struct Workspace {
@@ -93,6 +107,10 @@ pub struct Workspace {
     reviews: HashMap<String, Entity<ReviewView>>,
     /// Per project: its GitHub page, shown in a tab.
     githubs: HashMap<String, Entity<GitHubView>>,
+    /// Every project's notes, kept in step with their files.
+    notes: Entity<NotesStore>,
+    /// Per project: its notes, shown in a tab.
+    notes_views: HashMap<String, Entity<NotesView>>,
     /// Per pull request ("<project id>#<number>"): its files with their summaries, for the
     /// review modal, kept so summaries survive closing it.
     pr_changes: HashMap<String, Entity<ProjectChanges>>,
@@ -149,6 +167,9 @@ impl Workspace {
         // The last usage and context windows heard, so the status column has numbers at once.
         crate::usage::Usage::load(cx, paths.usage_file());
 
+        let notes = cx.new(|cx| NotesStore::new(&paths.data_dir, cx));
+        // The sidebar's note counts follow the files.
+        let notes_observer = cx.observe(&notes, |_, _, cx| cx.notify());
         let mut this = Self {
             paths,
             home,
@@ -159,6 +180,8 @@ impl Workspace {
             agents: HashMap::new(),
             reviews: HashMap::new(),
             githubs: HashMap::new(),
+            notes,
+            notes_views: HashMap::new(),
             pr_changes: HashMap::new(),
             active: None,
             status_choice: None,
@@ -178,7 +201,7 @@ impl Workspace {
             no_summaries: launch.no_summaries,
             settings_view: None,
             window_active: window.is_window_active(),
-            _subscriptions: Vec::new(),
+            _subscriptions: vec![notes_observer],
             _idle_check: None,
             _reminder_check: None,
         };
@@ -194,6 +217,9 @@ impl Workspace {
         // Open the requested folder, or the current one when there are no projects yet.
         let folder = launch.project.or_else(|| this.state.projects.is_empty().then(thread::default_cwd));
         let opened_project = folder.map(|folder| this.state.add_project(&folder).id.clone());
+        if let Some(id) = &opened_project {
+            this.bring_back_notes(id, cx);
+        }
 
         // A prompt or a canned session gets a fresh thread; otherwise reopen where the user was.
         let wants_new = this.scripted.is_some() || launch.prompt.is_some();
@@ -220,6 +246,9 @@ impl Workspace {
         }
         if launch.github {
             this.open_github(window, cx);
+        }
+        if launch.notes {
+            this.open_notes(window, cx);
         }
         this.find_icons(cx);
         this.watch_attention(window, cx);
@@ -310,6 +339,18 @@ impl Workspace {
                     effort,
                     permission_mode: mode,
                     eighty_twenty: cx.try_global::<crate::settings::Settings>().is_none_or(|s| s.eighty_twenty),
+                    notes: std::env::current_exe().ok().map(|binary| {
+                        Box::new(crate::agent::claude::NotesServer {
+                            binary,
+                            context: crate::notes_mcp::Context {
+                                file: crate::notes::notes_file(&self.paths.data_dir, &project.id),
+                                project_dir: project.path.clone(),
+                                project_name: project.name.clone(),
+                                thread: Some(meta.id.clone()),
+                                transcript: Some(self.paths.transcript(&meta.id)),
+                            },
+                        })
+                    }),
                     ..Default::default()
                 }),
             };
@@ -770,6 +811,8 @@ impl Workspace {
         self.agents.remove(project_id);
         self.reviews.remove(project_id);
         self.githubs.remove(project_id);
+        // Its notes stay on disk, for the notes tab's cleanup page or adding the folder again.
+        self.notes_views.remove(project_id);
         self.pr_changes.retain(|key, _| !key.starts_with(&format!("{project_id}#")));
         self.changes.remove(project_id);
         self.show_archived.remove(project_id);
@@ -871,6 +914,7 @@ impl Workspace {
             let Some(path) = paths.into_iter().next() else { return };
             let _ = this.update_in(cx, |this: &mut Workspace, window, cx| {
                 let project = this.state.add_project(&path).id.clone();
+                this.bring_back_notes(&project, cx);
                 this.find_icons(cx);
                 this.new_thread(&project, window, cx);
             });
@@ -1387,6 +1431,85 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Show the project's notes tab.
+    fn open_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self.active_project().map(|p| p.id.clone()) else { return };
+        self.open_project_notes(&project_id, window, cx);
+    }
+
+    fn open_project_notes(&mut self, project_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panes) = self.project_panes(project_id, None, window, cx) {
+            panes.update(cx, |p, cx| p.show_notes(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// A project was added: bring back the notes left when a project in the same folder was
+    /// removed.
+    fn bring_back_notes(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let Some(project) = self.state.project(project_id) else { return };
+        let (name, path) = (project.name.clone(), project.path.clone());
+        let live: Vec<String> = self.state.projects.iter().map(|p| p.id.clone()).collect();
+        let live: Vec<&str> = live.iter().map(String::as_str).collect();
+        self.notes.update(cx, |n, cx| n.reattach(project_id, &name, &path, &live, cx));
+    }
+
+    /// Every project: its id, name and folder.
+    pub(crate) fn project_list(&self) -> Vec<(String, String, PathBuf)> {
+        self.state.projects.iter().map(|p| (p.id.clone(), p.name.clone(), p.path.clone())).collect()
+    }
+
+    /// A thread's title, if it still exists.
+    pub(crate) fn thread_title(&self, thread_id: &str) -> Option<String> {
+        self.state.thread(thread_id).map(|(_, meta)| meta.title.clone().unwrap_or_else(|| "New thread".into()))
+    }
+
+    /// The thread the project's agent tab shows.
+    pub(crate) fn shown_thread(&self, project_id: &str, cx: &App) -> Option<String> {
+        self.agents.get(project_id).and_then(|a| a.read(cx).thread_id().map(str::to_string))
+    }
+
+    /// Open a thread at the user's `prompt`th message (its end when unknown).
+    fn open_thread_at(&mut self, thread_id: &str, prompt: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.thread(thread_id).is_none() {
+            return;
+        }
+        self.open_thread(thread_id, window, cx);
+        if let (Some(prompt), Some(thread)) = (prompt, self.threads.get(thread_id).cloned()) {
+            thread.update(cx, |t, cx| t.reveal_prompt(prompt, cx));
+        }
+    }
+
+    /// Start a thread for a note: a new thread with the note in its prompt box, ready to send,
+    /// and the note marked in progress.
+    fn work_on_note(&mut self, project_id: &str, number: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.state.project(project_id) else { return };
+        let (name, path) = (project.name.clone(), project.path.clone());
+        let Some(note) = self.notes.read(cx).book(project_id).and_then(|b| b.get(number)).cloned() else { return };
+        let Some(thread_id) = self.state.new_thread(project_id) else { return };
+        self.open_thread(&thread_id, window, cx);
+        let prompt = crate::notes::work_prompt(&note);
+        if let Some(thread) = self.threads.get(&thread_id).cloned() {
+            thread.update(cx, |t, cx| t.set_prompt(&prompt, window, cx));
+        }
+        let id = thread_id.clone();
+        self.notes.update(cx, |n, cx| {
+            n.edit(
+                project_id,
+                &name,
+                &path,
+                |book| {
+                    if let Some(note) = book.get_mut(number) {
+                        note.status = crate::notes::NoteStatus::Doing;
+                        note.work_thread = Some(id);
+                        note.updated = store::now();
+                    }
+                },
+                cx,
+            )
+        });
+    }
+
     /// A project's panes, restored from its saved layout on first use. `start` is the thread
     /// to show in the agent tab.
     fn project_panes(
@@ -1442,6 +1565,19 @@ impl Workspace {
             }
         }));
         self.githubs.insert(project.id.clone(), github.clone());
+        let workspace = cx.entity().downgrade();
+        let store = self.notes.clone();
+        let notes = cx.new(|cx| {
+            NotesView::new(store, workspace, project.id.clone(), project.name.clone(), project.path.clone(), cx)
+        });
+        let notes_project = project.id.clone();
+        self._subscriptions.push(cx.subscribe_in(&notes, window, move |this, _, event: &NotesEvent, window, cx| {
+            match event {
+                NotesEvent::OpenThread { thread, prompt } => this.open_thread_at(thread, *prompt, window, cx),
+                NotesEvent::WorkOn(number) => this.work_on_note(&notes_project, *number, window, cx),
+            }
+        }));
+        self.notes_views.insert(project.id.clone(), notes.clone());
         let agent = cx.new(|cx| AgentSlot::new(project.path.clone(), changes.clone(), cx));
         self._subscriptions.push(cx.subscribe_in(
             &agent,
@@ -1461,6 +1597,7 @@ impl Workspace {
                 agent,
                 review,
                 github,
+                notes,
                 Start { thread: start, terminal: false },
                 shell,
                 window,
@@ -1673,13 +1810,16 @@ impl Workspace {
             let header_menu = {
                 let (workspace, id) = (workspace.clone(), project.id.clone());
                 move |menu: PopupMenu, _: &mut Window, _: &mut Context<_>| {
-                    let (w1, w2) = (workspace.clone(), workspace.clone());
-                    let (i1, i2) = (id.clone(), id.clone());
+                    let (w1, w2, w3) = (workspace.clone(), workspace.clone(), workspace.clone());
+                    let (i1, i2, i3) = (id.clone(), id.clone(), id.clone());
                     let menu = menu
                         .item(
                             PopupMenuItem::new("New thread")
                                 .on_click(move |_, window, cx| w1.update(cx, |w, cx| w.new_thread(&i1, window, cx))),
                         )
+                        .item(PopupMenuItem::new("Notes").on_click(move |_, window, cx| {
+                            w3.update(cx, |w, cx| w.open_project_notes(&i3, window, cx))
+                        }))
                         .separator();
                     image_choices.add_to(menu).separator().item(PopupMenuItem::new("Remove from TJ…").on_click(
                         move |_, window, cx| w2.update(cx, |w, cx| w.confirm_remove_project(&i2, window, cx)),
@@ -1688,6 +1828,8 @@ impl Workspace {
             };
             let toggle_id = project.id.clone();
             let history_id = project.id.clone();
+            let notes_id = project.id.clone();
+            let pending_notes = self.notes.read(cx).pending(&project.id);
             projects.push(
                 v_flex()
                     .pb_2()
@@ -1711,6 +1853,22 @@ impl Workspace {
                                     .text_color(muted)
                                     .child(project.name.to_uppercase()),
                             )
+                            .when(pending_notes > 0, |el| {
+                                el.child(
+                                    Button::new(SharedString::from(format!("project-notes-{}", project.id)))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::StickyNote)
+                                        .label(pending_notes.to_string())
+                                        .tooltip(format!(
+                                            "{pending_notes} note{} to do",
+                                            if pending_notes == 1 { "" } else { "s" }
+                                        ))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_project_notes(&notes_id, window, cx)
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new(SharedString::from(format!("new-thread-{}", project.id)))
                                     .ghost()
@@ -1965,6 +2123,15 @@ impl Workspace {
                 )
                 .child(
                     chip(
+                        "header-notes",
+                        IconName::StickyNote,
+                        crate::keybindings::tooltip("Project notes: what was put off for later", "open_notes", cx)
+                            .into(),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.open_notes(window, cx))),
+                )
+                .child(
+                    chip(
                         "header-split-right",
                         IconName::Columns2,
                         crate::keybindings::tooltip("Split right", "split_right", cx).into(),
@@ -2127,6 +2294,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread_here(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSwitcher, window, cx| this.open_switcher(window, cx)))
             .on_action(cx.listener(|this, _: &OpenGitHub, window, cx| this.open_github(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenNotes, window, cx| this.open_notes(window, cx)))
             .on_action(cx.listener(|this, _: &FocusAgent, window, cx| this.focus_agent(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .size_full()
@@ -2692,6 +2860,114 @@ mod tests {
         use crate::github::MergeMethod;
         github.update(cx, |_, cx| cx.emit(crate::github_view::GitHubEvent::MergeMethodChosen(MergeMethod::Merge)));
         assert_eq!(State::load(&paths).unwrap().projects[0].github_merge_method, Some(MergeMethod::Merge));
+    }
+
+    #[gpui_kit::test]
+    fn notes_open_from_their_shortcut_start_threads_and_outlive_their_project(cx: &mut TestAppContext) {
+        use crate::notes::{Author, NewNote, NoteStatus, Source};
+        use crate::notes_view::NotesEvent;
+        use std::path::Path;
+        let (window, workspace, paths, project) = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        let (project_id, first) =
+            workspace.read_with(cx, |w, _| (w.state.projects[0].id.clone(), w.active.clone().unwrap()));
+        let store = workspace.read_with(cx, |w, _| w.notes.clone());
+
+        // A note Claude wrote in the first thread, as the notes server would.
+        let file = crate::notes::notes_file(&paths.data_dir, &project_id);
+        let source = Source { thread: Some(first.clone()), prompt: Some(1), ..Default::default() };
+        crate::notes::update(&file, "demo-project", &project, |b| {
+            b.add(NewNote {
+                title: "Prune list".into(),
+                author: Author::Agent,
+                source: Some(source),
+                ..Default::default()
+            })
+        })
+        .unwrap();
+        store.update(cx, |s, cx| s.edit(&project_id, "", Path::new(""), |_| (), cx));
+        assert_eq!(store.read_with(cx, |s, _| s.pending(&project_id)), 1, "the sidebar counts it");
+
+        // Ctrl+Shift+N opens the notes tab, once.
+        cx.simulate_keystrokes("ctrl-shift-n");
+        let panes = workspace.read_with(cx, |w, _| w.panes.get(&project_id).cloned().unwrap());
+        assert!(panes.read_with(cx, |p, _| p.notes_are_showing()), "the notes open as a tab");
+        workspace.update_in(cx, |w, window, cx| w.open_notes(window, cx));
+        assert!(panes.read_with(cx, |p, cx| p.snapshot(cx)).is_some_and(|l| {
+            l.tabs
+                .iter()
+                .filter(|t| **t == crate::store::SplitLayout::Pane { view: crate::store::TabState::Notes })
+                .count()
+                == 1
+        }));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // A note written in the tab, from the keyboard.
+        let notes = workspace.read_with(cx, |w, _| w.notes_views.get(&project_id).cloned().unwrap());
+        cx.simulate_keystrokes("alt-n");
+        assert!(notes.read_with(cx, |n, _| n.is_editing()));
+        cx.simulate_input("Fix the flaky test");
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("ctrl-enter");
+        assert!(!notes.read_with(cx, |n, _| n.is_editing()));
+        let book = store.read_with(cx, |s, _| s.book(&project_id).cloned().unwrap());
+        let mine = book.get(2).expect("saved as #2");
+        assert_eq!((mine.title.as_str(), mine.author), ("Fix the flaky test", Author::User));
+        assert_eq!(notes.read_with(cx, |n, _| n.selected()), Some(2));
+
+        // Work on this: a new thread with the note in its prompt box, and the note in progress.
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("down");
+        assert_eq!(notes.read_with(cx, |n, _| n.selected()), Some(1));
+        cx.simulate_keystrokes("alt-w");
+        let worker = workspace.read_with(cx, |w, _| w.active.clone().unwrap());
+        assert_ne!(worker, first);
+        let thread = workspace.read_with(cx, |w, _| w.threads.get(&worker).cloned().unwrap());
+        assert!(
+            thread.read_with(cx, |t, cx| t.prompt_text(cx)).starts_with("Let's work on project note #1: Prune list")
+        );
+        let note = store.read_with(cx, |s, _| s.book(&project_id).unwrap().get(1).cloned().unwrap());
+        assert_eq!((note.status, note.work_thread.as_deref()), (NoteStatus::Doing, Some(worker.as_str())));
+
+        // Going to where it was written shows that thread.
+        notes.update(cx, |_, cx| cx.emit(NotesEvent::OpenThread { thread: first.clone(), prompt: Some(1) }));
+        assert_eq!(workspace.read_with(cx, |w, _| w.active.clone()), Some(first.clone()));
+
+        // Notes left by a removed project are on the cleanup page (Alt+C); Alt+M moves them here.
+        let gone = crate::notes::notes_file(&paths.data_dir, "gone-project");
+        crate::notes::update(&gone, "Old", Path::new("/nowhere/old"), |b| {
+            b.add(NewNote { title: "Port the parser".into(), ..Default::default() })
+        })
+        .unwrap();
+        store.update(cx, |s, cx| s.edit("gone-project", "", Path::new(""), |_| (), cx));
+        workspace.update_in(cx, |w, window, cx| w.open_notes(window, cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("alt-c");
+        assert!(notes.read_with(cx, |n, _| n.is_cleaning_up()));
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("alt-m");
+        assert!(!gone.exists());
+        let titles: Vec<String> =
+            store.read_with(cx, |s, _| s.book(&project_id).unwrap().notes.iter().map(|n| n.title.clone()).collect());
+        assert_eq!(titles.last().map(String::as_str), Some("Port the parser"), "numbered after this project's");
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(!notes.read_with(cx, |n, _| n.is_cleaning_up()), "an empty cleanup page closes itself");
+
+        // Removing the project keeps its notes; adding the folder again brings them back.
+        workspace.update_in(cx, |w, window, cx| w.remove_project(&project_id, window, cx));
+        assert!(file.is_file(), "the notes outlive the project");
+        let orphans = store.read_with(cx, |s, _| s.orphans(&[]).len());
+        assert_eq!(orphans, 1, "listed for cleanup");
+        let again = workspace.update(cx, |w, cx| {
+            let id = w.state.add_project(&project).id.clone();
+            w.bring_back_notes(&id, cx);
+            id
+        });
+        assert_ne!(again, project_id);
+        assert_eq!(store.read_with(cx, |s, _| s.book(&again).map(|b| b.notes.len())), Some(3));
+        assert!(!file.exists(), "moved, not copied");
+        cx.update(|window, cx| window.render_frame(cx));
     }
 
     #[gpui_kit::test]
