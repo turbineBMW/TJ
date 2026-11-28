@@ -10,6 +10,12 @@
 //! failed) and the one picked: its jobs and their steps, the failing part of a job's log, and
 //! Re-run or Cancel. Runs still going are read again while the page is open.
 //!
+//! Other repos lists the pull requests the project's sessions sent to other repositories and
+//! hosts ([`crate::prs_view`]). Its tab appears once something is tracked; until then the ⋮ menu at
+//! the end of the page tabs opens it to add one. A project folder with no GitHub remote of its own, such as a
+//! folder of forks, shows that page alone when it has repositories in its subfolders or tracked
+//! pull requests.
+//!
 //! All the work is `gh` and `git` in the background (see [`crate::github`]).
 
 use std::{
@@ -39,6 +45,7 @@ use crate::github::{
     self, Branch, ChecksState, DraftComment, Job, LineComment, LocalStatus, MergeMethod, PrDetail, PrFilter, PrState,
     PullRequest, Remote, RepoInfo, ReviewEvent, RunFilter, RunState, WorkflowRun,
 };
+use crate::prs_view::PrsView;
 
 pub const CONTEXT: &str = "GitHub";
 const LIST_WIDTH: f32 = 340.0;
@@ -120,6 +127,8 @@ enum Phase {
 enum Page {
     PullRequests,
     Actions,
+    /// Pull requests on other repositories.
+    Tracked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +159,12 @@ struct Flash {
 
 pub struct GitHubView {
     root: PathBuf,
+    /// The pull requests sent to other repositories: the Other repos page.
+    tracked: Entity<PrsView>,
+    /// With no GitHub remote: there are git repositories in the project's subfolders.
+    nested_repos: bool,
+    /// With no GitHub remote: the user asked for the Other repos page all the same.
+    tracked_wanted: bool,
     /// The account picked for the project in TJ; `None` lets TJ pick from the remote.
     chosen: Option<String>,
     phase: Phase,
@@ -224,6 +239,7 @@ pub struct GitHubView {
 impl GitHubView {
     pub fn new(
         root: PathBuf,
+        tracked: Entity<PrsView>,
         chosen: Option<String>,
         last_merge_method: Option<MergeMethod>,
         window: &mut Window,
@@ -246,9 +262,14 @@ impl GitHubView {
             InputEvent::Change => cx.notify(),
             _ => {}
         }));
+        // The page's count, and whether a folder with no remote shows it, follow its PRs.
+        subscriptions.push(cx.observe(&tracked, |_, _, cx| cx.notify()));
         let diff = cx.new(|cx| DiffState::new(Vec::new(), cx));
         Self {
             root,
+            tracked,
+            nested_repos: false,
+            tracked_wanted: false,
             chosen,
             phase: Phase::Idle,
             accounts: Vec::new(),
@@ -304,16 +325,87 @@ impl GitHubView {
         }
     }
 
-    /// The tab's title: the repository, with how many pull requests are open.
-    pub fn title(&self) -> String {
-        match (&self.remote, self.phase == Phase::Ready && self.filter == PrFilter::Open) {
-            (Some(_), true) if !self.prs.is_empty() => format!("GitHub · {}", self.prs.len()),
-            _ => "GitHub".into(),
-        }
+    /// The tab's title, with how many pull requests are open: the repository's, or with no
+    /// remote, the ones on other repositories.
+    pub fn title(&self, cx: &App) -> String {
+        let open = if self.tracked_only(cx) {
+            self.tracked.read(cx).active(cx)
+        } else if self.remote.is_some() && self.phase == Phase::Ready && self.filter == PrFilter::Open {
+            self.prs.len()
+        } else {
+            0
+        };
+        if open == 0 { "GitHub".into() } else { format!("GitHub · {open}") }
+    }
+
+    /// The project's own repository (`owner/repo`), once found.
+    pub fn repo(&self) -> Option<String> {
+        self.remote.as_ref().map(Remote::slug)
+    }
+
+    /// No GitHub remote, but pull requests on other repositories to show (or repositories in
+    /// subfolders to send them from): the tab is the Other repos page alone.
+    fn tracked_only(&self, cx: &App) -> bool {
+        self.phase == Phase::NotGitHub
+            && (self.nested_repos || self.tracked_wanted || self.tracked.read(cx).count(cx) > 0)
+    }
+
+    /// Whether the header has an Other repos tab: once something is tracked, or while it's open.
+    /// Until then it's under the header's ⋮ menu.
+    fn tracked_tab_shown(&self, cx: &App) -> bool {
+        self.page == Page::Tracked || self.tracked.read(cx).count(cx) > 0
+    }
+
+    /// Open the Other repos page with its link field ready, from the header's ⋮ menu.
+    fn add_other_repo_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_page(Page::Tracked, cx);
+        self.tracked.update(cx, |t, cx| {
+            t.shown(window, cx);
+            t.start_adding(window, cx);
+        });
+    }
+
+    /// Whether the Other repos page is what's showing.
+    fn showing_tracked(&self, cx: &App) -> bool {
+        self.tracked_only(cx) || (self.phase == Phase::Ready && self.page == Page::Tracked)
+    }
+
+    #[cfg(test)]
+    pub fn is_showing_tracked(&self, cx: &App) -> bool {
+        self.showing_tracked(cx)
+    }
+
+    /// As if `gh` had found the project's repository, for tests that can't reach GitHub.
+    #[cfg(test)]
+    pub fn pretend_ready(&mut self, cx: &mut Context<Self>) {
+        let remote = Remote { name: "origin".into(), host: "github.com".into(), owner: "o".into(), repo: "r".into() };
+        self.phase = Phase::Ready;
+        self.remote = Some(remote);
+        self.account = Some(("me".into(), String::new()));
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn has_tracked_tab(&self, cx: &App) -> bool {
+        self.tracked_tab_shown(cx)
+    }
+
+    #[cfg(test)]
+    pub fn add_other_repo_pr_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_other_repo_pr(window, cx)
+    }
+
+    #[cfg(test)]
+    pub fn show_pull_requests_for_test(&mut self, cx: &mut Context<Self>) {
+        self.show_page(Page::PullRequests, cx)
     }
 
     /// The tab came to the front: focus it and bring stale data up to date.
     pub fn shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.showing_tracked(cx) {
+            self.tracked.update(cx, |t, cx| t.shown(window, cx));
+            return;
+        }
         window.focus(&self.focus, cx);
         let loaded_at = if self.page == Page::Actions { self.runs_loaded_at } else { self.loaded_at };
         if self.phase == Phase::Ready && loaded_at.is_none_or(|at| at.elapsed() > STALE) {
@@ -333,15 +425,18 @@ impl GitHubView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    if !github::gh_installed() {
-                        return Ok((Phase::NoGh, Vec::new(), None, None, RepoInfo::default()));
-                    }
+                    // No remote is known without gh, and it decides whether the Other repos
+                    // page stands in for the tab.
                     let Some(remote) = github::remote(&root)? else {
-                        return Ok((Phase::NotGitHub, Vec::new(), None, None, RepoInfo::default()));
+                        let nested = crate::tracked::has_nested_repos(&root);
+                        return Ok((Phase::NotGitHub, Vec::new(), None, None, RepoInfo::default(), nested));
                     };
+                    if !github::gh_installed() {
+                        return Ok((Phase::NoGh, Vec::new(), None, None, RepoInfo::default(), false));
+                    }
                     let accounts = github::accounts()?;
                     if accounts.is_empty() {
-                        return Ok((Phase::NoAccounts, accounts, Some(remote), None, RepoInfo::default()));
+                        return Ok((Phase::NoAccounts, accounts, Some(remote), None, RepoInfo::default(), false));
                     }
                     let (login, token, info) = match chosen.filter(|c| accounts.contains(c)) {
                         Some(login) => {
@@ -351,7 +446,7 @@ impl GitHubView {
                         }
                         None => github::pick_account(&accounts, &remote)?,
                     };
-                    anyhow::Ok((Phase::Ready, accounts, Some(remote), Some((login, token)), info))
+                    anyhow::Ok((Phase::Ready, accounts, Some(remote), Some((login, token)), info, false))
                 })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
@@ -359,8 +454,12 @@ impl GitHubView {
                     return;
                 }
                 match result {
-                    Ok((phase, accounts, remote, account, info)) => {
+                    Ok((phase, accounts, remote, account, info, nested)) => {
                         this.phase = phase;
+                        this.nested_repos = nested;
+                        // The repository's own pull requests are on the Pull requests page.
+                        let own = remote.as_ref().map(Remote::slug);
+                        this.tracked.update(cx, |t, cx| t.set_own_repo(own, cx));
                         this.accounts = accounts;
                         this.remote = remote;
                         this.account = account;
@@ -757,6 +856,7 @@ impl GitHubView {
             match page {
                 Page::Actions => self.load_runs(cx),
                 Page::PullRequests => self.load_prs(cx),
+                Page::Tracked => {}
             }
         }
         cx.notify();
@@ -774,6 +874,7 @@ impl GitHubView {
         match self.page {
             Page::PullRequests => self.selected.is_some(),
             Page::Actions => self.run_selected.is_some(),
+            Page::Tracked => false,
         }
     }
 
@@ -796,6 +897,9 @@ impl GitHubView {
     }
 
     fn select_step(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.page == Page::Tracked {
+            return;
+        }
         if self.page == Page::Actions {
             let Some(next) = step_in(self.runs.iter().map(|r| r.id), self.run_selected, step) else { return };
             self.select_run(next, cx);
@@ -1277,6 +1381,7 @@ impl GitHubView {
         icon: IconName,
         title: &str,
         body: &str,
+        extra: Option<Button>,
         c: &Colors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1298,12 +1403,17 @@ impl GitHubView {
             .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(title.to_string()))
             .child(div().max_w(px(460.)).text_sm().text_color(c.muted).text_center().child(body.to_string()))
             .child(
-                Button::new("github-retry")
-                    .small()
-                    .outline()
-                    .icon(IconName::RefreshCw)
-                    .label("Try again")
-                    .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("github-retry")
+                            .small()
+                            .outline()
+                            .icon(IconName::RefreshCw)
+                            .label("Try again")
+                            .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
+                    )
+                    .children(extra),
             )
             .into_any_element()
     }
@@ -1430,6 +1540,7 @@ impl GitHubView {
             let on = page == p;
             h_flex()
                 .id(id)
+                .debug_selector(move || id.into())
                 .test_support()
                 .gap_1p5()
                 .px_3()
@@ -1449,16 +1560,50 @@ impl GitHubView {
                 .when_some(count.filter(|n| *n > 0), |el, n| {
                     el.child(div().px_1p5().rounded_full().bg(c.fg.opacity(0.08)).text_xs().child(n.to_string()))
                 })
-                .on_click(cx.listener(move |this, _, _, cx| this.show_page(p, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.show_page(p, cx);
+                    if p == Page::Tracked {
+                        this.tracked.update(cx, |t, cx| t.shown(window, cx));
+                    } else {
+                        window.focus(&this.focus, cx);
+                    }
+                }))
         };
         let open_prs = (self.filter == PrFilter::Open).then_some(self.prs.len());
         let running = self.runs.iter().filter(|r| r.state.active()).count();
+        let tracked_tab = self.tracked_tab_shown(cx);
         let tabs = h_flex()
             .gap_1()
             // The picked tab's underline sits on the band's bottom border.
             .mb(px(-1.))
             .child(page_tab("github-page-prs", Page::PullRequests, IconName::GitPullRequest, "Pull requests", open_prs))
-            .child(page_tab("github-page-actions", Page::Actions, IconName::Workflow, "Actions", Some(running)));
+            .child(page_tab("github-page-actions", Page::Actions, IconName::Workflow, "Actions", Some(running)))
+            .when(tracked_tab, |el| {
+                el.child(page_tab(
+                    "github-page-tracked",
+                    Page::Tracked,
+                    IconName::FolderGit2,
+                    "Other repos",
+                    Some(self.tracked.read(cx).active(cx)),
+                ))
+            })
+            // Nothing tracked yet: the page is a menu item away instead of an empty tab.
+            .when(!tracked_tab, |el| {
+                let this = this.clone();
+                let more =
+                    Button::new("github-more")
+                        .small()
+                        .ghost()
+                        .icon(IconName::EllipsisVertical)
+                        .tooltip("More")
+                        .dropdown_menu(move |menu, _, _| {
+                            let this = this.clone();
+                            menu.item(PopupMenuItem::new("Add PR from another repo").on_click(move |_, window, cx| {
+                                this.update(cx, |v, cx| v.add_other_repo_pr(window, cx))
+                            }))
+                        });
+                el.child(div().flex_1()).child(div().debug_selector(|| "github-more".into()).child(more))
+            });
 
         v_flex()
             .flex_none()
@@ -3368,6 +3513,10 @@ impl Render for GitHubView {
         for input in std::mem::take(&mut self.to_clear) {
             input.update(cx, |i, cx| i.set_value("", window, cx));
         }
+        // Loading found the Other repos page stands in for the tab: it takes the keyboard.
+        if self.showing_tracked(cx) && self.focus.is_focused(window) {
+            self.tracked.update(cx, |t, cx| t.shown(window, cx));
+        }
         let c = Self::colors(cx);
         let body = match self.phase.clone() {
             Phase::Idle | Phase::Loading => v_flex()
@@ -3384,31 +3533,54 @@ impl Render for GitHubView {
                 IconName::Github,
                 "The GitHub CLI isn't installed",
                 "TJ talks to GitHub through gh. Install it (pacman -S github-cli), log in to each account with `gh auth login`, then try again.",
+                None,
                 &c,
                 cx,
             ),
-            Phase::NotGitHub => self.render_message(
-                IconName::GitBranch,
-                "No GitHub remote",
-                "This project has no remote on GitHub. Add one (git remote add origin …) and try again.",
-                &c,
-                cx,
-            ),
+            Phase::NotGitHub if self.tracked_only(cx) => self.tracked.clone().into_any_element(),
+            Phase::NotGitHub => {
+                let other = Button::new("github-other-repos")
+                    .small()
+                    .outline()
+                    .icon(IconName::FolderGit2)
+                    .label("Pull requests on other repositories")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.tracked_wanted = true;
+                        this.tracked.update(cx, |t, cx| t.shown(window, cx));
+                        cx.notify();
+                    }));
+                self.render_message(
+                    IconName::GitBranch,
+                    "No GitHub remote",
+                    "This project has no remote on GitHub. Add one (git remote add origin …) and try again, or keep track of pull requests it sends to other repositories.",
+                    Some(other),
+                    &c,
+                    cx,
+                )
+            }
             Phase::NoAccounts => self.render_message(
                 IconName::Users,
                 "No GitHub accounts",
                 "gh isn't logged in to any account. Run `gh auth login` in a terminal for each of your accounts, then try again.",
+                None,
                 &c,
                 cx,
             ),
-            Phase::Failed(err) => self.render_message(IconName::CircleAlert, "Couldn't reach GitHub", &err, &c, cx),
+            Phase::Failed(err) => {
+                self.render_message(IconName::CircleAlert, "Couldn't reach GitHub", &err, None, &c, cx)
+            }
+            Phase::Ready if self.page == Page::Tracked => v_flex()
+                .size_full()
+                .child(self.render_header(&c, cx))
+                .child(div().flex_1().min_h_0().child(self.tracked.clone()))
+                .into_any_element(),
             Phase::Ready => {
                 let (list, detail) = match self.page {
                     Page::PullRequests => (
                         self.render_list(&c, cx).into_any_element(),
                         (!self.narrow() || !self.list_page).then(|| self.render_detail(window, &c, cx)),
                     ),
-                    Page::Actions => (
+                    Page::Actions | Page::Tracked => (
                         self.render_runs(&c, cx).into_any_element(),
                         (!self.narrow() || !self.list_page).then(|| self.render_run(&c, cx)),
                     ),
@@ -3474,11 +3646,15 @@ impl Render for GitHubView {
             .on_action(cx.listener(|this, _: &ShowConversation, _, cx| this.show_section(Section::Conversation, cx)))
             .on_action(cx.listener(|this, _: &ShowFiles, _, cx| this.show_section(Section::Files, cx)))
             .on_action(cx.listener(|this, _: &ShowCommits, _, cx| this.show_section(Section::Commits, cx)))
-            .on_action(cx.listener(
-                |this, _: &Refresh, _, cx| {
-                    if this.phase == Phase::Ready { this.refresh(true, cx) } else { this.load(cx) }
-                },
-            ))
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                if this.showing_tracked(cx) {
+                    this.tracked.update(cx, |t, cx| t.refresh_all(cx))
+                } else if this.phase == Phase::Ready {
+                    this.refresh(true, cx)
+                } else {
+                    this.load(cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Pull, _, cx| this.pull(cx)))
             .child(body)
             .child(measure)

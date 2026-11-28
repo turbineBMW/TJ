@@ -61,6 +61,16 @@ pub struct ThreadNeedsYou {
 
 impl EventEmitter<ThreadNeedsYou> for ThreadView {}
 
+/// A shell command opened pull requests (`gh pr create` printed their links), for the project's
+/// PRs tab. Only sent live, never while a transcript is replayed.
+pub struct ThreadOpenedPrs {
+    pub urls: Vec<String>,
+    /// The folder the command ran in, when it said (`cd /path && gh pr create`).
+    pub folder: Option<std::path::PathBuf>,
+}
+
+impl EventEmitter<ThreadOpenedPrs> for ThreadView {}
+
 /// Something the composer's menus ask the workspace to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ThreadAction {
@@ -2355,6 +2365,13 @@ impl ThreadView {
                         tool.took = took_ms.map(std::time::Duration::from_millis);
                         if let Some(shell) = &mut tool.shell {
                             shell.finish(&output, is_error);
+                        }
+                        let command = tool.input.get("command").and_then(Value::as_str).unwrap_or_default();
+                        if !self.replaying && !is_error && tool.name == "Bash" && crate::tracked::opens_pr(command) {
+                            let urls = crate::tracked::pr_links(&output);
+                            if !urls.is_empty() {
+                                cx.emit(ThreadOpenedPrs { urls, folder: crate::tracked::command_folder(command) });
+                            }
                         }
                         if is_error {
                             self.plain.push(format!("({} failed: {})", tool.name, truncate(&output, 240)));

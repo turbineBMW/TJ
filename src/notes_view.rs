@@ -1275,7 +1275,7 @@ fn kind_look(kind: Kind, c: &Colors) -> (IconName, Hsla) {
     }
 }
 
-fn pill(text: &str, color: Hsla) -> Div {
+pub(crate) fn pill(text: &str, color: Hsla) -> Div {
     div()
         .flex_none()
         .px_1p5()
@@ -1286,7 +1286,7 @@ fn pill(text: &str, color: Hsla) -> Div {
         .child(text.to_string())
 }
 
-fn pill_icon(icon: IconName, text: &str, color: Hsla) -> Div {
+pub(crate) fn pill_icon(icon: IconName, text: &str, color: Hsla) -> Div {
     h_flex()
         .flex_none()
         .gap_1()
@@ -1301,7 +1301,7 @@ fn pill_icon(icon: IconName, text: &str, color: Hsla) -> Div {
 }
 
 /// How long ago a time (seconds since the epoch) was, briefly: "now", "5m", "3h", "2d", "Mar 4".
-fn ago(at: u64) -> String {
+pub(crate) fn ago(at: u64) -> String {
     let secs = crate::store::now().saturating_sub(at);
     match secs {
         0..60 => "now".into(),
@@ -1313,7 +1313,7 @@ fn ago(at: u64) -> String {
 }
 
 /// How long ago, in words: "just now", "5 minutes ago", "on Mar 4".
-fn ago_long(at: u64) -> String {
+pub(crate) fn ago_long(at: u64) -> String {
     let secs = crate::store::now().saturating_sub(at);
     let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
     match secs {

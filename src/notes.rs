@@ -18,6 +18,13 @@ use std::time::{Duration, SystemTime};
 use gpui_kit::{Context, Task};
 use serde::{Deserialize, Serialize};
 
+use crate::tracked::TrackedPr;
+
+/// A pull request's address the way it's stored: tidied, or as given if it isn't a web address.
+fn tidy_url(url: &str) -> String {
+    crate::tracked::parse_url(url).map_or_else(|| url.trim().to_string(), |l| l.url)
+}
+
 /// What Claude is told about the notes in every session that has the notes tools.
 pub const INSTRUCTIONS: &str = "TJ keeps a list of notes for this project (the `tj` MCP server's \
 notes_list, note_read, note_add, note_update and note_delete tools). The notes are how deferred work \
@@ -29,7 +36,18 @@ anything already decided.
 - When the user asks what's pending, left over or deferred, check notes_list.
 - When you finish work a note describes, close it with note_update (status \"done\") and a one-line \
 resolution (what was done, and the PR if there is one).
-- Prefer closing a note over deleting it; delete only duplicates or notes that were wrong.";
+- Prefer closing a note over deleting it; delete only duplicates or notes that were wrong.
+
+TJ also keeps track of the pull requests this project sends to other repositories and hosts (the \
+pr_track, pr_list, pr_update and pr_untrack tools), and shows them on the GitHub tab's Other repos page:
+- After you open a pull request or merge request on a repository other than this project's own, or mail \
+a patch series, call pr_track with its web address (for a patch, its lore.kernel.org or patchwork link), \
+the local folder its branch is in, and a one-line note on what it's for. TJ also catches `gh pr create` \
+output itself; tracking a PR twice is harmless.
+- When the user asks how their PRs are doing, or what's waiting on review, call pr_list (refresh: true \
+reads the latest state from GitHub and GitLab).
+- Set a mailed patch's or other link's status by hand with pr_update when you learn it was merged or \
+dropped.";
 
 /// What a note is about.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +190,9 @@ pub struct Notebook {
     pub next_number: u64,
     #[serde(default)]
     pub notes: Vec<Note>,
+    /// The pull requests the project's sessions sent out, anywhere ([`crate::tracked`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prs: Vec<TrackedPr>,
 }
 
 fn first_number() -> u64 {
@@ -190,7 +211,13 @@ pub struct NewNote {
 
 impl Notebook {
     pub fn new(name: &str, path: &Path) -> Self {
-        Self { project_name: name.to_string(), project_path: path.to_path_buf(), next_number: 1, notes: Vec::new() }
+        Self {
+            project_name: name.to_string(),
+            project_path: path.to_path_buf(),
+            next_number: 1,
+            notes: Vec::new(),
+            prs: Vec::new(),
+        }
     }
 
     pub fn get(&self, number: u64) -> Option<&Note> {
@@ -239,6 +266,51 @@ impl Notebook {
             self.next_number = note.number + 1;
             self.notes.push(note);
         }
+        for pr in other.prs {
+            if self.tracked(&pr.url).is_none() {
+                self.prs.push(pr);
+            }
+        }
+    }
+
+    /// The tracked pull request at `url` (as given or tidied).
+    pub fn tracked(&self, url: &str) -> Option<&TrackedPr> {
+        let url = tidy_url(url);
+        self.prs.iter().find(|p| p.url == url)
+    }
+
+    pub fn tracked_mut(&mut self, url: &str) -> Option<&mut TrackedPr> {
+        let url = tidy_url(url);
+        self.prs.iter_mut().find(|p| p.url == url)
+    }
+
+    /// Start tracking a pull request. One already tracked keeps its state, and takes the new
+    /// note, folder and source where it had none. True if it's new.
+    pub fn track(&mut self, pr: TrackedPr) -> bool {
+        match self.tracked_mut(&pr.url) {
+            Some(old) => {
+                if !pr.note.is_empty() {
+                    old.note = pr.note;
+                }
+                if old.folder.is_none() {
+                    old.folder = pr.folder;
+                }
+                if old.source.is_none() {
+                    old.source = pr.source;
+                }
+                false
+            }
+            None => {
+                self.prs.push(pr);
+                true
+            }
+        }
+    }
+
+    pub fn untrack(&mut self, url: &str) -> Option<TrackedPr> {
+        let url = tidy_url(url);
+        let ix = self.prs.iter().position(|p| p.url == url)?;
+        Some(self.prs.remove(ix))
     }
 
     /// The notes as Markdown, newest first, for copying out of TJ.
@@ -254,6 +326,16 @@ impl Notebook {
             }
             if let Some(resolution) = &note.resolution {
                 out.push_str(&format!("\nResolved: {resolution}\n"));
+            }
+        }
+        if !self.prs.is_empty() {
+            out.push_str("\n## Pull requests\n\n");
+            for pr in &self.prs {
+                out.push_str(&format!("- [{}] {} ({})", pr.status.name(), pr.display_title(), pr.url));
+                if !pr.note.is_empty() {
+                    out.push_str(&format!(" — {}", pr.note));
+                }
+                out.push('\n');
             }
         }
         out
@@ -467,7 +549,7 @@ impl NotesStore {
         let mut orphans: Vec<(&str, &Notebook)> = self
             .books
             .iter()
-            .filter(|(id, book)| !live.contains(&id.as_str()) && !book.notes.is_empty())
+            .filter(|(id, book)| !live.contains(&id.as_str()) && !(book.notes.is_empty() && book.prs.is_empty()))
             .map(|(id, book)| (id.as_str(), book))
             .collect();
         orphans.sort_by_key(|a| a.1.project_name.to_lowercase());
