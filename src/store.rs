@@ -317,6 +317,10 @@ pub struct Project {
     /// The merge method last picked in the GitHub tab, which its merge button starts on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_merge_method: Option<crate::github::MergeMethod>,
+    /// After merging in the GitHub tab, switch to the base branch, pull it, and delete the
+    /// pull request's local branch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub github_pull_after_merge: bool,
 }
 
 /// The picture chosen for a project.
@@ -516,6 +520,7 @@ impl State {
             image: None,
             github_account: None,
             github_merge_method: None,
+            github_pull_after_merge: false,
         });
         self.projects.last_mut().unwrap()
     }

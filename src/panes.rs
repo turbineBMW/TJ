@@ -1539,8 +1539,9 @@ mod tests {
                         cx,
                     )
                 });
-                let github =
-                    cx.new(|cx| crate::github_view::GitHubView::new(project.clone(), tracked, None, None, window, cx));
+                let github = cx.new(|cx| {
+                    crate::github_view::GitHubView::new(project.clone(), tracked, None, None, false, window, cx)
+                });
                 let notes = cx.new(|cx| {
                     crate::notes_view::NotesView::new(
                         store,

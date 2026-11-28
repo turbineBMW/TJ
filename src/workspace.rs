@@ -1641,6 +1641,7 @@ impl Workspace {
                 prs,
                 project.github_account.clone(),
                 project.github_merge_method,
+                project.github_pull_after_merge,
                 window,
                 cx,
             )
@@ -1658,6 +1659,12 @@ impl Workspace {
                 GitHubEvent::MergeMethodChosen(method) => {
                     if let Some(project) = this.state.project_mut(&github_project) {
                         project.github_merge_method = Some(*method);
+                    }
+                    this.save();
+                }
+                GitHubEvent::PullAfterMergeChosen(on) => {
+                    if let Some(project) = this.state.project_mut(&github_project) {
+                        project.github_pull_after_merge = *on;
                     }
                     this.save();
                 }
@@ -2981,6 +2988,10 @@ mod tests {
         use crate::github::MergeMethod;
         github.update(cx, |_, cx| cx.emit(crate::github_view::GitHubEvent::MergeMethodChosen(MergeMethod::Merge)));
         assert_eq!(State::load(&paths).unwrap().projects[0].github_merge_method, Some(MergeMethod::Merge));
+
+        // And whether to pull the base branch after merging.
+        github.update(cx, |_, cx| cx.emit(crate::github_view::GitHubEvent::PullAfterMergeChosen(true)));
+        assert!(State::load(&paths).unwrap().projects[0].github_pull_after_merge);
     }
 
     #[gpui_kit::test]

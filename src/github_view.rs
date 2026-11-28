@@ -94,6 +94,8 @@ pub enum GitHubEvent {
     AccountChosen(Option<String>),
     /// The merge method picked from the merge button's menu.
     MergeMethodChosen(MergeMethod),
+    /// The "pull the base branch locally after merging" switch was flipped.
+    PullAfterMergeChosen(bool),
     /// Open a file of a pull request in the review modal, with its summary.
     ExpandFile(ExpandFile),
 }
@@ -203,6 +205,9 @@ pub struct GitHubView {
     /// The merge method last picked for the project, which the merge button starts on.
     last_merge_method: Option<MergeMethod>,
     delete_branch: bool,
+    /// After a merge, switch to the base branch, pull it, and delete the local branch (when the
+    /// remote one is deleted too). Kept for the project.
+    pull_after_merge: bool,
     local: Option<LocalStatus>,
     branches: Vec<Branch>,
     /// What's running, for the header's spinner ("Pulling…").
@@ -242,6 +247,7 @@ impl GitHubView {
         tracked: Entity<PrsView>,
         chosen: Option<String>,
         last_merge_method: Option<MergeMethod>,
+        pull_after_merge: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -303,6 +309,7 @@ impl GitHubView {
             merge_method: MergeMethod::Squash,
             last_merge_method,
             delete_branch: true,
+            pull_after_merge,
             local: None,
             branches: Vec::new(),
             busy: None,
@@ -1167,8 +1174,8 @@ impl GitHubView {
         else {
             return;
         };
-        let (pr, sha, method, delete) =
-            (detail.pr.clone(), detail.head_sha.clone(), self.merge_method, self.delete_branch);
+        let (pr, sha, method, delete, tidy) =
+            (detail.pr.clone(), detail.head_sha.clone(), self.merge_method, self.delete_branch, self.pull_after_merge);
         let number = pr.number;
         let (root, fetch_token) = (self.root.clone(), token.clone());
         self.run(
@@ -1176,11 +1183,20 @@ impl GitHubView {
             move || {
                 github::merge(&token, &remote, &pr, method, &sha, delete)?;
                 // Bring the merge in locally, so Pull shows it straight away.
-                let _ = github::fetch(&root, Some(&fetch_token), &remote.name);
-                Ok(())
+                let fetched = github::fetch(&root, Some(&fetch_token), &remote.name);
+                if !tidy {
+                    return Ok(None);
+                }
+                // A fork's pr-N branch was made by TJ, so it goes too.
+                let drop_branch = delete || pr.cross_repo;
+                Ok(Some(fetched.and_then(|_| github::tidy_after_merge(&root, &remote.name, &pr, &sha, drop_branch))))
             },
-            move |this, _, cx| {
-                this.say(true, format!("Merged #{number}."));
+            move |this, tidied, cx| {
+                match tidied {
+                    None => this.say(true, format!("Merged #{number}.")),
+                    Some(Ok(text)) => this.say(true, format!("Merged #{number}. {text}").trim_end().to_string()),
+                    Some(Err(err)) => this.say(false, format!("Merged #{number}, but locally: {err:#}")),
+                }
                 this.load_detail(number, cx);
                 this.load_prs(cx);
                 this.load_local(cx);
@@ -2365,6 +2381,17 @@ impl GitHubView {
                             })),
                     )
                 })
+                .child(
+                    Switch::new("github-pull-after-merge")
+                        .checked(self.pull_after_merge)
+                        .label(format!("Pull {} here", pr.base))
+                        .small()
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            this.pull_after_merge = *checked;
+                            cx.emit(GitHubEvent::PullAfterMergeChosen(*checked));
+                            cx.notify();
+                        })),
+                )
         });
         let ready = (pr.state == PrState::Draft).then(|| {
             h_flex().px_4().py_3().border_t_1().border_color(c.border).child(
