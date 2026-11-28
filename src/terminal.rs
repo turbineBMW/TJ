@@ -106,10 +106,14 @@ pub fn agent_quote(text: &str, cwd: Option<&std::path::Path>) -> (String, String
         Some(dir) => format!("From my terminal, in {}:", dir.display()),
         None => "From my terminal:".to_string(),
     };
-    // A fence longer than any run of backticks in the text, so the text can't end it.
+    (label, format!("{from}\n{}", fenced(text, "")))
+}
+
+/// `text` in a code fence longer than any run of backticks in it, so the text can't end it.
+pub fn fenced(text: &str, lang: &str) -> String {
     let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
-    (label, format!("{from}\n{fence}\n{text}\n{fence}"))
+    format!("{fence}{lang}\n{text}\n{fence}")
 }
 
 pub struct TerminalView {

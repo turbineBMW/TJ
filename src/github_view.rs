@@ -68,7 +68,8 @@ gpui_kit::actions!(
         ShowFiles,
         ShowCommits,
         Refresh,
-        Pull
+        Pull,
+        SendToAgent
     ]
 );
 
@@ -85,6 +86,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-3", ShowCommits, cx),
         KeyBinding::new("f5", Refresh, cx),
         KeyBinding::new("ctrl-alt-l", Pull, cx),
+        KeyBinding::new("ctrl-alt-a", SendToAgent, cx),
     ]
 }
 
@@ -98,6 +100,8 @@ pub enum GitHubEvent {
     PullAfterMergeChosen(bool),
     /// Open a file of a pull request in the review modal, with its summary.
     ExpandFile(ExpandFile),
+    /// Put this in the project agent's prompt box as a chip: a failed job or review feedback.
+    SendToThread { icon: IconName, label: String, text: String },
 }
 
 /// A pull request's file to show in the review modal.
@@ -195,6 +199,8 @@ pub struct GitHubView {
     /// Job logs read so far (`None` while one is loading), and the jobs showing theirs.
     logs: HashMap<u64, Option<Vec<String>>>,
     logs_open: HashSet<u64>,
+    /// Jobs to send to the agent once their log is read ("Fix in thread" before the log was).
+    fix_when_read: HashSet<u64>,
     runs_scroll: ScrollHandle,
     diff: Entity<DiffState>,
     drafts: Vec<DraftComment>,
@@ -300,6 +306,7 @@ impl GitHubView {
             jobs_loading: false,
             logs: HashMap::new(),
             logs_open: HashSet::new(),
+            fix_when_read: HashSet::new(),
             runs_scroll: ScrollHandle::new(),
             diff,
             drafts: Vec::new(),
@@ -405,6 +412,37 @@ impl GitHubView {
     #[cfg(test)]
     pub fn show_pull_requests_for_test(&mut self, cx: &mut Context<Self>) {
         self.show_page(Page::PullRequests, cx)
+    }
+
+    /// As if this pull request were open on the Pull requests page.
+    #[cfg(test)]
+    pub fn pretend_pr(&mut self, detail: PrDetail, cx: &mut Context<Self>) {
+        self.page = Page::PullRequests;
+        self.selected = Some(detail.pr.number);
+        self.prs = vec![detail.pr.clone()];
+        self.loaded_at = Some(Instant::now());
+        self.detail = Some(detail);
+        self.list_page = false;
+        cx.notify();
+    }
+
+    /// As if this run were picked on the Actions page, with these jobs and logs read.
+    #[cfg(test)]
+    pub fn pretend_run(
+        &mut self,
+        run: WorkflowRun,
+        jobs: Vec<Job>,
+        logs: Vec<(u64, Vec<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.page = Page::Actions;
+        self.run_selected = Some(run.id);
+        self.jobs = Some((run.id, jobs));
+        self.runs = vec![run];
+        self.runs_loaded_at = Some(Instant::now());
+        self.logs.extend(logs.into_iter().map(|(id, lines)| (id, Some(lines))));
+        self.list_page = false;
+        cx.notify();
     }
 
     /// The tab came to the front: focus it and bring stale data up to date.
@@ -722,8 +760,13 @@ impl GitHubView {
             cx.notify();
             return;
         }
+        self.read_log(job, cx);
+        cx.notify();
+    }
+
+    /// Read a job's log, unless it's read or being read.
+    fn read_log(&mut self, job: u64, cx: &mut Context<Self>) {
         if self.logs.contains_key(&job) {
-            cx.notify();
             return;
         }
         let (Some(remote), Some(token)) = (self.remote.clone(), self.token()) else { return };
@@ -734,10 +777,14 @@ impl GitHubView {
                 match result {
                     Ok(lines) => {
                         this.logs.insert(job, Some(lines));
+                        if this.fix_when_read.remove(&job) {
+                            this.fix_job(job, cx);
+                        }
                     }
                     Err(err) => {
                         this.logs.remove(&job);
                         this.logs_open.remove(&job);
+                        this.fix_when_read.remove(&job);
                         this.say(false, format!("Couldn't read the log: {err:#}"));
                     }
                 }
@@ -745,7 +792,86 @@ impl GitHubView {
             });
         })
         .detach();
-        cx.notify();
+    }
+
+    fn local_branch(&self) -> Option<&str> {
+        self.local.as_ref().and_then(|l| l.branch.as_deref())
+    }
+
+    /// "Fix in thread": the failed job and its log go to the agent's prompt box, once the log is
+    /// read.
+    fn fix_job(&mut self, job_id: u64, cx: &mut Context<Self>) {
+        let Some((run_id, jobs)) = &self.jobs else { return };
+        let (Some(run), Some(job)) = (self.runs.iter().find(|r| r.id == *run_id), jobs.iter().find(|j| j.id == job_id))
+        else {
+            return;
+        };
+        let Some(remote) = &self.remote else { return };
+        match self.logs.get(&job_id) {
+            Some(Some(log)) => {
+                let (label, text) = crate::fix_prompt::failed_job(&remote.slug(), run, job, log, self.local_branch());
+                cx.emit(GitHubEvent::SendToThread { icon: IconName::Wrench, label, text });
+            }
+            _ => {
+                self.fix_when_read.insert(job_id);
+                self.read_log(job_id, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Ctrl+Alt+A: on the Actions page, every failed job of the picked run; on a pull request, all
+    /// its review feedback from others.
+    fn send_to_agent(&mut self, cx: &mut Context<Self>) {
+        match self.page {
+            Page::Actions => {
+                let failed: Vec<u64> = match &self.jobs {
+                    Some((run, jobs)) if Some(*run) == self.run_selected => {
+                        jobs.iter().filter(|j| j.state == RunState::Failed).map(|j| j.id).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                if failed.is_empty() {
+                    self.say(false, "No failed job to fix in this run.");
+                    cx.notify();
+                }
+                for job in failed {
+                    self.fix_job(job, cx);
+                }
+            }
+            Page::PullRequests => {
+                let Some(detail) = &self.detail else { return };
+                let me = self.account.as_ref().map(|(login, _)| login.as_str());
+                let threads = crate::fix_prompt::threads(&detail.line_comments);
+                match crate::fix_prompt::all_feedback(&detail.pr, &detail.timeline, &threads, me, self.local_branch()) {
+                    Some((label, text)) => {
+                        cx.emit(GitHubEvent::SendToThread { icon: IconName::MessageSquareReply, label, text })
+                    }
+                    None => {
+                        self.say(false, "No review feedback from others on this pull request.");
+                        cx.notify();
+                    }
+                }
+            }
+            Page::Tracked => {}
+        }
+    }
+
+    /// "Address in thread" on a line comment's thread, by its first comment.
+    fn address_thread(&mut self, root: u64, cx: &mut Context<Self>) {
+        let Some(detail) = &self.detail else { return };
+        let threads = crate::fix_prompt::threads(&detail.line_comments);
+        let Some(thread) = threads.iter().find(|t| t[0].id == root) else { return };
+        let (label, text) = crate::fix_prompt::review_thread(&detail.pr, thread, self.local_branch());
+        cx.emit(GitHubEvent::SendToThread { icon: IconName::MessageSquareReply, label, text });
+    }
+
+    /// "Address in thread" on a review or comment of the conversation.
+    fn address_review(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(detail) = &self.detail else { return };
+        let Some(item) = detail.timeline.get(ix) else { return };
+        let (label, text) = crate::fix_prompt::review(&detail.pr, item, self.local_branch());
+        cx.emit(GitHubEvent::SendToThread { icon: IconName::MessageSquareReply, label, text });
     }
 
     /// While the Actions page is open and something on it is still going, read it again.
@@ -2153,7 +2279,13 @@ impl GitHubView {
         let now = chrono::Utc::now();
         let pr = &detail.pr;
         let entry =
-            |id: String, author: &str, at: &str, badge: Option<AnyElement>, body: &str, accent: Option<Hsla>| {
+            |id: String,
+             author: &str,
+             at: &str,
+             badge: Option<AnyElement>,
+             body: &str,
+             accent: Option<Hsla>,
+             action: Option<AnyElement>| {
                 h_flex().gap_3().items_start().child(self.avatar(author, 32., c)).child(
                     v_flex()
                         .flex_1()
@@ -2171,7 +2303,8 @@ impl GitHubView {
                                 .text_sm()
                                 .child(div().font_weight(FontWeight::SEMIBOLD).child(author.to_string()))
                                 .child(div().text_color(c.muted).child(github::ago(at, now)))
-                                .children(badge),
+                                .children(badge)
+                                .when_some(action, |el, action| el.child(div().flex_1()).child(action)),
                         )
                         .when(!body.trim().is_empty(), |el| {
                             el.child(
@@ -2189,7 +2322,9 @@ impl GitHubView {
             Some(pill("Author", c.muted).into_any_element()),
             if detail.body.trim().is_empty() { "_No description provided._" } else { &detail.body },
             None,
+            None,
         );
+        let me = self.account.as_ref().map(|(login, _)| login.as_str());
         let timeline = detail.timeline.iter().enumerate().map(|(ix, item)| {
             let (badge, accent) = match item.review.as_deref() {
                 Some("APPROVED") => (Some(review_badge(IconName::CircleCheck, "approved", c.green)), Some(c.green)),
@@ -2200,7 +2335,20 @@ impl GitHubView {
                 Some(_) => (Some(review_badge(IconName::Eye, "reviewed", c.blue)), None),
                 None => (None, None),
             };
-            entry(format!("github-item-{}-{ix}", pr.number), &item.author, &item.at, badge, &item.body, accent)
+            let action = (Some(item.author.as_str()) != me && !item.body.trim().is_empty())
+                .then(|| {
+                    Button::new(SharedString::from(format!("github-address-{ix}")))
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::MessageSquareReply)
+                        .label("Address in thread")
+                        .tooltip("Send this to the agent (Ctrl+Alt+A sends all the feedback)")
+                        .on_click(cx.listener(move |this, _, _, cx| this.address_review(ix, cx)))
+                })
+                .map(|button| {
+                    div().debug_selector(move || format!("github-address-{ix}")).child(button).into_any_element()
+                });
+            entry(format!("github-item-{}-{ix}", pr.number), &item.author, &item.at, badge, &item.body, accent, action)
         });
         let open = matches!(pr.state, PrState::Open | PrState::Draft);
         div().id("github-conversation").size_full().overflow_y_scroll().child(
@@ -2480,13 +2628,7 @@ impl GitHubView {
         let _ = window;
         let this = cx.entity().downgrade();
         // Line comments in threads, under the line they're on (outdated ones under the file).
-        let mut threads: Vec<(u64, Vec<LineComment>)> = Vec::new();
-        for comment in &detail.line_comments {
-            match comment.reply_to.and_then(|to| threads.iter_mut().find(|(root, _)| *root == to)) {
-                Some((_, thread)) => thread.push(comment.clone()),
-                None => threads.push((comment.id, vec![comment.clone()])),
-            }
-        }
+        let threads = crate::fix_prompt::threads(&detail.line_comments);
         enum Note {
             Thread(Vec<LineComment>),
             Draft(usize, DraftComment),
@@ -2495,9 +2637,9 @@ impl GitHubView {
             Review,
         }
         let mut notes: Vec<(DiffAnnotation, Note)> = Vec::new();
-        for (root, thread) in threads {
+        for thread in threads {
             let first = &thread[0];
-            let id = SharedString::from(format!("thread-{root}"));
+            let id = SharedString::from(format!("thread-{}", first.id));
             let annotation = match first.line {
                 Some(line) => DiffAnnotation::line(
                     id,
@@ -2716,8 +2858,10 @@ impl GitHubView {
                 match note {
                     Note::Thread(thread) => {
                         let root = thread[0].clone();
+                        let root_id = root.id;
                         let outdated = root.line.is_none();
                         let this = this.clone();
+                        let address = this.clone();
                         frame(c.blue)
                             .children(thread.iter().map(|comment| {
                                 v_flex()
@@ -2752,28 +2896,43 @@ impl GitHubView {
                                     )
                             }))
                             .child(
-                                h_flex().px_2().py_1().child(
-                                    Button::new(SharedString::from(format!("reply-{}", root.id)))
-                                        .xsmall()
-                                        .ghost()
-                                        .icon(IconName::Reply)
-                                        .label("Reply")
-                                        .on_click(move |_, window, cx| {
-                                            let root = root.clone();
-                                            let _ = this.update(cx, |v, cx| {
-                                                let line = root.line.unwrap_or(1);
-                                                v.open_compose(
-                                                    root.path.clone(),
-                                                    root.side.clone(),
-                                                    line,
-                                                    line,
-                                                    Some(root.id),
-                                                    window,
-                                                    cx,
-                                                )
-                                            });
-                                        }),
-                                ),
+                                h_flex()
+                                    .px_2()
+                                    .py_1()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(SharedString::from(format!("reply-{}", root.id)))
+                                            .xsmall()
+                                            .ghost()
+                                            .icon(IconName::Reply)
+                                            .label("Reply")
+                                            .on_click(move |_, window, cx| {
+                                                let root = root.clone();
+                                                let _ = this.update(cx, |v, cx| {
+                                                    let line = root.line.unwrap_or(1);
+                                                    v.open_compose(
+                                                        root.path.clone(),
+                                                        root.side.clone(),
+                                                        line,
+                                                        line,
+                                                        Some(root.id),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!("address-{root_id}")))
+                                            .xsmall()
+                                            .ghost()
+                                            .icon(IconName::MessageSquareReply)
+                                            .label("Address in thread")
+                                            .tooltip("Send this comment to the agent")
+                                            .on_click(move |_, _, cx| {
+                                                let _ = address.update(cx, |v, cx| v.address_thread(root_id, cx));
+                                            }),
+                                    ),
                             )
                             .into_any_element()
                     }
@@ -3525,6 +3684,24 @@ impl GitHubView {
                             now,
                         )))
                     })
+                    .when(job.state == RunState::Failed, |el| {
+                        el.child(
+                            div().debug_selector(move || format!("github-job-fix-{id}")).child(
+                                Button::new(SharedString::from(format!("github-job-fix-{id}")))
+                                    .xsmall()
+                                    .outline()
+                                    .icon(IconName::Wrench)
+                                    .label(if self.fix_when_read.contains(&id) {
+                                        "Reading log…"
+                                    } else {
+                                        "Fix in thread"
+                                    })
+                                    .disabled(self.fix_when_read.contains(&id))
+                                    .tooltip("Send the job and its log to the agent (Ctrl+Alt+A)")
+                                    .on_click(cx.listener(move |this, _, _, cx| this.fix_job(id, cx))),
+                            ),
+                        )
+                    })
                     .child(
                         Button::new(SharedString::from(format!("github-job-log-{id}")))
                             .xsmall()
@@ -3707,6 +3884,7 @@ impl Render for GitHubView {
                 }
             }))
             .on_action(cx.listener(|this, _: &Pull, _, cx| this.pull(cx)))
+            .on_action(cx.listener(|this, _: &SendToAgent, _, cx| this.send_to_agent(cx)))
             .child(body)
             .child(measure)
     }

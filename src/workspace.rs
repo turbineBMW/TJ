@@ -1677,6 +1677,9 @@ impl Workspace {
                 GitHubEvent::ExpandFile(file) => {
                     this.open_pr_file(&github_project, github_root.clone(), file.clone(), window, cx)
                 }
+                GitHubEvent::SendToThread { icon, label, text } => {
+                    this.quote_to_agent(&github_project, *icon, label.clone(), text.clone(), window, cx)
+                }
             }
         }));
         self.githubs.insert(project.id.clone(), github.clone());
@@ -3050,6 +3053,79 @@ mod tests {
         github.update(cx, |g, cx| g.show_pull_requests_for_test(cx));
         assert_eq!(prs.read_with(cx, |p, cx| p.count(cx)), 1);
         assert!(github.read_with(cx, |g, cx| g.has_tracked_tab(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_alt_a_in_the_github_tab_sends_a_failed_job_or_review_feedback_to_the_agent(cx: &mut TestAppContext) {
+        use crate::github::{RunState, WorkflowRun};
+        let (window, workspace, _paths, _project) = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        let project_id = workspace.read_with(cx, |w, _| w.state.projects[0].id.clone());
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        cx.simulate_keystrokes("ctrl-shift-g");
+        cx.run_until_parked();
+        let github = workspace.read_with(cx, |w, _| w.githubs.get(&project_id).cloned().unwrap());
+        github.update(cx, |g, cx| g.pretend_ready(cx));
+
+        // A failed run on the Actions page: its failed job goes, with the log.
+        let run = WorkflowRun {
+            id: 7,
+            number: 126,
+            attempt: 1,
+            workflow: "CI".into(),
+            title: "Add a cache".into(),
+            event: "push".into(),
+            branch: "cache".into(),
+            sha: "abcdef1".into(),
+            actor: "me".into(),
+            state: RunState::Failed,
+            started_at: String::new(),
+            updated_at: String::new(),
+            url: String::new(),
+        };
+        let jobs = crate::github::parse_jobs(&serde_json::json!({ "jobs": [
+            { "id": 1, "name": "fmt", "status": "completed", "conclusion": "success", "steps": [] },
+            { "id": 2, "name": "test", "status": "completed", "conclusion": "failure", "steps": [
+                { "name": "cargo test", "status": "completed", "conclusion": "failure" }
+            ] }
+        ] }));
+        let log = vec!["$ cargo test".to_string(), "Error: 1 test failed".to_string()];
+        github.update(cx, |g, cx| g.pretend_run(run, jobs, vec![(2, log)], cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(cx.debug_bounds("github-page-actions").is_some(), "the GitHub tab is drawn");
+        assert!(cx.debug_bounds("github-job-fix-2").is_some(), "the failed job has Fix in thread");
+        assert!(cx.debug_bounds("github-job-fix-1").is_none(), "a passed one doesn't");
+        cx.update(|window, cx| window.focus(&gpui_kit::Focusable::focus_handle(github.read(cx), cx), cx));
+        cx.simulate_keystrokes("ctrl-alt-a");
+        let (labels, texts) = thread.read_with(cx, |t, _| t.quote_parts());
+        assert_eq!(labels, ["CI · test failed"]);
+        assert!(texts[0].contains("failed at step 1 \"cargo test\""), "{texts:?}");
+        assert!(texts[0].contains("Error: 1 test failed"), "{texts:?}");
+        let focused = cx.update(|window, cx| thread.read(cx).prompt_focus(cx).is_focused(window));
+        assert!(focused, "the caret is in the prompt box");
+
+        // A pull request: the feedback from others goes as one chip.
+        let detail = crate::github::parse_detail(
+            &serde_json::json!({
+                "number": 12, "title": "Add a cache", "headRefName": "cache", "author": { "login": "me" },
+                "comments": [],
+                "reviews": [{ "author": { "login": "ana" }, "state": "CHANGES_REQUESTED", "body": "A few things.", "submittedAt": "2026-11-01T00:00:00Z" }]
+            }),
+            &serde_json::json!([{ "id": 5, "path": "src/cache.rs", "line": 3, "side": "RIGHT", "user": { "login": "ana" }, "body": "Don't unwrap.", "diff_hunk": "@@ -1 +1,3 @@\n+unwrap()" }]),
+            String::new(),
+        );
+        github.update(cx, |g, cx| g.pretend_pr(detail, cx));
+        // The agent's tab came to the front; bring the GitHub tab back.
+        cx.simulate_keystrokes("ctrl-shift-g");
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(cx.debug_bounds("github-address-0").is_some(), "the review has Address in thread");
+        cx.update(|window, cx| window.focus(&gpui_kit::Focusable::focus_handle(github.read(cx), cx), cx));
+        cx.simulate_keystrokes("ctrl-alt-a");
+        let (labels, texts) = thread.read_with(cx, |t, _| t.quote_parts());
+        assert_eq!(labels[1], "Review · #12 · 2 comments");
+        assert!(texts[1].contains("ana requested changes:\n> A few things."), "{texts:?}");
+        assert!(texts[1].contains("`src/cache.rs` line 3:\n```diff\n@@ -1 +1,3 @@\n+unwrap()\n```"), "{texts:?}");
     }
 
     #[gpui_kit::test]
