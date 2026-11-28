@@ -14,11 +14,13 @@ use alacritty_terminal::{
     tty,
     vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Rgb},
 };
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::{ActiveTheme as _, menu::ContextMenuExt as _};
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
 const FONT_SIZE: f32 = 14.0;
-const KEY_CONTEXT: &str = "Terminal";
+pub(crate) const KEY_CONTEXT: &str = "Terminal";
+
+gpui_kit::actions!(terminal, [SendToAgent]);
 
 /// Keys the terminal must receive even though an outer view binds them.
 ///
@@ -75,6 +77,40 @@ struct ImageCell {
 pub struct TerminalExited;
 
 impl EventEmitter<TerminalExited> for TerminalView {}
+
+/// The user sent the selection to the project's agent ([`SendToAgent`], or the right-click menu).
+pub struct SelectionForAgent {
+    pub text: String,
+    /// The shell's working directory when it was sent.
+    pub cwd: Option<PathBuf>,
+}
+
+impl EventEmitter<SelectionForAgent> for TerminalView {}
+
+/// The chip's label and the text it carries to the agent, for `text` selected in a terminal
+/// whose shell is in `cwd`.
+pub fn agent_quote(text: &str, cwd: Option<&std::path::Path>) -> (String, String) {
+    let text = text.trim_end();
+    let lines = text.lines().count();
+    let label = match lines {
+        1 => {
+            let line = text.trim();
+            match line.char_indices().nth(40) {
+                Some((cut, _)) => format!("Terminal · {}…", &line[..cut]),
+                None => format!("Terminal · {line}"),
+            }
+        }
+        n => format!("Terminal · {n} lines"),
+    };
+    let from = match cwd {
+        Some(dir) => format!("From my terminal, in {}:", dir.display()),
+        None => "From my terminal:".to_string(),
+    };
+    // A fence longer than any run of backticks in the text, so the text can't end it.
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    (label, format!("{from}\n{fence}\n{text}\n{fence}"))
+}
 
 pub struct TerminalView {
     term: Arc<FairMutex<Term<Listener>>>,
@@ -1139,6 +1175,53 @@ impl TerminalView {
         self.term.lock().selection_to_string().filter(|t| !t.is_empty())
     }
 
+    /// Hand the selection to the project's agent, and clear it, as copying does.
+    fn send_to_agent(&mut self, _: &SendToAgent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.selected_text().filter(|t| !t.trim().is_empty()) else { return };
+        self.term.lock().selection = None;
+        cx.notify();
+        cx.emit(SelectionForAgent { text, cwd: self.cwd() });
+    }
+
+    /// The right-click menu. An app in mouse mode gets right clicks instead (see
+    /// [`Self::on_mouse_down`]).
+    fn right_click_menu(
+        this: WeakEntity<Self>,
+        menu: gpui_kit::component::menu::PopupMenu,
+        cx: &App,
+    ) -> gpui_kit::component::menu::PopupMenu {
+        use gpui_kit::component::menu::PopupMenuItem;
+        let Some(term) = this.upgrade() else { return menu };
+        let (selected, focus) = {
+            let t = term.read(cx);
+            (t.selected_text().is_some(), t.focus.clone())
+        };
+        let (copy, paste) = (this.clone(), this);
+        menu.action_context(focus)
+            .menu_with_icon_and_disabled(
+                "Send to agent",
+                gpui_kit::assets::IconName::SquareTerminal,
+                Box::new(SendToAgent),
+                !selected,
+            )
+            .separator()
+            .item(PopupMenuItem::new("Copy").disabled(!selected).on_click(move |_, _, cx| {
+                let _ = copy.update(cx, |t, cx| {
+                    if let Some(text) = t.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                });
+            }))
+            .item(PopupMenuItem::new("Paste").on_click(move |_, _, cx| {
+                let text = cx.read_from_clipboard().and_then(|c| c.text());
+                let _ = paste.update(cx, |t, _| {
+                    if let Some(text) = text {
+                        t.paste(&text);
+                    }
+                });
+            }))
+    }
+
     /// Put `command` on the shell's command line without running it, for the user to check and
     /// run with Enter. A shell just started isn't reading yet, so this waits (up to three seconds)
     /// for its prompt to turn on bracketed paste: pasted that way, a command of several lines
@@ -1160,6 +1243,18 @@ impl TerminalView {
             });
         })
         .detach();
+    }
+
+    /// Show `screen` (as if the shell printed it) and select its rows `rows`, for tests
+    /// elsewhere that need a selection.
+    #[cfg(test)]
+    pub(crate) fn show_and_select(&mut self, screen: &[u8], rows: Range<i32>) {
+        let mut term = self.term.lock();
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut *term, screen);
+        let mut selection = Selection::new(SelectionType::Lines, Point::new(Line(rows.start), Column(0)), Side::Left);
+        selection.update(Point::new(Line(rows.end - 1), Column(0)), Side::Right);
+        term.selection = Some(selection);
     }
 
     fn paste(&self, text: &str) {
@@ -1347,10 +1442,12 @@ impl Render for TerminalView {
         .left_0()
         .size_full();
 
+        let weak = cx.entity().downgrade();
         div()
             .id("terminal")
             .track_focus(&self.focus)
             .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::send_to_agent))
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll(cx.listener(Self::on_scroll))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -1401,6 +1498,7 @@ impl Render for TerminalView {
                         .child("[process exited]"),
                 )
             })
+            .context_menu(move |menu, _, cx| Self::right_click_menu(weak.clone(), menu, cx))
     }
 }
 
@@ -1420,6 +1518,91 @@ mod tests {
         AppContext as _, Entity, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
         ScrollDelta, ScrollEvent, TestAppContext, WindowBounds, WindowOptions, bounds, point, px, size,
     };
+
+    #[test]
+    fn a_selection_goes_to_the_agent_fenced_with_where_it_came_from() {
+        let dir = std::path::Path::new("/home/me/project");
+        let (label, text) = super::agent_quote("$ cargo test\nerror: oops\n\n", Some(dir));
+        assert_eq!(label, "Terminal · 2 lines");
+        assert_eq!(text, "From my terminal, in /home/me/project:\n```\n$ cargo test\nerror: oops\n```");
+
+        let (label, _) = super::agent_quote("  a single line that is long enough to need cutting short  ", None);
+        assert_eq!(label, "Terminal · a single line that is long enough to nee…");
+        let (label, text) = super::agent_quote("echo ```", None);
+        assert_eq!(label, "Terminal · echo ```");
+        assert_eq!(text, "From my terminal:\n````\necho ```\n````", "a fence the text can't end");
+    }
+
+    #[gpui_kit::test]
+    fn right_click_opens_the_menu_unless_an_app_wants_the_mouse(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, b"$ make\r\nmake: *** No rule");
+        let cx = &mut cx;
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = sent.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&term, move |_, event: &super::SelectionForAgent, _| {
+                seen.borrow_mut().push(event.text.clone())
+            })
+            .detach()
+        });
+        let focus = term.read_with(cx, |t, _| t.focus.clone());
+        let focused = |cx: &mut gpui_kit::VisualTestContext| cx.update(|window, _| focus.is_focused(window));
+
+        // The menu takes the keyboard; its first item sends the selection.
+        term.update(cx, |t, _| t.show_and_select(b"", 0..1));
+        let spot = at(&term, cx, 2, 1, false);
+        cx.simulate_event(mouse(MouseButton::Right, spot, 1, false));
+        cx.simulate_event(MouseUpEvent { button: MouseButton::Right, ..up(spot) });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(!focused(cx), "the menu is open");
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(*sent.borrow(), ["$ make\n"]);
+        assert!(focused(cx), "the keyboard is back in the terminal");
+
+        // An app in mouse mode gets the right click instead.
+        term.update(cx, |t, cx| {
+            let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+            parser.advance(&mut *t.term.lock(), b"\x1b[?1000h\x1b[?1006h");
+            t.sent.borrow_mut().clear();
+            cx.notify();
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_event(mouse(MouseButton::Right, spot, 1, false));
+        cx.run_until_parked();
+        assert!(focused(cx), "no menu");
+        let reported = term.read_with(cx, |t, _| t.sent.borrow().clone());
+        assert_eq!(String::from_utf8_lossy(&reported), "\x1b[<2;3;2M");
+    }
+
+    #[gpui_kit::test]
+    fn send_to_agent_hands_over_the_selection_and_clears_it(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, b"$ make\r\nmake: *** No rule\r\n   ");
+        let cx = &mut cx;
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = sent.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&term, move |_, event: &super::SelectionForAgent, _| {
+                seen.borrow_mut().push(event.text.clone())
+            })
+            .detach()
+        });
+        let focus = term.read_with(cx, |t, _| t.focus.clone());
+        cx.update(|window, cx| window.focus(&focus, cx));
+
+        // Nothing selected, or only blanks: nothing to send.
+        cx.dispatch_action(super::SendToAgent);
+        term.update(cx, |t, _| t.show_and_select(b"", 2..3));
+        cx.dispatch_action(super::SendToAgent);
+        assert!(sent.borrow().is_empty(), "{:?}", sent.borrow());
+
+        term.update(cx, |t, _| t.show_and_select(b"", 0..2));
+        cx.dispatch_action(super::SendToAgent);
+        assert_eq!(sent.borrow().len(), 1);
+        assert!(sent.borrow()[0].starts_with("$ make\nmake: *** No rule"), "{:?}", sent.borrow());
+        assert_eq!(term.read_with(cx, |t, _| t.selected_text()), None, "the selection is cleared");
+    }
 
     #[test]
     fn commands_go_on_the_command_line_without_running() {

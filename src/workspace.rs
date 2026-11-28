@@ -1445,13 +1445,14 @@ impl Workspace {
     fn quote_to_agent(
         &mut self,
         project_id: &str,
+        icon: gpui_kit::assets::IconName,
         label: String,
         text: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(thread) = self.focus_project_agent(project_id, window, cx) else { return };
-        thread.update(cx, |t, cx| t.add_quote(gpui_kit::assets::IconName::FileDiff, label, text, window, cx));
+        thread.update(cx, |t, cx| t.add_quote(icon, label, text, window, cx));
     }
 
     /// Show the project's GitHub tab.
@@ -1610,9 +1611,14 @@ impl Workspace {
                     &review,
                     window,
                     move |this, _, event: &ReviewEvent, window, cx| match event {
-                        ReviewEvent::SendToThread { label, text } => {
-                            this.quote_to_agent(&review_project, label.clone(), text.clone(), window, cx)
-                        }
+                        ReviewEvent::SendToThread { label, text } => this.quote_to_agent(
+                            &review_project,
+                            gpui_kit::assets::IconName::FileDiff,
+                            label.clone(),
+                            text.clone(),
+                            window,
+                            cx,
+                        ),
                     },
                 ));
                 self.reviews.insert(project.id.clone(), review.clone());
@@ -1714,28 +1720,38 @@ impl Workspace {
             )
         });
         let id = project.id.clone();
-        self._subscriptions.push(cx.subscribe(&panes, move |this, panes, event: &PaneEvent, cx| match event {
-            PaneEvent::LayoutChanged => {
-                let layout = panes.read(cx).snapshot(cx);
-                if let Some(project) = this.state.project_mut(&id) {
-                    project.area = layout;
-                    project.layout = None;
+        self._subscriptions.push(cx.subscribe_in(&panes, window, move |this, panes, event: &PaneEvent, window, cx| {
+            match event {
+                PaneEvent::LayoutChanged => {
+                    let layout = panes.read(cx).snapshot(cx);
+                    if let Some(project) = this.state.project_mut(&id) {
+                        project.area = layout;
+                        project.layout = None;
+                    }
+                    // The agent's tab may have come on show.
+                    this.mark_shown_seen(cx);
+                    this.save();
                 }
-                // The agent's tab may have come on show.
-                this.mark_shown_seen(cx);
-                this.save();
-            }
-            PaneEvent::ThreadFocused(thread) => {
-                this.active = Some(thread.clone());
-                this.state.selected_thread = this.active.clone();
-                this.mark_shown_seen(cx);
-                this.save();
-                cx.notify();
-            }
-            PaneEvent::ReviewClosed => {
-                if let Some(changes) = this.changes.get(&id).cloned() {
-                    changes.update(cx, |c, cx| c.set_auto_summarize(None, cx));
+                PaneEvent::ThreadFocused(thread) => {
+                    this.active = Some(thread.clone());
+                    this.state.selected_thread = this.active.clone();
+                    this.mark_shown_seen(cx);
+                    this.save();
+                    cx.notify();
                 }
+                PaneEvent::ReviewClosed => {
+                    if let Some(changes) = this.changes.get(&id).cloned() {
+                        changes.update(cx, |c, cx| c.set_auto_summarize(None, cx));
+                    }
+                }
+                PaneEvent::SendToAgent { label, text } => this.quote_to_agent(
+                    &id,
+                    gpui_kit::assets::IconName::SquareTerminal,
+                    label.clone(),
+                    text.clone(),
+                    window,
+                    cx,
+                ),
             }
         }));
         self._subscriptions.push(cx.observe(&changes, |_, _, cx| cx.notify()));
@@ -3653,6 +3669,26 @@ mod tests {
         assert!(!panes.read_with(cx, |p, _| p.agent_on_show()));
         cx.simulate_keystrokes("ctrl-shift-l");
         assert!(on_prompt(cx), "the agent comes back in a tab of its own");
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_alt_a_sends_a_terminals_selection_to_the_agents_prompt_box(cx: &mut TestAppContext) {
+        let (window, workspace, _, _) = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        let panes = workspace.read_with(cx, |w, _| w.panes.values().next().cloned().unwrap());
+        let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
+        panes.update_in(cx, |p, window, cx| p.split(crate::store::SplitDirection::Right, window, cx));
+        let term = panes.read_with(cx, |p, _| p.active_terminal().unwrap());
+        term.update(cx, |t, _| t.show_and_select(b"$ cargo test\r\nerror[E0308]: mismatched types", 0..2));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        cx.simulate_keystrokes("ctrl-alt-a");
+        let (labels, texts) = thread.read_with(cx, |t, _| t.quote_parts());
+        assert_eq!(labels, ["Terminal · 2 lines"]);
+        assert!(texts[0].contains("```\n$ cargo test\nerror[E0308]: mismatched types\n```"), "{texts:?}");
+        let focused = cx.update(|window, cx| thread.read(cx).prompt_focus(cx).is_focused(window));
+        assert!(focused, "the caret is in the prompt box");
     }
 
     #[gpui_kit::test]

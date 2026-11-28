@@ -19,7 +19,7 @@ use crate::changes::ReviewView;
 use crate::github_view::GitHubView;
 use crate::notes_view::NotesView;
 use crate::store::{AreaLayout, SplitDirection, SplitLayout, TabState};
-use crate::terminal::{TerminalExited, TerminalView};
+use crate::terminal::{SelectionForAgent, TerminalExited, TerminalView};
 use crate::thread::{Status, ThreadView};
 
 pub const CONTEXT: &str = "Panes";
@@ -420,6 +420,8 @@ pub enum PaneEvent {
     ThreadFocused(String),
     /// The review closed.
     ReviewClosed,
+    /// A terminal sent its selection to the agent: put it in the prompt box as a chip.
+    SendToAgent { label: String, text: String },
 }
 
 impl EventEmitter<PaneEvent> for Panes {}
@@ -597,6 +599,10 @@ impl Panes {
                         this.close_entity(id, window, cx);
                     },
                 ));
+                self._subscriptions.push(cx.subscribe(&term, |_, _, event: &SelectionForAgent, cx| {
+                    let (label, text) = crate::terminal::agent_quote(&event.text, event.cwd.as_deref());
+                    cx.emit(PaneEvent::SendToAgent { label, text });
+                }));
                 self._subscriptions.push(cx.observe(&term, |_, _, cx| cx.notify()));
                 Some(term)
             }
@@ -1573,6 +1579,7 @@ mod tests {
                         PaneEvent::LayoutChanged => "layout".into(),
                         PaneEvent::ThreadFocused(id) => format!("focus:{id}"),
                         PaneEvent::ReviewClosed => "review-closed".into(),
+                        PaneEvent::SendToAgent { label, .. } => format!("send:{label}"),
                     })
                 })
                 .detach();

@@ -86,6 +86,14 @@ pub static COMMANDS: &[Command] = &[
         ["ctrl-shift-j"],
         workspace::OpenActivity
     ),
+    command!(
+        "send_to_agent",
+        "Send the terminal's selection to the agent",
+        Projects,
+        crate::terminal::KEY_CONTEXT,
+        ["ctrl-alt-a"],
+        crate::terminal::SendToAgent
+    ),
     command!("settings", "Open settings", Window, WS, ["ctrl-,"], workspace::OpenSettings),
     command!("toggle_sidebar", "Show or hide the sidebar", Window, WS, ["ctrl-shift-s"], workspace::ToggleSidebar),
     // Ctrl+T and Ctrl+W, like a browser. A terminal keeps them for its shell (transpose, delete a
