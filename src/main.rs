@@ -10,6 +10,7 @@ mod caret;
 mod changes;
 mod composer;
 mod demo;
+mod fix_prompt;
 mod fonts;
 mod github;
 mod github_view;

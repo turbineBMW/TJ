@@ -573,6 +573,8 @@ pub struct LineComment {
     pub body: String,
     pub at: String,
     pub reply_to: Option<u64>,
+    /// The diff lines GitHub shows above the comment, ending at its line.
+    pub diff_hunk: String,
 }
 
 #[derive(Clone, Debug)]
@@ -669,6 +671,7 @@ pub fn parse_line_comments(v: &Value) -> Vec<LineComment> {
             body: c["body"].as_str().unwrap_or("").to_string(),
             at: c["created_at"].as_str().unwrap_or("").to_string(),
             reply_to: c["in_reply_to_id"].as_u64(),
+            diff_hunk: c["diff_hunk"].as_str().unwrap_or("").to_string(),
         })
         .collect()
 }
