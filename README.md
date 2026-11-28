@@ -36,6 +36,7 @@ Named after Tony Jay, who voiced Judge Claude Frollo.
   | `Ctrl+Alt+N` / `Ctrl+Alt+P` | Next / previous project (down / up the sidebar, wrapping round). A project comes back as you left it: the same thread, panes and tabs. |
   | `Ctrl+Shift+O` | A new thread in the project on show (its start screen) |
   | `Ctrl+Shift+L` | Back to the project's agent, with the caret in its prompt box, from any tab or split (a terminal, the GitHub tab, the review). A closed agent opens again in its own tab |
+  | `Ctrl+Alt+A` | In a terminal, send the selected text to the project's agent as a chip in its prompt box (with the shell's directory), and put the caret there. Also on the terminal's right-click menu, beside Copy and Paste |
   | `Ctrl+Shift+G` | The project's GitHub tab: pull requests, reviews, merging, branches, pull and push, on the project's own account |
   | `Ctrl+Shift+N` | The project's notes: what was put off for later, added by you or by Claude |
   | `Ctrl+Shift+M` | The Markdown file Claude mentioned last in this thread, in a dialog (←/→ for the others) |
