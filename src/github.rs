@@ -1030,6 +1030,68 @@ pub fn checkout(root: &Path, token: Option<&str>, remote: &str, pr: &PullRequest
     Ok(local)
 }
 
+/// After a merge (and a fetch): move off the pull request's branch onto its base, fast-forward
+/// the base to the remote's, and (`drop_branch`) delete the pull request's local branch when
+/// it holds nothing beyond what was merged (`head_sha`). Returns what it did, for the message.
+/// Nothing is forced: a dirty tree, a base with commits of its own, or a branch with commits
+/// the pull request didn't have are left alone and said so.
+pub fn tidy_after_merge(
+    root: &Path,
+    remote: &str,
+    pr: &PullRequest,
+    head_sha: &str,
+    drop_branch: bool,
+) -> anyhow::Result<String> {
+    let (local, base) = (local_branch_for(pr), pr.base.as_str());
+    let tracking = format!("refs/remotes/{remote}/{base}");
+    let has =
+        |branch: &str| git(root, None, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
+    let mut done = Vec::new();
+    let status = local_status(root)?;
+    let mut current = status.branch.clone();
+    if current.as_deref() == Some(local.as_str()) {
+        if status.dirty > 0 {
+            bail!("staying on {local}: it has uncommitted changes.");
+        }
+        if has(base) {
+            git(root, None, &["switch", "--quiet", base])?;
+        } else {
+            git(root, None, &["switch", "--quiet", "--track", &format!("{remote}/{base}")])?;
+        }
+        done.push(format!("Switched to {base}"));
+        current = Some(base.to_string());
+    }
+    if current.as_deref() == Some(base) {
+        match git(root, None, &["merge", "--ff-only", "--quiet", &tracking]) {
+            Ok(_) => done.push(format!("{base} is up to date")),
+            Err(_) => done.push(format!("{base} has commits {remote} doesn't, so it wasn't updated")),
+        }
+    } else if has(base) {
+        // Not checked out: fast-forward the ref itself (a local fetch refuses anything else).
+        match git(root, None, &["fetch", "--quiet", ".", &format!("{tracking}:refs/heads/{base}")]) {
+            Ok(_) => done.push(format!("{base} is up to date")),
+            Err(_) => done.push(format!("{base} has commits {remote} doesn't, so it wasn't updated")),
+        }
+    }
+    if drop_branch && local != base && has(&local) {
+        // Safe when the branch's tip is part of what was merged; with a squash or rebase merge
+        // that's only the head commit, so without it fall back to the base.
+        let merged = if head_sha.is_empty() { tracking.as_str() } else { head_sha };
+        let branch_ref = format!("refs/heads/{local}");
+        if git(root, None, &["merge-base", "--is-ancestor", &branch_ref, merged]).is_err() {
+            done.push(format!("kept {local}: it has commits the pull request didn't"));
+        } else if git(root, None, &["branch", "--quiet", "-D", &local]).is_ok() {
+            done.push(format!("deleted {local}"));
+        } else {
+            done.push(format!("couldn't delete {local} (checked out in another worktree?)"));
+        }
+    }
+    Ok(match done.join(", ") {
+        text if text.is_empty() => String::new(),
+        text => format!("{text}."),
+    })
+}
+
 // ---------- actions ----------
 
 /// Which workflow runs the Actions page lists.
@@ -1688,6 +1750,89 @@ diff --git a/y.rs b/y.rs\n--- a/y.rs\n+++ b/y.rs\n@@ -10,3 +12,4 @@ fn f()\n ctx
 
         let list = branches(&clone, "origin").unwrap();
         assert!(list.iter().any(|b| b.name == "feat" && !b.remote_only));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// After a squash merge on GitHub: back onto main, main pulled, the merged branch gone; but a
+    /// branch with work the pull request didn't have, or a dirty tree, is left alone.
+    #[test]
+    fn tidying_after_a_merge_pulls_the_base_and_drops_only_merged_branches() {
+        let base = std::env::temp_dir().join(format!("tj-gh-{}", crate::store::new_id()));
+        let (origin, clone, other) = (base.join("origin.git"), base.join("clone"), base.join("other"));
+        std::fs::create_dir_all(&base).unwrap();
+        let sh = |dir: &Path, args: &[&str]| -> String {
+            let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        sh(&base, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        for dir in [&clone, &other] {
+            sh(&base, &["clone", "-q", origin.to_str().unwrap(), dir.to_str().unwrap()]);
+            for args in [
+                &["config", "user.email", "t@example.com"][..],
+                &["config", "user.name", "T"],
+                &["config", "commit.gpgsign", "false"],
+            ] {
+                sh(dir, args);
+            }
+        }
+        sh(&clone, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        sh(&clone, &["push", "-q", "-u", "origin", "main"]);
+        sh(&other, &["pull", "-q", "origin", "main"]);
+        let pr = |number: u64, head: &str| PullRequest {
+            number,
+            title: "t".into(),
+            author: "a".into(),
+            head: head.into(),
+            base: "main".into(),
+            state: PrState::Open,
+            cross_repo: false,
+            review_decision: String::new(),
+            checks: vec![],
+            additions: 0,
+            deletions: 0,
+            changed_files: 0,
+            comments: 0,
+            labels: vec![],
+            updated_at: String::new(),
+            url: String::new(),
+        };
+        // GitHub squash-merges `feat`: a new commit on main, and the branch deleted.
+        let squash = |head: &str| {
+            sh(&other, &["commit", "-q", "--allow-empty", "-m", &format!("squashed {head}")]);
+            sh(&other, &["push", "-q", "origin", "main", &format!(":{head}")]);
+        };
+
+        sh(&clone, &["switch", "-q", "-c", "feat"]);
+        sh(&clone, &["commit", "-q", "--allow-empty", "-m", "feature"]);
+        sh(&clone, &["push", "-q", "-u", "origin", "feat"]);
+        let head = sh(&clone, &["rev-parse", "HEAD"]);
+        squash("feat");
+        fetch(&clone, None, "origin").unwrap();
+        let said = tidy_after_merge(&clone, "origin", &pr(1, "feat"), &head, true).unwrap();
+        assert_eq!(said, "Switched to main, main is up to date, deleted feat.");
+        let status = local_status(&clone).unwrap();
+        assert_eq!((status.branch.as_deref(), status.behind), (Some("main"), 0));
+        assert!(sh(&clone, &["branch", "--list", "feat"]).is_empty());
+
+        // A commit made after the pull request's head keeps the branch.
+        sh(&clone, &["switch", "-q", "-c", "more"]);
+        sh(&clone, &["commit", "-q", "--allow-empty", "-m", "pushed"]);
+        sh(&clone, &["push", "-q", "-u", "origin", "more"]);
+        let head = sh(&clone, &["rev-parse", "HEAD"]);
+        sh(&clone, &["commit", "-q", "--allow-empty", "-m", "not pushed"]);
+        squash("more");
+        fetch(&clone, None, "origin").unwrap();
+        let said = tidy_after_merge(&clone, "origin", &pr(2, "more"), &head, true).unwrap();
+        assert!(said.ends_with("kept more: it has commits the pull request didn't."), "{said}");
+        assert_eq!(sh(&clone, &["branch", "--list", "more"]), "more");
+
+        // Uncommitted changes on the branch: nothing moves.
+        sh(&clone, &["switch", "-q", "-c", "dirty"]);
+        std::fs::write(clone.join("wip.txt"), "wip").unwrap();
+        let err = tidy_after_merge(&clone, "origin", &pr(3, "dirty"), "", true).unwrap_err();
+        assert!(err.to_string().contains("uncommitted"), "{err}");
+        assert_eq!(local_status(&clone).unwrap().branch.as_deref(), Some("dirty"));
         let _ = std::fs::remove_dir_all(&base);
     }
 }
