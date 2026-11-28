@@ -93,6 +93,15 @@ pub struct TerminalView {
     origin: gpui_kit::Point<Pixels>,
     /// A drag is selecting text.
     selecting: bool,
+    /// Where the selecting drag last was, so it keeps scrolling while held above or below the grid.
+    drag_at: Option<gpui_kit::Point<Pixels>>,
+    /// The loop scrolling the view while a selecting drag is held above or below the grid.
+    autoscroll: Option<Task<()>>,
+    /// How far past `display_offset` the scrollback is shown, in pixels toward older lines
+    /// (`0..cell.height`): scrolling moves the grid smoothly, not a line at a time.
+    scroll_px: f32,
+    /// Scrolling that hasn't made a whole line yet, for apps sent the wheel as keys or buttons.
+    wheel_rest: f32,
     /// The button an app in mouse mode saw pressed (for drag motion and the release).
     reported_button: Option<u8>,
     /// The last cell reported to the app, so motion within one cell isn't repeated.
@@ -189,6 +198,10 @@ impl TerminalView {
                 _pump: pump,
                 origin: gpui_kit::Point::default(),
                 selecting: false,
+                drag_at: None,
+                autoscroll: None,
+                scroll_px: 0.0,
+                wheel_rest: 0.0,
                 reported_button: None,
                 last_reported: None,
                 caret: Default::default(),
@@ -274,6 +287,7 @@ impl TerminalView {
         self.cell_font = cx.theme().mono_font_family.clone();
         self.scale = scale;
         self.cell = cell_size(window, cx);
+        self.scroll_px = 0.0;
         {
             let mut g = self.geometry.lock().unwrap();
             g.scale = scale;
@@ -319,7 +333,7 @@ impl TerminalView {
                 cx.stop_propagation();
                 return;
             }
-            self.term.lock().scroll_display(Scroll::Bottom);
+            self.scroll_to_bottom();
             self.write(b"\x03".to_vec());
             cx.stop_propagation();
             return;
@@ -332,40 +346,63 @@ impl TerminalView {
 
         if let Some(bytes) = key_to_bytes(ks, mode) {
             // Typing goes to the prompt at the bottom; a selection there would be stale.
-            let mut term = self.term.lock();
-            term.scroll_display(Scroll::Bottom);
-            term.selection = None;
-            drop(term);
+            self.scroll_to_bottom();
+            self.term.lock().selection = None;
             self.write(bytes);
             cx.stop_propagation();
         }
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let lines = (event.delta.pixel_delta(self.cell.height).y / self.cell.height).round() as i32;
+        let pixels = f32::from(event.delta.pixel_delta(self.cell.height).y);
+        let app_wants_mouse = self.app_wants_mouse(&event.modifiers);
+        let alt_screen = self.term.lock().mode().contains(TermMode::ALT_SCREEN);
+        if !app_wants_mouse && !alt_screen {
+            self.wheel_rest = 0.0;
+            if self.scroll_pixels(pixels) {
+                cx.notify();
+            }
+            return;
+        }
+        // Apps get whole lines; a touchpad's small steps add up to them instead of being lost.
+        let height = f32::from(self.cell.height);
+        self.wheel_rest += pixels;
+        let lines = (self.wheel_rest / height).trunc() as i32;
+        self.wheel_rest -= lines as f32 * height;
         if lines == 0 {
             return;
         }
-        // An app in mouse mode gets the wheel as buttons 64 (up) and 65 (down).
-        if self.app_wants_mouse(&event.modifiers) {
+        if app_wants_mouse {
+            // An app in mouse mode gets the wheel as buttons 64 (up) and 65 (down).
             let button = if lines > 0 { 64 } else { 65 };
             for _ in 0..lines.unsigned_abs() {
                 self.report_mouse(button, event.position, &event.modifiers, true);
             }
-            return;
-        }
-        let mut term = self.term.lock();
-        if term.mode().contains(TermMode::ALT_SCREEN) {
+        } else {
             // Full-screen apps (less, vim) get arrow keys instead of scrollback.
             let key: &[u8] = if lines > 0 { b"\x1bOA" } else { b"\x1bOB" };
-            let bytes = key.repeat(lines.unsigned_abs() as usize);
-            drop(term);
-            self.write(bytes);
-        } else {
-            term.scroll_display(Scroll::Delta(lines));
-            drop(term);
-            cx.notify();
+            self.write(key.repeat(lines.unsigned_abs() as usize));
         }
+    }
+
+    /// Move the scrollback `pixels` toward older lines (negative: toward the prompt), keeping
+    /// the part of a line left over in `scroll_px`. Returns whether the view moved.
+    fn scroll_pixels(&mut self, pixels: f32) -> bool {
+        let height = f32::from(self.cell.height);
+        let mut term = self.term.lock();
+        let history = term.grid().history_size();
+        let offset = term.grid().display_offset();
+        let now = offset as f32 * height + self.scroll_px;
+        let target = (now + pixels).clamp(0.0, history as f32 * height);
+        let new_offset = ((target / height).floor() as usize).min(history);
+        self.scroll_px = target - new_offset as f32 * height;
+        term.scroll_display(Scroll::Delta(new_offset as i32 - offset as i32));
+        target != now
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.term.lock().scroll_display(Scroll::Bottom);
+        self.scroll_px = 0.0;
     }
 }
 
@@ -911,7 +948,7 @@ impl TerminalView {
     /// The grid cell under a window position, clamped to the grid, and which half of it.
     fn cell_at(&self, position: gpui_kit::Point<Pixels>) -> (usize, usize, Side) {
         let x = (position.x - self.origin.x) / self.cell.width;
-        let y = (position.y - self.origin.y) / self.cell.height;
+        let y = (position.y - self.origin.y - px(self.scroll_px)) / self.cell.height;
         let col = (x.max(0.0).floor() as usize).min(self.size.cols.saturating_sub(1));
         let row = (y.max(0.0).floor() as usize).min(self.size.rows.saturating_sub(1));
         let side = if x < 0.0 {
@@ -989,13 +1026,9 @@ impl TerminalView {
             if event.pressed_button != Some(MouseButton::Left) {
                 return;
             }
-            let (col, row, side) = self.cell_at(event.position);
-            let mut term = self.term.lock();
-            let point = Point::new(Line(row as i32 - term.grid().display_offset() as i32), Column(col));
-            if let Some(selection) = term.selection.as_mut() {
-                selection.update(point, side);
-            }
-            drop(term);
+            self.drag_at = Some(event.position);
+            self.extend_selection(event.position);
+            self.start_autoscroll(cx);
             cx.notify();
             return;
         }
@@ -1012,9 +1045,77 @@ impl TerminalView {
         }
     }
 
+    /// Move the selection's free end to the cell under `position` (clamped to the grid).
+    fn extend_selection(&mut self, position: gpui_kit::Point<Pixels>) {
+        let (col, row, side) = self.cell_at(position);
+        let mut term = self.term.lock();
+        let point = Point::new(Line(row as i32 - term.grid().display_offset() as i32), Column(col));
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(point, side);
+        }
+    }
+
+    /// How fast a selecting drag held `position` scrolls, in pixels per frame toward older
+    /// lines: none inside the grid, faster the further above or below it.
+    fn autoscroll_speed(&self, position: gpui_kit::Point<Pixels>) -> f32 {
+        let height = f32::from(self.cell.height);
+        let top = f32::from(self.origin.y);
+        let bottom = top + height * self.size.rows as f32;
+        let y = f32::from(position.y);
+        let speed = |distance: f32| (2.0 + distance / 4.0).min(height * 3.0);
+        if y < top {
+            speed(top - y)
+        } else if y > bottom {
+            -speed(y - bottom)
+        } else {
+            0.0
+        }
+    }
+
+    /// While a selecting drag is held above or below the grid, scroll every frame and keep
+    /// extending the selection, as other terminals do; the mouse needn't move.
+    fn start_autoscroll(&mut self, cx: &mut Context<Self>) {
+        let held = self.drag_at.is_some_and(|at| self.autoscroll_speed(at) != 0.0);
+        if !held || self.autoscroll.is_some() {
+            return;
+        }
+        self.autoscroll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+                let more = this.update(cx, |t, cx| t.autoscroll_step(cx)).unwrap_or(false);
+                if !more {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// One frame of [`Self::start_autoscroll`]; false once the drag ends or comes back inside.
+    fn autoscroll_step(&mut self, cx: &mut Context<Self>) -> bool {
+        let speed = match self.drag_at {
+            Some(at) if self.selecting => self.autoscroll_speed(at),
+            _ => 0.0,
+        };
+        if speed == 0.0 {
+            // Finished (the task ends after this returns), so the next drag starts a new one.
+            if let Some(task) = self.autoscroll.take() {
+                task.detach();
+            }
+            return false;
+        }
+        if self.scroll_pixels(speed)
+            && let Some(at) = self.drag_at
+        {
+            self.extend_selection(at);
+            cx.notify();
+        }
+        true
+    }
+
     fn on_window_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
         if self.selecting && event.button == MouseButton::Left {
             self.selecting = false;
+            self.drag_at = None;
             self.copy_selection_to_primary(cx);
         }
         if let Some(button) = self.reported_button.take() {
@@ -1090,30 +1191,13 @@ impl Render for TerminalView {
         let mut cursor_cell: Option<(char, bool, Font)> = None;
         let selection_bg = cx.theme().selection;
         let metrics = LineMetrics::of(&base_font, window);
-
-        let rows = self.size.rows;
-        let mut lines: Vec<GridLine> = (0..rows).map(|_| GridLine::default()).collect();
-        let mut image_cells: Vec<ImageCell> = Vec::new();
-
-        for indexed in content.display_iter {
-            let row = indexed.point.line.0 + offset;
-            if row < 0 || row as usize >= rows {
-                continue;
-            }
-            let cell = indexed.cell;
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let col = indexed.point.column.0;
-            let line = &mut lines[row as usize];
-
-            // An image's cell: drawn below as part of its image, so no text or background.
-            if let Some((id, image_row, image_col)) = crate::images::decode_cell(cell.c, cell.fg, cell.bg) {
-                image_cells.push(ImageCell { row: row as usize, col, id, image_row, image_col });
-                line.push(col, ' ', None, fg, base_font.clone());
-                continue;
-            }
-
+        // The history above may have been cleared, or this is the alternate screen.
+        if content.display_offset >= term.grid().history_size() {
+            self.scroll_px = 0.0;
+        }
+        // A cell's colours, decorations and font go on its line; returns the font it's drawn in.
+        let draw = |line: &mut GridLine, point: Point, cell: &alacritty_terminal::term::cell::Cell| -> Font {
+            let col = point.column.0;
             let mut cell_fg = palette.resolve(cell.fg, cell.flags, true).unwrap_or(fg);
             let mut cell_bg = palette.resolve(cell.bg, cell.flags, false);
             if cell.flags.contains(Flags::INVERSE) {
@@ -1124,7 +1208,7 @@ impl Render for TerminalView {
             if cell.flags.contains(Flags::DIM) {
                 cell_fg = cell_fg.opacity(0.7);
             }
-            if selection.is_some_and(|s| s.contains(indexed.point)) {
+            if selection.is_some_and(|s| s.contains(point)) {
                 cell_bg = Some(selection_bg);
             }
 
@@ -1152,10 +1236,58 @@ impl Render for TerminalView {
             if let Some(family) = fallback.as_ref().and_then(|f| f.family_for(ch)) {
                 run_font.family = family.clone();
             }
-            if indexed.point == cursor.point {
-                cursor_cell = Some((cell.c, cell.flags.contains(Flags::WIDE_CHAR), run_font.clone()));
+            line.push(col, ch, zerowidth, cell_fg, run_font.clone());
+            run_font
+        };
+
+        let rows = self.size.rows;
+        let mut lines: Vec<GridLine> = (0..rows).map(|_| GridLine::default()).collect();
+        let mut image_cells: Vec<ImageCell> = Vec::new();
+
+        for indexed in content.display_iter {
+            let row = indexed.point.line.0 + offset;
+            if row < 0 || row as usize >= rows {
+                continue;
             }
-            line.push(col, ch, zerowidth, cell_fg, run_font);
+            let cell = indexed.cell;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let col = indexed.point.column.0;
+            let line = &mut lines[row as usize];
+
+            // An image's cell: drawn below as part of its image, so no text or background.
+            if let Some((id, image_row, image_col)) = crate::images::decode_cell(cell.c, cell.fg, cell.bg) {
+                image_cells.push(ImageCell { row: row as usize, col, id, image_row, image_col });
+                line.push(col, ' ', None, fg, base_font.clone());
+                continue;
+            }
+
+            let run_font = draw(line, indexed.point, cell);
+            if indexed.point == cursor.point {
+                cursor_cell = Some((cell.c, cell.flags.contains(Flags::WIDE_CHAR), run_font));
+            }
+        }
+
+        // Scrolled part of a line back: the line above the grid shows at the top.
+        let shift = self.scroll_px;
+        let mut above = None;
+        if shift > 0.0 {
+            let line = Line(-offset - 1);
+            let mut grid_line = GridLine::default();
+            for col in 0..term.columns() {
+                let point = Point::new(line, Column(col));
+                let cell = &term.grid()[point];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                if crate::images::decode_cell(cell.c, cell.fg, cell.bg).is_some() {
+                    grid_line.push(col, ' ', None, fg, base_font.clone());
+                } else {
+                    draw(&mut grid_line, point, cell);
+                }
+            }
+            above = Some(grid_line);
         }
         drop(term);
 
@@ -1187,7 +1319,8 @@ impl Render for TerminalView {
                 };
                 cx.defer(move |cx| {
                     this.update(cx, |t, cx| {
-                        t.origin = bounds.origin;
+                        // Where row 0 sits with no part-line scrolled (`cell_at` adds that).
+                        t.origin = point(bounds.origin.x, bounds.origin.y - px(shift));
                         t.resize(size, cx)
                     })
                 });
@@ -1230,25 +1363,32 @@ impl Render for TerminalView {
             .bg(bg)
             .p_2()
             .child(
-                div()
-                    .relative()
-                    .size_full()
-                    .child(
-                        canvas(
-                            |_, _, _| {},
-                            move |bounds, _, window, _| {
-                                let origin = snap_point(bounds.origin, window.scale_factor());
-                                for (row, line) in lines.iter().enumerate() {
-                                    let top = point(origin.x, origin.y + cell.height * row as f32);
-                                    line.paint(top, cell, metrics, window);
-                                }
-                            },
+                // The grid moves down by the part of a line scrolled back, under this edge.
+                div().size_full().overflow_hidden().child(
+                    div()
+                        .relative()
+                        .top(px(shift))
+                        .size_full()
+                        .child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    let origin = snap_point(bounds.origin, window.scale_factor());
+                                    if let Some(line) = &above {
+                                        line.paint(point(origin.x, origin.y - cell.height), cell, metrics, window);
+                                    }
+                                    for (row, line) in lines.iter().enumerate() {
+                                        let top = point(origin.x, origin.y + cell.height * row as f32);
+                                        line.paint(top, cell, metrics, window);
+                                    }
+                                },
+                            )
+                            .size_full(),
                         )
-                        .size_full(),
-                    )
-                    .children(image_slices)
-                    .children(cursor_overlay)
-                    .child(measure),
+                        .children(image_slices)
+                        .children(cursor_overlay)
+                        .child(measure),
+                ),
             )
             .when(self.exited, |el| {
                 el.child(
@@ -1273,11 +1413,12 @@ impl Focusable for TerminalView {
 #[cfg(test)]
 mod tests {
     use super::{TermMode, TerminalView, command_line_bytes, key_to_bytes, mouse_report};
+    use alacritty_terminal::grid::Dimensions as _;
     use alacritty_terminal::tty::Shell;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
         AppContext as _, Entity, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-        TestAppContext, WindowBounds, WindowOptions, bounds, point, px, size,
+        ScrollDelta, ScrollEvent, TestAppContext, WindowBounds, WindowOptions, bounds, point, px, size,
     };
 
     #[test]
@@ -1524,6 +1665,85 @@ mod tests {
         cx.simulate_event(mouse(MouseButton::Left, line, 3, false));
         cx.simulate_event(up(line));
         assert_eq!(term.read_with(cx, |t, _| t.selected_text()).as_deref().map(str::trim_end), Some("second line"));
+    }
+
+    /// A screen of `count` numbered lines, most of them in the scrollback.
+    fn numbered_lines(count: usize) -> Vec<u8> {
+        (0..count).map(|i| format!("line {i}\r\n")).collect::<String>().into_bytes()
+    }
+
+    /// The scrollback position: lines scrolled back, and the part of a line past that.
+    fn scrolled(term: &Entity<TerminalView>, cx: &mut gpui_kit::VisualTestContext) -> (usize, f32) {
+        term.read_with(cx, |t, _| (t.term.lock().grid().display_offset(), t.scroll_px / f32::from(t.cell.height)))
+    }
+
+    fn scroll_lines(term: &Entity<TerminalView>, cx: &mut gpui_kit::VisualTestContext, lines: f32) {
+        let position = at(term, cx, 5, 5, false);
+        let height = term.read_with(cx, |t, _| t.cell.height);
+        let delta = ScrollDelta::Pixels(point(px(0.), height * lines));
+        cx.simulate_event(ScrollEvent { position, delta, ..Default::default() });
+        cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    #[gpui_kit::test]
+    fn scrolling_moves_the_scrollback_smoothly(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, &numbered_lines(100));
+        let cx = &mut cx;
+        let close = |(lines, part): (usize, f32), want: (usize, f32)| lines == want.0 && (part - want.1).abs() < 0.01;
+
+        // Half a line is kept (and drawn), not rounded away; it adds up with the next step.
+        scroll_lines(&term, cx, 0.5);
+        assert!(close(scrolled(&term, cx), (0, 0.5)), "{:?}", scrolled(&term, cx));
+        scroll_lines(&term, cx, 0.75);
+        assert!(close(scrolled(&term, cx), (1, 0.25)), "{:?}", scrolled(&term, cx));
+
+        // It stops at the prompt, lined up.
+        scroll_lines(&term, cx, -3.0);
+        assert_eq!(scrolled(&term, cx), (0, 0.0));
+
+        // And at the top of the scrollback.
+        scroll_lines(&term, cx, 1000.0);
+        let history = term.read_with(cx, |t, _| t.term.lock().grid().history_size());
+        assert_eq!(scrolled(&term, cx), (history, 0.0));
+
+        // Typing goes back to the prompt.
+        let inside = at(&term, cx, 5, 5, false);
+        cx.simulate_event(mouse(MouseButton::Left, inside, 1, false));
+        cx.simulate_event(up(inside));
+        scroll_lines(&term, cx, -2.5);
+        assert_ne!(scrolled(&term, cx), (0, 0.0));
+        cx.simulate_keystrokes("x");
+        assert_eq!(scrolled(&term, cx), (0, 0.0));
+    }
+
+    #[gpui_kit::test]
+    fn a_selecting_drag_held_above_the_grid_scrolls_back(cx: &mut TestAppContext) {
+        let (term, mut cx) = terminal_showing(cx, &numbered_lines(100));
+        let cx = &mut cx;
+        let start = at(&term, cx, 0, 2, false);
+        cx.simulate_event(mouse(MouseButton::Left, start, 1, false));
+        let above = point(start.x, term.read_with(cx, |t, _| t.origin.y) - px(5.));
+        let held = MouseMoveEvent {
+            position: above,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        };
+        cx.simulate_event(held);
+
+        // The view keeps scrolling while the mouse is held still, and the selection grows with it.
+        cx.executor().advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+        let (back, _) = scrolled(&term, cx);
+        assert!(back > 0, "didn't scroll");
+        let selected = term.read_with(cx, |t, _| t.selected_text()).unwrap_or_default();
+        assert!(selected.lines().count() > 3, "{selected:?}");
+
+        // Letting go stops it.
+        cx.simulate_event(up(above));
+        let stopped = scrolled(&term, cx);
+        cx.executor().advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+        assert_eq!(scrolled(&term, cx), stopped);
     }
 
     #[gpui_kit::test]
