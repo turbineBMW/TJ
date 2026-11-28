@@ -497,6 +497,7 @@ impl GitHubView {
                 let polled = this.update(cx, |this: &mut Self, cx| {
                     this.load_local(cx);
                     this.poll_runs(cx);
+                    this.poll_detail(cx);
                 });
                 if polled.is_err() {
                     break;
@@ -579,8 +580,18 @@ impl GitHubView {
                 this.detail_loading = false;
                 match result {
                     Ok(detail) => {
-                        let files = crate::changes::from_patch(&detail.patch).map(|c| c.diff_files).unwrap_or_default();
-                        this.diff.update(cx, |d, cx| d.set_files(files, cx));
+                        // Read again for its checks, the diff is usually the same; setting it
+                        // anyway would drop the selection and expanded context.
+                        if this.detail.as_ref().is_none_or(|d| d.patch != detail.patch) {
+                            let files =
+                                crate::changes::from_patch(&detail.patch).map(|c| c.diff_files).unwrap_or_default();
+                            this.diff.update(cx, |d, cx| d.set_files(files, cx));
+                        }
+                        // The list row shows the same checks, so it doesn't sit at "running" either.
+                        if let Some(row) = this.prs.iter_mut().find(|p| p.number == number) {
+                            row.checks = detail.pr.checks.clone();
+                            row.state = detail.pr.state;
+                        }
                         let people: Vec<String> = detail
                             .timeline
                             .iter()
@@ -745,6 +756,19 @@ impl GitHubView {
         let jobs_going = self.jobs.as_ref().is_some_and(|(_, jobs)| jobs.iter().any(|j| j.state.active()));
         if jobs_going || self.runs.iter().any(|r| r.state.active()) {
             self.load_runs(cx);
+        }
+    }
+
+    /// While the Pull requests page is open and the picked one has checks still running, read it
+    /// again, so they move on to passed or failed without leaving the page.
+    fn poll_detail(&mut self, cx: &mut Context<Self>) {
+        if self.page != Page::PullRequests || self.detail_loading {
+            return;
+        }
+        if let Some(number) = self.selected
+            && self.detail.as_ref().is_some_and(|d| d.pr.number == number && d.pr.checks_running())
+        {
+            self.load_detail(number, cx);
         }
     }
 
