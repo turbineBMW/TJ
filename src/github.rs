@@ -416,6 +416,13 @@ impl PullRequest {
     pub fn checks_state(&self) -> ChecksState {
         roll_up(&self.checks)
     }
+
+    /// Some check hasn't finished, on a pull request that can still change. The roll-up can't
+    /// say: a failed check wins it while others are still going.
+    pub fn checks_running(&self) -> bool {
+        matches!(self.state, PrState::Open | PrState::Draft)
+            && self.checks.iter().any(|c| c.state == ChecksState::Pending)
+    }
 }
 
 pub fn roll_up(checks: &[Check]) -> ChecksState {
@@ -1501,6 +1508,23 @@ diff --git a/y.rs b/y.rs\n--- a/y.rs\n+++ b/y.rs\n@@ -10,3 +12,4 @@ fn f()\n ctx
         assert_eq!(roll_up(&[]), ChecksState::None);
         assert_eq!(roll_up(&[check(ChecksState::Passing), check(ChecksState::Pending)]), ChecksState::Pending);
         assert_eq!(roll_up(&[check(ChecksState::Pending), check(ChecksState::Failing)]), ChecksState::Failing);
+    }
+
+    #[test]
+    fn checks_run_until_none_is_pending_or_the_pull_request_is_done() {
+        let check = |state| Check { name: "c".into(), state, status: String::new(), url: None };
+        let v: Value = serde_json::from_str(r#"{"state":"OPEN"}"#).unwrap();
+        let mut pr = parse_pull_request(&v);
+        assert!(!pr.checks_running());
+        pr.checks = vec![check(ChecksState::Failing), check(ChecksState::Pending)];
+        assert!(pr.checks_running());
+        pr.state = PrState::Draft;
+        assert!(pr.checks_running());
+        pr.state = PrState::Merged;
+        assert!(!pr.checks_running());
+        pr.state = PrState::Open;
+        pr.checks = vec![check(ChecksState::Failing), check(ChecksState::Passing)];
+        assert!(!pr.checks_running());
     }
 
     #[test]
