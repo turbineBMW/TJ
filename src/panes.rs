@@ -551,6 +551,7 @@ impl Panes {
                     TabState::Review => once(&mut placed.review).then(|| View::Review(self.review.clone())),
                     TabState::GitHub => once(&mut placed.github).then(|| View::GitHub(self.github.clone())),
                     TabState::Notes => once(&mut placed.notes).then(|| View::Notes(self.notes.clone())),
+                    TabState::Unknown => None,
                 }?;
                 Some(self.leaf(view))
             }
@@ -1366,7 +1367,7 @@ fn view_label(view: &View, cx: &App) -> (String, Option<Hsla>) {
             (tab_title(t.title(), t.cwd()), None)
         }
         View::Review(review) => (review.read(cx).title(cx), None),
-        View::GitHub(github) => (github.read(cx).title(), None),
+        View::GitHub(github) => (github.read(cx).title(cx), None),
         View::Notes(notes) => (notes.read(cx).title(cx), None),
     }
 }
@@ -1526,8 +1527,20 @@ mod tests {
                 let thread = cx.new(|cx| ThreadView::new(Backend::Scripted(Vec::new()), window, cx));
                 let changes = cx.new(|cx| ProjectChanges::new(project.clone(), cx));
                 let review = cx.new(|cx| ReviewView::new(changes.clone(), true, cx));
-                let github = cx.new(|cx| crate::github_view::GitHubView::new(project.clone(), None, None, window, cx));
                 let store = cx.new(|cx| crate::notes::NotesStore::new(&project.join(".notes-test"), cx));
+                let tracked = cx.new(|cx| {
+                    crate::prs_view::PrsView::new(
+                        store.clone(),
+                        gpui_kit::WeakEntity::new_invalid(),
+                        "p1".into(),
+                        "proj".into(),
+                        project.clone(),
+                        true,
+                        cx,
+                    )
+                });
+                let github =
+                    cx.new(|cx| crate::github_view::GitHubView::new(project.clone(), tracked, None, None, window, cx));
                 let notes = cx.new(|cx| {
                     crate::notes_view::NotesView::new(
                         store,
@@ -1937,6 +1950,8 @@ mod tests {
                 SplitLayout::Pane { view: TabState::GitHub },
                 // Each one-of-a-kind view is shown once.
                 SplitLayout::Pane { view: TabState::Review },
+                // A tab another build saved is left out.
+                SplitLayout::Pane { view: TabState::Unknown },
             ],
             active: 2,
         };

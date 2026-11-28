@@ -21,6 +21,8 @@ pub fn init(cx: &mut App) {
     cx.bind_keys(crate::changes::bindings());
     // Moving through notes and acting on them in the Notes tab.
     cx.bind_keys(crate::notes_view::bindings());
+    // Moving through tracked pull requests and acting on them in the PRs tab.
+    cx.bind_keys(crate::prs_view::bindings());
     // The shortcuts settings can change: Vmux's pane and tab keys inside the main area, and the
     // window-wide ones (projects, the switcher, settings, the sidebar).
     crate::keybindings::apply(cx);

@@ -1,5 +1,5 @@
 //! `tj notes-mcp`: a small MCP server, over stdio, that lets Claude read and change a project's
-//! notes ([`crate::notes`]). TJ gives it to every Claude session it starts, with the project's
+//! notes ([`crate::notes`]) and the pull requests it keeps track of ([`crate::tracked`]). TJ gives it to every Claude session it starts, with the project's
 //! notes file and the thread the session belongs to, so a note Claude adds knows where it was
 //! written.
 //!
@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use crate::notes::{self, Author, Kind, NewNote, NoteStatus, Source};
+use crate::tracked::{self, PrStatus, TrackedPr};
 
 /// What the server works on, from its command line.
 #[derive(Clone, Debug, Default)]
@@ -175,6 +176,58 @@ fn tools() -> Value {
                 "required": ["number"]
             },
             "annotations": {"destructiveHint": true}
+        },
+        {
+            "name": "pr_track",
+            "description": "Keep track of a pull request, merge request or mailed patch series this project sent out, on any repository or host (GitHub, GitLab, a mailing list). It shows on the GitHub tab's Other repos page, where TJ keeps its state fresh. Call it right after you open one. Tracking the same address again only updates its note and folder.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Its web address: the PR or MR page, or the patch's lore.kernel.org or patchwork link"},
+                    "title": {"type": "string", "description": "For links TJ can't read (a mailed patch): its subject. GitHub and GitLab ones get theirs from the host"},
+                    "note": {"type": "string", "description": "One line: what it's for, or what it's waiting on"},
+                    "folder": {"type": "string", "description": "The local checkout its branch is in (absolute path)"},
+                    "status": {"type": "string", "enum": ["open", "draft", "merged", "closed"], "description": "For links TJ can't read (mailing lists, other hosts). Default: open"}
+                },
+                "required": ["url"]
+            }
+        },
+        {
+            "name": "pr_list",
+            "description": "List the pull requests this project is keeping track of, with their state, checks, review and note. By default only the ones still open (open or draft).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["active", "open", "draft", "merged", "closed", "all"], "description": "Which to list (default: active)"},
+                    "refresh": {"type": "boolean", "description": "Read the latest state from GitHub and GitLab first (slower)"}
+                }
+            },
+            "annotations": {"readOnlyHint": true}
+        },
+        {
+            "name": "pr_update",
+            "description": "Change a tracked pull request: its note, its folder, or (for links TJ can't read, like a mailed patch) its status and title. GitHub and GitLab ones get their status from the host.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "status": {"type": "string", "enum": ["open", "draft", "merged", "closed"]},
+                    "title": {"type": "string"},
+                    "note": {"type": "string", "description": "Replaces the note; empty clears it"},
+                    "folder": {"type": "string"}
+                },
+                "required": ["url"]
+            }
+        },
+        {
+            "name": "pr_untrack",
+            "description": "Stop keeping track of a pull request. Merged and closed ones can stay; untrack only ones tracked by mistake or no longer wanted.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            },
+            "annotations": {"destructiveHint": true}
         }
     ])
 }
@@ -318,8 +371,144 @@ fn call(name: &str, args: &Value, cx: &Context) -> anyhow::Result<String> {
                 Ok(format!("Deleted note #{number}."))
             })
         }
+        "pr_track" => {
+            let url = string(args, "url").unwrap_or_default();
+            let mut pr = TrackedPr::new(&url, Author::Agent)
+                .ok_or_else(|| anyhow::anyhow!("{url:?} isn't a web address (https://...)"))?;
+            let folder = string(args, "folder").filter(|f| !f.trim().is_empty()).map(PathBuf::from);
+            let (branch, commit) = notes::git_state(folder.as_deref().unwrap_or(&cx.project_dir));
+            let prompt = cx.transcript.as_deref().and_then(notes::prompts_in);
+            pr.source = Some(Source { thread: cx.thread.clone(), prompt, branch, commit });
+            pr.folder = folder;
+            pr.note = string(args, "note").unwrap_or_default().trim().to_string();
+            pr.title = string(args, "title").unwrap_or_default().trim().to_string();
+            if let Some(status) = status(args)? {
+                pr.status = status;
+            }
+            // Read it now, so the answer says what it is (and a wrong address shows at once).
+            let read = tracked::fetch(&pr);
+            match &read {
+                Ok(Some(fresh)) => pr.apply(fresh.clone()),
+                Ok(None) => {}
+                Err(err) => pr.failed(format!("{err:#}")),
+            }
+            let line = pr_line(&pr);
+            let url = pr.url.clone();
+            let new = notes::update(&cx.file, &cx.project_name, &cx.project_dir, |book| {
+                let new = book.track(pr.clone());
+                // Tracked before: it still takes what was just read.
+                if !new && let (Some(old), Ok(Some(fresh))) = (book.tracked_mut(&url), &read) {
+                    old.apply(fresh.clone());
+                }
+                new
+            })?;
+            let lead = if new { "Tracking" } else { "Already tracking" };
+            let mut out =
+                format!("{lead} {line}\nThe user sees it on the GitHub tab's Other repos page (Ctrl+Shift+G).");
+            if let Err(err) = read {
+                out.push_str(&format!("\nCouldn't read its state yet: {err:#}"));
+            }
+            Ok(out)
+        }
+        "pr_list" => {
+            let which = string(args, "status").unwrap_or_else(|| "active".into());
+            let keep = |status: PrStatus| match which.as_str() {
+                "all" => true,
+                "active" | "pending" => status.is_active(),
+                other => PrStatus::parse(other) == Some(status),
+            };
+            if args.get("refresh").and_then(Value::as_bool).unwrap_or(false) {
+                let book = notes::load(&cx.file).unwrap_or_default();
+                let stale: Vec<TrackedPr> =
+                    book.prs.into_iter().filter(|p| keep(p.status) && p.forge.refreshes()).collect();
+                let results = tracked::fetch_all(stale);
+                edit(&mut |book| {
+                    for (url, result) in &results {
+                        if let Some(pr) = book.tracked_mut(url) {
+                            match result {
+                                Ok(Some(fresh)) => pr.apply(fresh.clone()),
+                                Ok(None) => {}
+                                Err(err) => pr.failed(format!("{err:#}")),
+                            }
+                        }
+                    }
+                    Ok(String::new())
+                })?;
+            }
+            let book = notes::load(&cx.file).unwrap_or_default();
+            let lines: Vec<String> = book.prs.iter().filter(|p| keep(p.status)).map(pr_line).collect();
+            Ok(if lines.is_empty() { format!("No {which} pull requests tracked.") } else { lines.join("\n") })
+        }
+        "pr_update" => {
+            let url = string(args, "url").unwrap_or_default();
+            let status = status(args)?;
+            let (title, note, folder) = (string(args, "title"), string(args, "note"), string(args, "folder"));
+            edit(&mut |book| {
+                let pr = book.tracked_mut(&url).ok_or_else(|| anyhow::anyhow!("{url} isn't tracked"))?;
+                if let Some(status) = status {
+                    pr.status = status;
+                }
+                if let Some(title) = title.as_ref().filter(|t| !t.trim().is_empty()) {
+                    pr.title = title.trim().to_string();
+                }
+                if let Some(note) = &note {
+                    pr.note = note.trim().to_string();
+                }
+                if let Some(folder) = &folder {
+                    pr.folder = Some(PathBuf::from(folder.trim())).filter(|f| !f.as_os_str().is_empty());
+                }
+                let mut out = format!("Updated {}", pr_line(pr));
+                if status.is_some() && pr.forge.refreshes() {
+                    out.push_str(&format!("\n{} sets its status itself; the next refresh replaces this one.", pr.host));
+                }
+                Ok(out)
+            })
+        }
+        "pr_untrack" => {
+            let url = string(args, "url").unwrap_or_default();
+            edit(&mut |book| {
+                let pr = book.untrack(&url).ok_or_else(|| anyhow::anyhow!("{url} isn't tracked"))?;
+                Ok(format!("Stopped tracking {}.", pr.reference()))
+            })
+        }
         _ => anyhow::bail!("Unknown tool {name}"),
     }
+}
+
+fn status(args: &Value) -> anyhow::Result<Option<PrStatus>> {
+    match string(args, "status") {
+        None => Ok(None),
+        Some(name) => PrStatus::parse(&name)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("Unknown status {name:?}: use open, draft, merged or closed")),
+    }
+}
+
+/// One tracked PR in a line: `[open] o/r#12 Fix it (checks passing, approved) — note — url`.
+fn pr_line(pr: &TrackedPr) -> String {
+    let mut line = format!("[{}] {}", pr.status.name(), pr.reference());
+    if !pr.title.is_empty() {
+        line.push_str(&format!(" {}", pr.title));
+    }
+    let facts: Vec<&str> = [
+        (pr.checks != tracked::Checks::None).then(|| pr.checks.label()),
+        Some(pr.review.label()).filter(|r| !r.is_empty()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    // Checks and review only matter while it's open.
+    if !facts.is_empty() && pr.status.is_active() {
+        line.push_str(&format!(" ({})", facts.join(", ").to_lowercase()));
+    }
+    if !pr.note.is_empty() {
+        line.push_str(&format!(" — {}", pr.note));
+    }
+    line.push_str(&format!(" — {}", pr.url));
+    if let Some(error) = &pr.error {
+        line.push_str(&format!(" (last read failed: {error})"));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -362,7 +551,20 @@ mod tests {
         let tools = handle(&json!({"id": 2, "method": "tools/list"}), &cx).unwrap();
         let names: Vec<&str> =
             tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["notes_list", "note_read", "note_add", "note_update", "note_delete"]);
+        assert_eq!(
+            names,
+            [
+                "notes_list",
+                "note_read",
+                "note_add",
+                "note_update",
+                "note_delete",
+                "pr_track",
+                "pr_list",
+                "pr_update",
+                "pr_untrack"
+            ]
+        );
         let unknown = handle(&json!({"id": 3, "method": "resources/list"}), &cx).unwrap();
         assert_eq!(unknown["error"]["code"], -32601);
     }
@@ -390,6 +592,47 @@ mod tests {
         assert!(failed && text.contains("no note #1"));
         let (_, failed) = call_tool(&cx, "note_add", json!({"title": "x", "kind": "chore"}));
         assert!(failed, "an unknown kind is refused");
+    }
+
+    #[test]
+    fn prs_can_be_tracked_listed_updated_and_untracked() {
+        let cx = context("prs");
+        // A mailed patch: nothing to read, so nothing leaves the machine.
+        let lore = "https://lore.kernel.org/linux-bluetooth/abc@x.org/";
+        let (text, failed) = call_tool(
+            &cx,
+            "pr_track",
+            json!({
+                "url": lore,
+                "title": "Bluetooth: quirk",
+                "note": "SP11 battery quirk",
+                "folder": cx.project_dir.display().to_string()
+            }),
+        );
+        assert!(!failed && text.starts_with("Tracking [open] linux-bluetooth Bluetooth: quirk"), "{text}");
+        let book = notes::load(&cx.file).unwrap();
+        let pr = &book.prs[0];
+        assert_eq!((pr.added_by, pr.source.as_ref().unwrap().thread.as_deref()), (Author::Agent, Some("t1")));
+        assert_eq!(pr.folder.as_deref(), Some(cx.project_dir.as_path()));
+
+        let (text, _) = call_tool(&cx, "pr_track", json!({"url": lore}));
+        assert!(text.starts_with("Already tracking"), "{text}");
+        assert_eq!(notes::load(&cx.file).unwrap().prs.len(), 1, "the same address is one PR");
+        assert_eq!(notes::load(&cx.file).unwrap().prs[0].note, "SP11 battery quirk", "an empty note keeps the old");
+
+        let listed = call_tool(&cx, "pr_list", json!({})).0;
+        assert!(listed.contains("SP11 battery quirk") && listed.contains("lore.kernel.org"), "{listed}");
+        let (text, _) = call_tool(&cx, "pr_update", json!({"url": lore, "status": "merged", "title": "Bluetooth fix"}));
+        assert!(text.contains("[merged] linux-bluetooth Bluetooth fix"), "{text}");
+        assert_eq!(call_tool(&cx, "pr_list", json!({})).0, "No active pull requests tracked.");
+        assert!(call_tool(&cx, "pr_list", json!({"status": "merged"})).0.contains("Bluetooth fix"));
+
+        let (_, failed) = call_tool(&cx, "pr_track", json!({"url": "not a link"}));
+        assert!(failed);
+        let (_, failed) = call_tool(&cx, "pr_update", json!({"url": lore, "status": "shipped"}));
+        assert!(failed, "an unknown status is refused");
+        assert_eq!(call_tool(&cx, "pr_untrack", json!({"url": lore})).0, "Stopped tracking linux-bluetooth.");
+        assert!(call_tool(&cx, "pr_untrack", json!({"url": lore})).1);
     }
 
     #[test]

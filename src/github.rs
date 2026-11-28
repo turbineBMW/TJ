@@ -443,6 +443,24 @@ pub fn pull_requests(token: &str, remote: &Remote, filter: PrFilter) -> anyhow::
     Ok(list.iter().map(parse_pull_request).collect())
 }
 
+/// One pull request by its web address, on whichever repository it is. `gh`'s active account
+/// is tried first, then each other account, so a private repository one of them can see works.
+pub fn pull_request_at(url: &str) -> anyhow::Result<PullRequest> {
+    let args = ["pr", "view", url, "--json", LIST_FIELDS];
+    let first = match run_gh(None, &args, None) {
+        Ok(out) => return Ok(parse_pull_request(&serde_json::from_str(&out)?)),
+        Err(err) => err,
+    };
+    for login in accounts().unwrap_or_default().iter().skip(1) {
+        if let Ok(token) = token(login)
+            && let Ok(out) = run_gh(Some(&token), &args, None)
+        {
+            return Ok(parse_pull_request(&serde_json::from_str(&out)?));
+        }
+    }
+    Err(first)
+}
+
 fn login(v: &Value) -> String {
     v["login"].as_str().unwrap_or("ghost").to_string()
 }

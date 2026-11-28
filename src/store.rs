@@ -355,6 +355,10 @@ pub enum TabState {
     GitHub,
     /// The project's notes.
     Notes,
+    /// A kind of tab this build doesn't know, saved by an older or newer one; left out when the
+    /// layout is restored, so one stray tab can't make the whole state file unreadable.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A saved main area: the tabs along the top bar, and which one is on show.
@@ -458,6 +462,26 @@ impl State {
         }
         let text = fs::read_to_string(&file)?;
         serde_json::from_str(&text).with_context(|| format!("reading {}", file.display()))
+    }
+
+    /// Move an unreadable state file out of the way, to `state.json.unreadable-<unix time>` beside
+    /// it, so the empty state started in its place can't save over it. Where it went, or `None`
+    /// when there was no file or it couldn't be moved.
+    pub fn set_aside(paths: &Paths) -> Option<PathBuf> {
+        let file = paths.state_file();
+        if !file.exists() {
+            return None;
+        }
+        // Never onto an earlier one, from a restart in the same second.
+        let stamp = now();
+        let kept = (0..)
+            .map(|n| match n {
+                0 => file.with_file_name(format!("state.json.unreadable-{stamp}")),
+                n => file.with_file_name(format!("state.json.unreadable-{stamp}-{n}")),
+            })
+            .find(|p| !p.exists())?;
+        fs::rename(&file, &kept).ok()?;
+        Some(kept)
     }
 
     /// Write atomically: a crash mid-save never leaves a half-written state file.
@@ -741,6 +765,44 @@ mod tests {
         let text = fs::read_to_string(paths.state_file()).unwrap();
         assert!(text.contains("\"acceptEdits\""));
         assert_eq!(State::load(&paths).unwrap(), state);
+    }
+
+    #[test]
+    fn a_tab_from_another_build_doesnt_make_the_state_unreadable() {
+        let dir = temp_dir("state-unknown-tab");
+        let paths = Paths::in_dir(&dir);
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        let text = r#"{"projects": [{"id": "p1", "name": "demo", "path": "/demo", "threads": [
+            {"id": "t1", "title": "Kept", "created_at": 1, "updated_at": 2}],
+            "area": {"tabs": [{"kind": "pane", "view": {"kind": "agent"}},
+                              {"kind": "pane", "view": {"kind": "prs"}},
+                              {"kind": "pane", "view": {"kind": "someday", "with": "fields"}}], "active": 0}}]}"#;
+        fs::write(paths.state_file(), text).unwrap();
+
+        let state = State::load(&paths).unwrap();
+        assert_eq!(state.projects[0].threads[0].title.as_deref(), Some("Kept"));
+        let tabs = &state.projects[0].area.as_ref().unwrap().tabs;
+        assert_eq!(tabs[1], SplitLayout::Pane { view: TabState::Unknown });
+        assert_eq!(tabs[2], SplitLayout::Pane { view: TabState::Unknown });
+    }
+
+    #[test]
+    fn an_unreadable_state_file_is_set_aside_not_saved_over() {
+        let dir = temp_dir("state-unreadable");
+        let paths = Paths::in_dir(&dir);
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        fs::write(paths.state_file(), "{not json").unwrap();
+        assert!(State::load(&paths).is_err());
+
+        let kept = State::set_aside(&paths).unwrap();
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "{not json");
+        assert!(!paths.state_file().exists());
+        State::default().save(&paths).unwrap();
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "{not json", "saving afresh leaves it alone");
+        let again = State::set_aside(&paths).unwrap();
+        assert_ne!(again, kept, "a second one in the same second gets its own name");
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "{not json");
+        assert_eq!(State::set_aside(&paths), None, "with no file there's nothing to move");
     }
 
     #[test]

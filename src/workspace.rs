@@ -22,12 +22,13 @@ use crate::github_view::{GitHubEvent, GitHubView};
 use crate::notes::NotesStore;
 use crate::notes_view::{NotesEvent, NotesView};
 use crate::panes::{FLOAT_HEIGHT, FLOAT_INSET, PaneEvent, Panes, Start};
+use crate::prs_view::{PrsEvent, PrsView};
 use crate::settings::Settings;
 use crate::store::SplitDirection;
 use crate::store::{self, Accounts, Paths, State};
 use crate::thread::{
-    self, Backend, MenuContext, Status, ThreadAction, ThreadChanged, ThreadNeedsYou, ThreadSent, ThreadSetup,
-    ThreadView,
+    self, Backend, MenuContext, Status, ThreadAction, ThreadChanged, ThreadNeedsYou, ThreadOpenedPrs, ThreadSent,
+    ThreadSetup, ThreadView,
 };
 use gpui_kit::assets::IconName;
 
@@ -85,7 +86,8 @@ pub struct Launch {
     pub paths: Option<Paths>,
     /// The shell terminals run; the login shell when `None` (tests use `/bin/sh`).
     pub shell: Option<alacritty_terminal::tty::Shell>,
-    /// Don't call Claude for change summaries or the model list (tests).
+    /// Don't call Claude for change summaries or the model list, or read tracked pull requests
+    /// from their hosts (tests).
     pub no_summaries: bool,
     /// Open the review of the project's changes at launch (test hook).
     pub review: bool,
@@ -113,6 +115,8 @@ pub struct Workspace {
     notes: Entity<NotesStore>,
     /// Per project: its notes, shown in a tab.
     notes_views: HashMap<String, Entity<NotesView>>,
+    /// Per project: its tracked pull requests, shown in a tab.
+    prs_views: HashMap<String, Entity<PrsView>>,
     /// Per pull request ("<project id>#<number>"): its files with their summaries, for the
     /// review modal, kept so summaries survive closing it.
     pr_changes: HashMap<String, Entity<ProjectChanges>>,
@@ -163,7 +167,16 @@ impl Workspace {
             Accounts::detect(&home)
         });
         let state = State::load(&paths).unwrap_or_else(|err| {
-            problem = Some(format!("Could not read saved projects: {err:#}").into());
+            // Starting over saves at once, so keep the old file where the user can get it back.
+            problem = Some(
+                match State::set_aside(&paths) {
+                    Some(kept) => {
+                        format!("Could not read saved projects ({err:#}); the old file is kept as {}", kept.display())
+                    }
+                    None => format!("Could not read saved projects: {err:#}"),
+                }
+                .into(),
+            );
             State::default()
         });
         // The last usage and context windows heard, so the status column has numbers at once.
@@ -184,6 +197,7 @@ impl Workspace {
             githubs: HashMap::new(),
             notes,
             notes_views: HashMap::new(),
+            prs_views: HashMap::new(),
             pr_changes: HashMap::new(),
             active: None,
             status_choice: None,
@@ -252,6 +266,7 @@ impl Workspace {
         if launch.notes {
             this.open_notes(window, cx);
         }
+
         this.find_icons(cx);
         this.watch_attention(window, cx);
         // Save each terminal's current directory when the window closes.
@@ -370,6 +385,10 @@ impl Workspace {
             let id = thread_id.to_string();
             self._subscriptions
                 .push(cx.subscribe(&thread, move |this, _, event: &ThreadNeedsYou, cx| this.needs_you(&id, event, cx)));
+            let id = thread_id.to_string();
+            self._subscriptions.push(
+                cx.subscribe(&thread, move |this, _, event: &ThreadOpenedPrs, cx| this.track_prs(&id, event, cx)),
+            );
             let id = thread_id.to_string();
             self._subscriptions.push(cx.subscribe(&thread, move |this, _, _: &ThreadSent, cx| {
                 this.state.touch_thread(&id);
@@ -815,6 +834,7 @@ impl Workspace {
         self.githubs.remove(project_id);
         // Its notes stay on disk, for the notes tab's cleanup page or adding the folder again.
         self.notes_views.remove(project_id);
+        self.prs_views.remove(project_id);
         self.pr_changes.retain(|key, _| !key.starts_with(&format!("{project_id}#")));
         self.changes.remove(project_id);
         self.show_archived.remove(project_id);
@@ -1456,6 +1476,46 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A thread's shell command opened pull requests: track the ones on other repositories in its
+    /// project, as if Claude had called `pr_track` (which it may well do too; the same link is one
+    /// PR).
+    fn track_prs(&mut self, thread_id: &str, event: &ThreadOpenedPrs, cx: &mut Context<Self>) {
+        let Some((project, _)) = self.state.thread(thread_id) else { return };
+        let (id, name, path) = (project.id.clone(), project.name.clone(), project.path.clone());
+        let (branch, commit) = crate::notes::git_state(event.folder.as_deref().unwrap_or(&path));
+        let prompt = crate::notes::prompts_in(&self.paths.transcript(thread_id));
+        let source = crate::notes::Source { thread: Some(thread_id.to_string()), prompt, branch, commit };
+        // The project's own repository's pull requests are on its Pull requests page already.
+        let own = self.githubs.get(&id).and_then(|g| g.read(cx).repo());
+        let prs: Vec<crate::tracked::TrackedPr> = event
+            .urls
+            .iter()
+            .filter_map(|url| crate::tracked::TrackedPr::new(url, crate::notes::Author::Agent))
+            .filter(|pr| {
+                pr.forge != crate::tracked::Forge::GitHub
+                    || own.as_ref().is_none_or(|r| !r.eq_ignore_ascii_case(&pr.repo))
+            })
+            .map(|mut pr| {
+                pr.folder = event.folder.clone();
+                pr.source = Some(source.clone());
+                pr
+            })
+            .collect();
+        self.notes.update(cx, |n, cx| {
+            n.edit(
+                &id,
+                &name,
+                &path,
+                |book| {
+                    for pr in prs {
+                        book.track(pr);
+                    }
+                },
+                cx,
+            )
+        });
+    }
+
     /// A project was added: bring back the notes left when a project in the same folder was
     /// removed.
     fn bring_back_notes(&mut self, project_id: &str, cx: &mut Context<Self>) {
@@ -1559,9 +1619,26 @@ impl Workspace {
                 review
             }
         };
+        let (workspace, store) = (cx.entity().downgrade(), self.notes.clone());
+        let prs = cx.new(|cx| {
+            PrsView::new(
+                store,
+                workspace,
+                project.id.clone(),
+                project.name.clone(),
+                project.path.clone(),
+                no_summaries,
+                cx,
+            )
+        });
+        self._subscriptions.push(cx.subscribe_in(&prs, window, |this, _, event: &PrsEvent, window, cx| match event {
+            PrsEvent::OpenThread { thread, prompt } => this.open_thread_at(thread, *prompt, window, cx),
+        }));
+        self.prs_views.insert(project.id.clone(), prs.clone());
         let github = cx.new(|cx| {
             GitHubView::new(
                 project.path.clone(),
+                prs,
                 project.github_account.clone(),
                 project.github_merge_method,
                 window,
@@ -2230,7 +2307,7 @@ fn drag_area() -> impl IntoElement {
 }
 
 /// `/home/me/Projects/TJ` -> `~/Projects/TJ`.
-fn display_path(path: &std::path::Path, home: &std::path::Path) -> String {
+pub(crate) fn display_path(path: &std::path::Path, home: &std::path::Path) -> String {
     match path.strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
         Ok(rest) => format!("~/{}", rest.display()),
@@ -2408,7 +2485,11 @@ mod tests {
     }
 
     fn open_with_shell(cx: &mut TestAppContext, shell: alacritty_terminal::tty::Shell) -> Opened {
-        let root = std::env::temp_dir().join(format!("tj-ws-{}", new_id()));
+        open_in(cx, &std::env::temp_dir().join(format!("tj-ws-{}", new_id())), shell)
+    }
+
+    /// Open on `root`, whose `home/` may already hold saved state.
+    fn open_in(cx: &mut TestAppContext, root: &std::path::Path, shell: alacritty_terminal::tty::Shell) -> Opened {
         let project = root.join("demo-project");
         std::fs::create_dir_all(&project).unwrap();
         let paths = Paths::in_dir(&root.join("home"));
@@ -2900,6 +2981,84 @@ mod tests {
         use crate::github::MergeMethod;
         github.update(cx, |_, cx| cx.emit(crate::github_view::GitHubEvent::MergeMethodChosen(MergeMethod::Merge)));
         assert_eq!(State::load(&paths).unwrap().projects[0].github_merge_method, Some(MergeMethod::Merge));
+    }
+
+    #[gpui_kit::test]
+    fn an_unreadable_state_file_is_kept_aside_at_launch(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!("tj-ws-{}", new_id()));
+        let paths = Paths::in_dir(&root.join("home"));
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(paths.state_file(), "{\"projects\": [oops").unwrap();
+
+        let quiet = alacritty_terminal::tty::Shell::new("sleep".into(), vec!["60".into()]);
+        let (window, workspace, paths, _) = open_in(cx, &root, quiet);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        let problem = workspace.read_with(cx, |w, _| w.problem.clone()).unwrap();
+        assert!(problem.contains("the old file is kept as"), "{problem}");
+        let kept: Vec<_> = std::fs::read_dir(&paths.data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("state.json.unreadable-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "{\"projects\": [oops", "untouched");
+        assert!(State::load(&paths).is_ok(), "the fresh state saved in its place reads back");
+    }
+
+    #[gpui_kit::test]
+    fn a_folder_of_repos_shows_its_tracked_prs_on_the_github_tab(cx: &mut TestAppContext) {
+        use crate::notes::Author;
+        use crate::tracked::Forge;
+        let (window, workspace, _paths, project) = open_quiet(cx);
+        // No remote of its own, but a fork in a subfolder: a folder of repositories.
+        std::fs::create_dir_all(project.join("upstream/fork/.git")).unwrap();
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        let (project_id, first) =
+            workspace.read_with(cx, |w, _| (w.state.projects[0].id.clone(), w.active.clone().unwrap()));
+        let store = workspace.read_with(cx, |w, _| w.notes.clone());
+
+        // Ctrl+Shift+G opens the GitHub tab, which finds no remote and shows Other repos alone.
+        cx.simulate_keystrokes("ctrl-shift-g");
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        let github = workspace.read_with(cx, |w, _| w.githubs.get(&project_id).cloned().unwrap());
+        assert!(github.read_with(cx, |g, cx| g.is_showing_tracked(cx)), "the Other repos page stands in");
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // A mailed patch tracked from the keyboard: its link, Enter, a note, Enter.
+        let prs = workspace.read_with(cx, |w, _| w.prs_views.get(&project_id).cloned().unwrap());
+        cx.simulate_keystrokes("alt-n");
+        assert!(prs.read_with(cx, |p, _| p.is_adding()));
+        cx.simulate_input("https://lore.kernel.org/linux-bluetooth/abc@x.org/");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("Battery quirk");
+        cx.simulate_keystrokes("enter");
+        assert!(!prs.read_with(cx, |p, _| p.is_adding()));
+        let book = store.read_with(cx, |s, _| s.book(&project_id).cloned().unwrap());
+        let pr = &book.prs[0];
+        assert_eq!((pr.forge, pr.note.as_str(), pr.added_by), (Forge::MailingList, "Battery quirk", Author::User));
+        let lore = "https://lore.kernel.org/linux-bluetooth/abc@x.org";
+        assert_eq!(prs.read_with(cx, |p, cx| p.selected_url(cx)).as_deref(), Some(lore));
+
+        // `gh pr create` in a thread prints its link: the PR is tracked, from that thread.
+        let thread = workspace.read_with(cx, |w, _| w.threads.get(&first).cloned().unwrap());
+        let url = "https://github.com/o/r/pull/7".to_string();
+        thread.update(cx, |_, cx| {
+            cx.emit(crate::thread::ThreadOpenedPrs { urls: vec![url.clone(), url.clone()], folder: None })
+        });
+        let book = store.read_with(cx, |s, _| s.book(&project_id).cloned().unwrap());
+        assert_eq!(book.prs.len(), 2, "the same link twice is one PR");
+        let gh = book.tracked(&url).unwrap();
+        assert_eq!((gh.forge, gh.added_by), (Forge::GitHub, Author::Agent));
+        assert_eq!(gh.source.as_ref().and_then(|s| s.thread.as_deref()), Some(first.as_str()));
+        assert_eq!(github.read_with(cx, |g, cx| g.title(cx)), "GitHub · 2", "the tab counts the open ones");
+
+        // Delete stops tracking the picked one.
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.simulate_keystrokes("delete");
+        assert_eq!(store.read_with(cx, |s, _| s.book(&project_id).unwrap().prs.len()), 1);
     }
 
     #[gpui_kit::test]
