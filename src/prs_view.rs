@@ -397,7 +397,8 @@ impl PrsView {
         cx.notify();
     }
 
-    fn start_adding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Show the fields for tracking one by its link, the link focused.
+    pub fn start_adding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.adder.is_some() {
             return;
         }

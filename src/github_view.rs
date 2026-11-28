@@ -11,7 +11,8 @@
 //! Re-run or Cancel. Runs still going are read again while the page is open.
 //!
 //! Other repos lists the pull requests the project's sessions sent to other repositories and
-//! hosts ([`crate::prs_view`]). A project folder with no GitHub remote of its own, such as a
+//! hosts ([`crate::prs_view`]). Its tab appears once something is tracked; until then the ⋮ menu at
+//! the end of the page tabs opens it to add one. A project folder with no GitHub remote of its own, such as a
 //! folder of forks, shows that page alone when it has repositories in its subfolders or tracked
 //! pull requests.
 //!
@@ -349,6 +350,21 @@ impl GitHubView {
             && (self.nested_repos || self.tracked_wanted || self.tracked.read(cx).count(cx) > 0)
     }
 
+    /// Whether the header has an Other repos tab: once something is tracked, or while it's open.
+    /// Until then it's under the header's ⋮ menu.
+    fn tracked_tab_shown(&self, cx: &App) -> bool {
+        self.page == Page::Tracked || self.tracked.read(cx).count(cx) > 0
+    }
+
+    /// Open the Other repos page with its link field ready, from the header's ⋮ menu.
+    fn add_other_repo_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_page(Page::Tracked, cx);
+        self.tracked.update(cx, |t, cx| {
+            t.shown(window, cx);
+            t.start_adding(window, cx);
+        });
+    }
+
     /// Whether the Other repos page is what's showing.
     fn showing_tracked(&self, cx: &App) -> bool {
         self.tracked_only(cx) || (self.phase == Phase::Ready && self.page == Page::Tracked)
@@ -357,6 +373,31 @@ impl GitHubView {
     #[cfg(test)]
     pub fn is_showing_tracked(&self, cx: &App) -> bool {
         self.showing_tracked(cx)
+    }
+
+    /// As if `gh` had found the project's repository, for tests that can't reach GitHub.
+    #[cfg(test)]
+    pub fn pretend_ready(&mut self, cx: &mut Context<Self>) {
+        let remote = Remote { name: "origin".into(), host: "github.com".into(), owner: "o".into(), repo: "r".into() };
+        self.phase = Phase::Ready;
+        self.remote = Some(remote);
+        self.account = Some(("me".into(), String::new()));
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn has_tracked_tab(&self, cx: &App) -> bool {
+        self.tracked_tab_shown(cx)
+    }
+
+    #[cfg(test)]
+    pub fn add_other_repo_pr_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_other_repo_pr(window, cx)
+    }
+
+    #[cfg(test)]
+    pub fn show_pull_requests_for_test(&mut self, cx: &mut Context<Self>) {
+        self.show_page(Page::PullRequests, cx)
     }
 
     /// The tab came to the front: focus it and bring stale data up to date.
@@ -1499,6 +1540,7 @@ impl GitHubView {
             let on = page == p;
             h_flex()
                 .id(id)
+                .debug_selector(move || id.into())
                 .test_support()
                 .gap_1p5()
                 .px_3()
@@ -1529,19 +1571,39 @@ impl GitHubView {
         };
         let open_prs = (self.filter == PrFilter::Open).then_some(self.prs.len());
         let running = self.runs.iter().filter(|r| r.state.active()).count();
+        let tracked_tab = self.tracked_tab_shown(cx);
         let tabs = h_flex()
             .gap_1()
             // The picked tab's underline sits on the band's bottom border.
             .mb(px(-1.))
             .child(page_tab("github-page-prs", Page::PullRequests, IconName::GitPullRequest, "Pull requests", open_prs))
             .child(page_tab("github-page-actions", Page::Actions, IconName::Workflow, "Actions", Some(running)))
-            .child(page_tab(
-                "github-page-tracked",
-                Page::Tracked,
-                IconName::FolderGit2,
-                "Other repos",
-                Some(self.tracked.read(cx).active(cx)),
-            ));
+            .when(tracked_tab, |el| {
+                el.child(page_tab(
+                    "github-page-tracked",
+                    Page::Tracked,
+                    IconName::FolderGit2,
+                    "Other repos",
+                    Some(self.tracked.read(cx).active(cx)),
+                ))
+            })
+            // Nothing tracked yet: the page is a menu item away instead of an empty tab.
+            .when(!tracked_tab, |el| {
+                let this = this.clone();
+                let more =
+                    Button::new("github-more")
+                        .small()
+                        .ghost()
+                        .icon(IconName::EllipsisVertical)
+                        .tooltip("More")
+                        .dropdown_menu(move |menu, _, _| {
+                            let this = this.clone();
+                            menu.item(PopupMenuItem::new("Add PR from another repo").on_click(move |_, window, cx| {
+                                this.update(cx, |v, cx| v.add_other_repo_pr(window, cx))
+                            }))
+                        });
+                el.child(div().flex_1()).child(div().debug_selector(|| "github-more".into()).child(more))
+            });
 
         v_flex()
             .flex_none()

@@ -2984,6 +2984,48 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn other_repos_waits_under_the_github_menu_until_something_is_tracked(cx: &mut TestAppContext) {
+        let (window, workspace, _paths, _project) = open_quiet(cx);
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| window.render_frame(cx));
+        let project_id = workspace.read_with(cx, |w, _| w.state.projects[0].id.clone());
+        cx.simulate_keystrokes("ctrl-shift-g");
+        cx.run_until_parked();
+        let github = workspace.read_with(cx, |w, _| w.githubs.get(&project_id).cloned().unwrap());
+        let prs = workspace.read_with(cx, |w, _| w.prs_views.get(&project_id).cloned().unwrap());
+        github.update(cx, |g, cx| g.pretend_ready(cx));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        // Nothing tracked: no Other repos tab, just the ⋮ menu at the end of the page tabs.
+        assert!(!github.read_with(cx, |g, cx| g.has_tracked_tab(cx)));
+        assert!(cx.debug_bounds("github-page-actions").is_some(), "the page tabs are drawn");
+        assert!(cx.debug_bounds("github-page-tracked").is_none());
+        assert!(cx.debug_bounds("github-more").is_some());
+
+        // Its "Add PR from another repo" opens the page with the link field ready.
+        github.update_in(cx, |g, window, cx| g.add_other_repo_pr_for_test(window, cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        assert!(github.read_with(cx, |g, cx| g.is_showing_tracked(cx)));
+        assert!(github.read_with(cx, |g, cx| g.has_tracked_tab(cx)), "the tab shows while it's open");
+        assert!(prs.read_with(cx, |p, _| p.is_adding()));
+        assert!(cx.debug_bounds("github-page-tracked").is_some());
+        assert!(cx.debug_bounds("github-more").is_none());
+
+        // Leaving it with nothing tracked puts it back under the menu.
+        cx.simulate_keystrokes("escape");
+        github.update(cx, |g, cx| g.show_pull_requests_for_test(cx));
+        assert!(!github.read_with(cx, |g, cx| g.has_tracked_tab(cx)));
+
+        // Once one is tracked, the tab stays.
+        github.update_in(cx, |g, window, cx| g.add_other_repo_pr_for_test(window, cx));
+        cx.simulate_input("https://gitlab.com/group/proj/-/merge_requests/4");
+        cx.simulate_keystrokes("enter enter");
+        github.update(cx, |g, cx| g.show_pull_requests_for_test(cx));
+        assert_eq!(prs.read_with(cx, |p, cx| p.count(cx)), 1);
+        assert!(github.read_with(cx, |g, cx| g.has_tracked_tab(cx)));
+    }
+
+    #[gpui_kit::test]
     fn an_unreadable_state_file_is_kept_aside_at_launch(cx: &mut TestAppContext) {
         let root = std::env::temp_dir().join(format!("tj-ws-{}", new_id()));
         let paths = Paths::in_dir(&root.join("home"));
