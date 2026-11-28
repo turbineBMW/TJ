@@ -96,6 +96,14 @@ pub static COMMANDS: &[Command] = &[
     ),
     command!("settings", "Open settings", Window, WS, ["ctrl-,"], workspace::OpenSettings),
     command!("toggle_sidebar", "Show or hide the sidebar", Window, WS, ["ctrl-shift-s"], workspace::ToggleSidebar),
+    command!(
+        "toggle_status",
+        "Show or hide the thread's status (overview) column",
+        Window,
+        WS,
+        ["ctrl-shift-d"],
+        workspace::ToggleStatus
+    ),
     // Ctrl+T and Ctrl+W, like a browser. A terminal keeps them for its shell (transpose, delete a
     // word), so the Shift spellings work there too.
     command!("new_tab", "New terminal tab", Panes, PANES, ["ctrl-t", "ctrl-shift-t"], panes::NewTab),

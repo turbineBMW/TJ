@@ -49,6 +49,7 @@ gpui_kit::actions!(
     workspace,
     [
         ToggleSidebar,
+        ToggleStatus,
         NextProject,
         PreviousProject,
         NewThread,
@@ -122,8 +123,6 @@ pub struct Workspace {
     pr_changes: HashMap<String, Entity<ProjectChanges>>,
     /// The thread the header follows (the one last shown or focused).
     active: Option<String>,
-    /// The status column shown or hidden by hand; `None` follows the window's width.
-    status_choice: Option<bool>,
     shell: Option<alacritty_terminal::tty::Shell>,
     model: Option<String>,
     scripted: Option<Vec<(Duration, AgentEvent)>>,
@@ -200,7 +199,6 @@ impl Workspace {
             prs_views: HashMap::new(),
             pr_changes: HashMap::new(),
             active: None,
-            status_choice: None,
             shell: launch.shell,
             model: launch.model,
             scripted: launch.scripted,
@@ -286,6 +284,17 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Show the thread's status column, or fold it away, overriding what the window's width
+    /// would pick. Only while the status column has something to show. Remembered across
+    /// restarts.
+    fn toggle_status(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.has_status(cx) {
+            self.state.status_choice = Some(!self.status_shown(window, cx));
+            self.save();
+            cx.notify();
+        }
+    }
+
     fn save(&mut self) {
         if let Err(err) = self.state.save(&self.paths) {
             self.problem = Some(format!("Could not save projects: {err:#}").into());
@@ -315,7 +324,7 @@ impl Workspace {
     fn status_shown(&self, window: &Window, cx: &App) -> bool {
         let sidebar = if self.state.sidebar_collapsed { 0. } else { SIDEBAR_WIDTH };
         let room = window.viewport_size().width - px(sidebar + crate::agent_slot::STATUS_WIDTH);
-        self.has_status(cx) && self.status_choice.unwrap_or(room >= px(STATUS_FOLD_WIDTH))
+        self.has_status(cx) && self.state.status_choice.unwrap_or(room >= px(STATUS_FOLD_WIDTH))
     }
 
     // ---------- threads ----------
@@ -2162,12 +2171,14 @@ impl Workspace {
             chip(
                 "header-status",
                 if shown { IconName::PanelRightClose } else { IconName::PanelRightOpen },
-                if shown { "Hide the thread's status" } else { "Show the thread's status" }.into(),
+                crate::keybindings::tooltip(
+                    if shown { "Hide the thread's status" } else { "Show the thread's status" },
+                    "toggle_status",
+                    cx,
+                )
+                .into(),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.status_choice = Some(!shown);
-                cx.notify();
-            }))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_status(window, cx)))
         });
         let with_panes = |f: fn(&mut Panes, &mut Window, &mut Context<Panes>)| {
             cx.listener(move |this: &mut Self, _: &ClickEvent, window, cx| {
@@ -2422,6 +2433,7 @@ impl Render for Workspace {
         crate::caret::watch(h_flex())
             .key_context(CONTEXT)
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleStatus, window, cx| this.toggle_status(window, cx)))
             .on_action(cx.listener(|this, _: &NextProject, window, cx| this.step_project(1, window, cx)))
             .on_action(cx.listener(|this, _: &PreviousProject, window, cx| this.step_project(-1, window, cx)))
             .on_action(cx.listener(|this, _: &NewThread, window, cx| this.new_thread_here(window, cx)))
@@ -2770,7 +2782,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn the_status_column_sits_in_the_frame_and_folds_when_the_window_is_narrow(cx: &mut TestAppContext) {
-        let (window, workspace, _, _) = open(cx);
+        let (window, workspace, paths, _) = open(cx);
         let cx = &mut VisualTestContext::from_window(window, cx);
         let thread = workspace.read_with(cx, |w, _| w.active_thread().unwrap());
         thread.update(cx, |t, cx| {
@@ -2805,6 +2817,13 @@ mod tests {
         cx.update(|window, cx| window.click(SharedString::from("header-status"), cx));
         settle(cx);
         assert!(!status_showing(cx), "and hidden again");
+        cx.simulate_keystrokes("ctrl-shift-d");
+        settle(cx);
+        assert!(status_showing(cx), "Ctrl+Shift+D shows it");
+        assert_eq!(State::load(&paths).unwrap().status_choice, Some(true), "and that's saved");
+        cx.simulate_keystrokes("ctrl-shift-d");
+        settle(cx);
+        assert!(!status_showing(cx), "and hides it again");
 
         // It belongs to the window, not the agent tab: in a wide window a split leaves it shown.
         cx.update(|window, cx| window.click(SharedString::from("header-status"), cx));

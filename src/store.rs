@@ -453,6 +453,10 @@ pub struct State {
     /// The sidebar is folded away (Ctrl+Shift+S, or the button at the left of the top bar).
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// The status column at the right shown or hidden by hand (Ctrl+Shift+D, or the button at
+    /// the right of the top bar); `None` follows the window's width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_choice: Option<bool>,
     /// Notifications to show again later (picked on a notification).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reminders: Vec<Reminder>,
